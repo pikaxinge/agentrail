@@ -305,6 +305,20 @@ fn optional_string(args: &Value, field: &str) -> Option<String> {
         .map(ToString::to_string)
 }
 
+fn validate_delivery_cursor_bounds(
+    tool_name: &str,
+    cursor_field: &str,
+    requested_cursor: u64,
+    latest_cursor: u64,
+) -> Result<()> {
+    if requested_cursor > latest_cursor {
+        anyhow::bail!(
+            "invalid {cursor_field} for {tool_name}: {requested_cursor} is ahead of latest cursor {latest_cursor}"
+        );
+    }
+    Ok(())
+}
+
 fn parse_optional_u64(args: &Value, field: &str) -> Result<Option<u64>> {
     let Some(value) = args.get(field) else {
         return Ok(None);
@@ -956,6 +970,23 @@ fn runtime_cleanup_targets(task_id_filter: Option<&str>) -> Result<Vec<RuntimeCl
     Ok(targets)
 }
 
+fn task_matches_prune_filters(
+    task: &TaskRecord,
+    scope_id: Option<&str>,
+    state_filter: &HashSet<TaskRuntimeState>,
+    updated_before_epoch_ms: i64,
+) -> bool {
+    if let Some(scope) = scope_id
+        && task.scope_id.as_deref() != Some(scope)
+    {
+        return false;
+    }
+    if !state_filter.is_empty() && !state_filter.contains(&task.state) {
+        return false;
+    }
+    task.updated_epoch_ms < updated_before_epoch_ms
+}
+
 fn purge_runtime_tasks(task_ids: &HashSet<String>) -> Result<usize> {
     if task_ids.is_empty() {
         return Ok(0);
@@ -1029,6 +1060,11 @@ async fn delivery_stop_runtime(args: Value) -> Result<Value> {
             "unknown".to_string()
         }
     };
+
+    if active_or_session {
+        let session_id = session.as_ref().map(|active| active.session_id.clone());
+        emit_delivery_status_events(&task_id, "stopped", &runtime_state, session_id)?;
+    }
 
     Ok(json!({
         "tool": "delivery_stop",
@@ -1197,6 +1233,7 @@ async fn delivery_cleanup_runtime(args: Value) -> Result<Value> {
         for label in &state_labels {
             states.push(runtime_state_from_label(label)?);
         }
+        let state_filter = states.iter().copied().collect::<HashSet<_>>();
 
         let updated_before_epoch_ms = optional_i64(&args, "updated_before_epoch_ms")?
             .ok_or_else(|| anyhow::anyhow!("missing updated_before_epoch_ms"))?;
@@ -1204,7 +1241,82 @@ async fn delivery_cleanup_runtime(args: Value) -> Result<Value> {
             anyhow::bail!("invalid updated_before_epoch_ms: must be non-negative");
         }
 
+        let candidates = {
+            let runtime = runtime_state_mutex()?;
+            let snapshot = runtime.store.export_snapshot()?;
+            snapshot
+                .tasks
+                .into_iter()
+                .filter_map(|task| {
+                    if !task_matches_prune_filters(
+                        &task,
+                        scope_id.as_deref(),
+                        &state_filter,
+                        updated_before_epoch_ms,
+                    ) {
+                        return None;
+                    }
+                    let session = runtime.sessions.get(&task.id).cloned();
+                    Some((task.id, task.state, session))
+                })
+                .collect::<Vec<_>>()
+        };
+
+        let mut stale_session_task_ids = HashSet::new();
+        let mut active_task_ids = HashSet::new();
+        for (task_id, task_state, session) in &candidates {
+            if runtime_state_is_active(*task_state) {
+                active_task_ids.insert(task_id.clone());
+            }
+
+            if let Some(session) = session {
+                match runner_status(session.runner_mode, &session.session_id).await {
+                    Ok(status) => {
+                        if runner_state_is_terminal(&status.state) {
+                            stale_session_task_ids.insert(task_id.clone());
+                        } else {
+                            active_task_ids.insert(task_id.clone());
+                        }
+                    }
+                    Err(error) if is_session_not_found_error(&error) => {
+                        stale_session_task_ids.insert(task_id.clone());
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+        }
+
         let mut runtime = runtime_state_mutex()?;
+        for task_id in &stale_session_task_ids {
+            runtime.sessions.remove(task_id);
+        }
+
+        for (task_id, _, _) in &candidates {
+            let Some(task) = runtime.store.get_task(task_id)? else {
+                continue;
+            };
+            if !task_matches_prune_filters(
+                &task,
+                scope_id.as_deref(),
+                &state_filter,
+                updated_before_epoch_ms,
+            ) {
+                continue;
+            }
+            if runtime_state_is_active(task.state) || runtime.sessions.contains_key(task_id) {
+                active_task_ids.insert(task_id.clone());
+            }
+        }
+
+        if !active_task_ids.is_empty() {
+            let mut active = active_task_ids.into_iter().collect::<Vec<_>>();
+            active.sort_unstable();
+            anyhow::bail!(
+                "retention prune refused for active task(s): {}",
+                active.join(", ")
+            );
+        }
+
         let deleted_task_ids = runtime.store.prune_tasks(
             scope_id.as_deref(),
             &states,
@@ -1363,6 +1475,14 @@ fn delivery_events_subscribe(args: Value) -> Result<Value> {
 
     let mut runtime = runtime_state_mutex()?;
     let latest_cursor = runtime.next_delivery_cursor.saturating_sub(1);
+    if let Some(cursor) = requested_cursor {
+        validate_delivery_cursor_bounds(
+            "delivery_events_subscribe",
+            "cursor",
+            cursor,
+            latest_cursor,
+        )?;
+    }
     let subscription = runtime
         .delivery_subscriptions
         .entry(subscriber_id.clone())
@@ -1399,7 +1519,14 @@ fn delivery_events_next(args: Value) -> Result<Value> {
         .delivery_subscriptions
         .get(subscriber_id)
         .ok_or_else(|| anyhow::anyhow!("unknown subscriber_id: {subscriber_id}"))?;
+    let latest_cursor = runtime.next_delivery_cursor.saturating_sub(1);
     let start_cursor = requested_cursor.unwrap_or(subscription.cursor);
+    validate_delivery_cursor_bounds(
+        "delivery_events_next",
+        "cursor",
+        start_cursor,
+        latest_cursor,
+    )?;
     let filter_task = requested_task_id
         .as_deref()
         .or(subscription.task_id.as_deref());
@@ -1436,6 +1563,13 @@ fn delivery_events_ack(args: Value) -> Result<Value> {
     let subscriber_id = require_string_field("delivery_events_ack", &args, "subscriber_id")?;
     let requested_cursor = require_u64_field("delivery_events_ack", &args, "cursor")?;
     let mut runtime = runtime_state_mutex()?;
+    let latest_cursor = runtime.next_delivery_cursor.saturating_sub(1);
+    validate_delivery_cursor_bounds(
+        "delivery_events_ack",
+        "cursor",
+        requested_cursor,
+        latest_cursor,
+    )?;
     let subscription = runtime
         .delivery_subscriptions
         .get_mut(subscriber_id)
@@ -1957,7 +2091,20 @@ fn mcp_tools_descriptor() -> Value {
                         "items": {"type":"string"}
                     },
                     "updated_before_epoch_ms": {"type":"integer"}
-                }
+                },
+                "allOf": [
+                    {
+                        "if": {
+                            "anyOf": [
+                                {"required": ["scope_id"]},
+                                {"required": ["states"]}
+                            ]
+                        },
+                        "then": {
+                            "required": ["updated_before_epoch_ms"]
+                        }
+                    }
+                ]
             }
         },
         {

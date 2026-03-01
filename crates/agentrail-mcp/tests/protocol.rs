@@ -167,6 +167,18 @@ fn tools_list_includes_delivery_stop_and_cleanup_schemas() {
         cleanup["inputSchema"]["properties"]["updated_before_epoch_ms"]["type"],
         json!("integer")
     );
+    assert_eq!(
+        cleanup["inputSchema"]["allOf"][0]["if"]["anyOf"][0]["required"],
+        json!(["scope_id"])
+    );
+    assert_eq!(
+        cleanup["inputSchema"]["allOf"][0]["if"]["anyOf"][1]["required"],
+        json!(["states"])
+    );
+    assert_eq!(
+        cleanup["inputSchema"]["allOf"][0]["then"]["required"],
+        json!(["updated_before_epoch_ms"])
+    );
 
     let report = tools
         .iter()

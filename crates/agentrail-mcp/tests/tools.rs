@@ -682,6 +682,46 @@ fn delivery_events_reconnect_with_cursor_replays_without_loss() {
 }
 
 #[test]
+fn delivery_events_reject_forward_cursor_jumps_for_subscribe_and_ack() {
+    let subscriber_id = unique_subscriber_id("delivery-sub-forward-jump");
+
+    let subscribe_err = handle_tool_call(
+        "delivery_events_subscribe",
+        json!({
+            "subscriber_id": subscriber_id,
+            "cursor": u64::MAX
+        }),
+    )
+    .expect_err("subscribe should reject forward cursor jumps");
+    assert!(
+        subscribe_err.to_string().contains("cursor"),
+        "expected cursor validation error, got: {subscribe_err}"
+    );
+
+    let subscriber_id = unique_subscriber_id("delivery-sub-forward-ack");
+    let _ = handle_tool_call(
+        "delivery_events_subscribe",
+        json!({
+            "subscriber_id": subscriber_id
+        }),
+    )
+    .expect("subscribe should succeed without cursor override");
+
+    let ack_err = handle_tool_call(
+        "delivery_events_ack",
+        json!({
+            "subscriber_id": subscriber_id,
+            "cursor": u64::MAX
+        }),
+    )
+    .expect_err("ack should reject forward cursor jumps");
+    assert!(
+        ack_err.to_string().contains("cursor"),
+        "expected cursor validation error, got: {ack_err}"
+    );
+}
+
+#[test]
 fn delivery_events_status_changed_is_deduplicated_for_same_state() {
     let tmp = tempdir().expect("tempdir");
     let task_id = unique_task_id("task-events-dedupe");
@@ -778,6 +818,55 @@ fn delivery_stop_transitions_active_process_to_failed_retryable() {
     )
     .expect("delivery_status should succeed after stop");
     assert_eq!(status["runtime_state"], "failed_retryable");
+}
+
+#[test]
+fn delivery_stop_emits_lifecycle_events_for_stopped_transition() {
+    let tmp = tempdir().expect("tempdir");
+    let task_id = unique_task_id("task-delivery-stop-events");
+    let (subscriber_id, _) = subscribe_events(&task_id);
+
+    let _ = handle_tool_call(
+        "delivery_submit",
+        json!({
+            "task_id": task_id,
+            "worker_id": "worker-a",
+            "runner_mode": "process",
+            "command": "bash",
+            "args": ["-lc", "sleep 5"],
+            "workdir": tmp.path().display().to_string()
+        }),
+    )
+    .expect("delivery_submit should succeed");
+
+    let _ = handle_tool_call(
+        "delivery_stop",
+        json!({
+            "task_id": task_id,
+            "reason": "manual-stop"
+        }),
+    )
+    .expect("delivery_stop should succeed");
+
+    let next = next_events(&subscriber_id, &task_id, 64);
+    let events = next["events"].as_array().expect("events should be array");
+
+    assert!(
+        events.iter().any(|event| {
+            event["event_type"] == "status_changed"
+                && event["state"] == "stopped"
+                && event["runtime_state"] == "failed_retryable"
+        }),
+        "expected stopped status_changed event, got: {events:?}"
+    );
+    assert!(
+        events.iter().any(|event| {
+            event["event_type"] == "stopped"
+                && event["state"] == "stopped"
+                && event["runtime_state"] == "failed_retryable"
+        }),
+        "expected stopped lifecycle event, got: {events:?}"
+    );
 }
 
 #[test]
@@ -1019,6 +1108,69 @@ fn delivery_cleanup_retention_prune_mode_deletes_by_scope_state_and_cutoff() {
         handle_tool_call("delivery_report", json!({ "scope_id": scope_id })).expect("report");
     let remaining = report_task_ids(&scoped_report);
     assert_eq!(remaining, vec![running_task]);
+}
+
+#[test]
+fn delivery_cleanup_retention_prune_mode_rejects_active_tasks() {
+    let tmp = tempdir().expect("tempdir");
+    let scope_id = unique_task_id("scope-retention-active-guard");
+    let ready_task = unique_task_id("task-prune-guard-ready");
+    let running_task = unique_task_id("task-prune-guard-running");
+
+    let _ = handle_tool_call(
+        "delivery_submit",
+        json!({
+            "task_id": ready_task,
+            "scope_id": scope_id,
+            "worker_id": "worker-a",
+            "runner_mode": "process",
+            "command": "bash",
+            "args": ["-lc", "true"],
+            "workdir": tmp.path().display().to_string()
+        }),
+    )
+    .expect("ready submit should succeed");
+    let _ = wait_for_runtime_state(&ready_task, "ready_to_merge");
+
+    let _ = handle_tool_call(
+        "delivery_submit",
+        json!({
+            "task_id": running_task,
+            "scope_id": scope_id,
+            "worker_id": "worker-a",
+            "runner_mode": "process",
+            "command": "bash",
+            "args": ["-lc", "sleep 5"],
+            "workdir": tmp.path().display().to_string()
+        }),
+    )
+    .expect("running submit should succeed");
+    let _ = wait_for_runtime_state(&running_task, "running");
+
+    let cutoff_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("clock should be monotonic")
+        .as_millis() as i64
+        + 60_000;
+
+    let err = handle_tool_call(
+        "delivery_cleanup",
+        json!({
+            "scope_id": scope_id,
+            "updated_before_epoch_ms": cutoff_ms
+        }),
+    )
+    .expect_err("prune cleanup should refuse active tasks");
+    assert!(
+        err.to_string().contains("active task"),
+        "expected active-task guard error, got: {err}"
+    );
+
+    let scoped_report =
+        handle_tool_call("delivery_report", json!({ "scope_id": scope_id })).expect("report");
+    let remaining = report_task_ids(&scoped_report);
+    assert!(remaining.contains(&ready_task));
+    assert!(remaining.contains(&running_task));
 }
 
 #[test]
