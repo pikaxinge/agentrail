@@ -227,6 +227,34 @@ Each issue is intentionally implementation-ready and includes acceptance gates.
 - Test Plan
   - Contract tests over JSON message fixtures.
 
+## AR-111 Interactive DAG Control Console (Deferred Proposal)
+
+- Problem
+  - Chat/CLI workflows are effective but become cognitively expensive for large dependency graphs.
+- Goal
+  - Provide an interactive HTML DAG control console for visual inspection and node-level control actions.
+- Scope In
+  - DAG home with pan/zoom and status badges.
+  - Node hover summary and click-through detail pane.
+  - Command panel for safe runtime actions (`steer/stop/retry` as first slice).
+  - UI actions routed through existing MCP/runtime APIs only.
+- Scope Out
+  - Replacing chat-first workflows.
+  - New source-of-truth data model outside runtime store and plan state.
+- Acceptance Criteria
+  - Read-only DAG render from live snapshot.
+  - Node detail pane with dependencies and recent events.
+  - At least three control actions wired end-to-end through MCP.
+  - No regression in existing chat/CLI orchestration flows.
+- Risks
+  - UI scope creep delaying core runtime hardening.
+  - Large-graph rendering performance.
+- Test Plan
+  - UI contract tests for snapshot schema.
+  - End-to-end action tests for command dispatch and result feedback.
+- Proposal Doc
+  - `docs/roadmap/proposals/2026-03-01-interactive-dag-control-console-proposal.md`
+
 ## Priority and Suggested Sequence
 
 - P0
@@ -237,6 +265,8 @@ Each issue is intentionally implementation-ready and includes acceptance gates.
   - AR-107, AR-108
 - P3
   - AR-109, AR-110
+- P4
+  - AR-111 (deferred proposal)
 
 ## Definition of Done for This Roadmap Batch
 
