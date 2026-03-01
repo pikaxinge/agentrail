@@ -622,6 +622,27 @@ fn resolve_start_command_and_args(args: &Value) -> Result<(String, Vec<String>)>
     Ok((command, command_args))
 }
 
+fn validate_delivery_submit_preflight(args: &Value) -> Result<()> {
+    let steer_required = optional_bool(args, "steer_required", false)?;
+    if !steer_required {
+        return Ok(());
+    }
+
+    let runner_mode = RuntimeRunnerMode::parse(args.get("runner_mode").and_then(Value::as_str))?;
+    if runner_mode != RuntimeRunnerMode::Tmux {
+        anyhow::bail!("invalid delivery_submit: steer_required=true requires runner_mode=tmux");
+    }
+
+    let interactive_command = optional_bool(args, "interactive_command", false)?;
+    if !interactive_command {
+        anyhow::bail!(
+            "invalid delivery_submit: steer_required=true requires interactive_command=true"
+        );
+    }
+
+    Ok(())
+}
+
 async fn runner_start(mode: RuntimeRunnerMode, spec: TaskSpec) -> Result<TaskHandle> {
     match mode {
         RuntimeRunnerMode::Process => ProcessRunner.start(spec).await,
@@ -2316,6 +2337,8 @@ fn mcp_tools_descriptor() -> Value {
                     "scope_id": {"type":"string"},
                     "worker_id": {"type":"string"},
                     "runner_mode": {"type":"string", "enum": ["process", "tmux"]},
+                    "steer_required": {"type":"boolean"},
+                    "interactive_command": {"type":"boolean"},
                     "command": {"type":"string"},
                     "args": {
                         "type":"array",
@@ -2545,6 +2568,7 @@ pub fn handle_tool_call_with_allowed_root(
         "orchestrate_status" => block_on_result(orchestrate_status_runtime(args)),
         "orchestrate_steer" => block_on_result(orchestrate_steer_runtime(args)),
         "delivery_submit" => {
+            validate_delivery_submit_preflight(&args)?;
             let orchestration = block_on_result(orchestrate_start_runtime(args))?;
             if let Some(task_id) = orchestration.get("task_id").and_then(Value::as_str) {
                 let runtime_state = orchestration

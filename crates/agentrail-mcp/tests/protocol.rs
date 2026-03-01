@@ -180,6 +180,19 @@ fn tools_list_includes_delivery_stop_and_cleanup_schemas() {
         json!(["updated_before_epoch_ms"])
     );
 
+    let submit = tools
+        .iter()
+        .find(|t| t["name"] == "delivery_submit")
+        .expect("delivery_submit descriptor should exist");
+    assert_eq!(
+        submit["inputSchema"]["properties"]["steer_required"]["type"],
+        json!("boolean")
+    );
+    assert_eq!(
+        submit["inputSchema"]["properties"]["interactive_command"]["type"],
+        json!("boolean")
+    );
+
     let report = tools
         .iter()
         .find(|t| t["name"] == "delivery_report")

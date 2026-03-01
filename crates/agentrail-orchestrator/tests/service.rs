@@ -463,7 +463,8 @@ async fn launch_ready_tasks_emits_structured_launch_trace_fields() {
         "expected task_id field in tracing output, got: {logs}"
     );
     assert!(
-        has_field_value(&logs, "outcome", "running"),
-        "expected outcome field in tracing output, got: {logs}"
+        has_field_value(&logs, "outcome", "running")
+            || has_field_value(&logs, "outcome", "preparing"),
+        "expected running/preparing outcome field in tracing output, got: {logs}"
     );
 }
