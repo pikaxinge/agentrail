@@ -465,6 +465,60 @@ fn delivery_submit_rejects_steer_required_without_interactive_command() {
 }
 
 #[test]
+fn delivery_submit_rejects_steer_required_for_codex_exec_shape() {
+    let tmp = tempdir().expect("tempdir");
+    let task_id = unique_task_id("task-delivery-steer-required-codex-exec");
+
+    let err = handle_tool_call(
+        "delivery_submit",
+        json!({
+            "task_id": task_id,
+            "worker_id": "worker-a",
+            "runner_mode": "tmux",
+            "steer_required": true,
+            "interactive_command": true,
+            "command": "codex",
+            "args": ["exec", "echo should-not-run"],
+            "workdir": tmp.path().display().to_string()
+        }),
+    )
+    .expect_err("delivery_submit should reject codex exec command shape");
+
+    assert!(
+        err.to_string()
+            .contains("rejects non-steerable codex exec command shape"),
+        "expected non-steerable codex exec validation error, got: {err}"
+    );
+}
+
+#[test]
+fn delivery_submit_rejects_steer_required_for_guarded_exec_wrapper() {
+    let tmp = tempdir().expect("tempdir");
+    let task_id = unique_task_id("task-delivery-steer-required-guarded-exec");
+
+    let err = handle_tool_call(
+        "delivery_submit",
+        json!({
+            "task_id": task_id,
+            "worker_id": "worker-a",
+            "runner_mode": "tmux",
+            "steer_required": true,
+            "interactive_command": true,
+            "command": "scripts/codex-guarded-exec.sh",
+            "args": ["--workdir", tmp.path().display().to_string(), "--timeout-sec", "300", "--", "-C", tmp.path().display().to_string(), "echo should-not-run"],
+            "workdir": tmp.path().display().to_string()
+        }),
+    )
+    .expect_err("delivery_submit should reject codex guarded exec wrapper shape");
+
+    assert!(
+        err.to_string()
+            .contains("rejects non-steerable codex exec command shape"),
+        "expected non-steerable guarded exec validation error, got: {err}"
+    );
+}
+
+#[test]
 fn delivery_status_normalized_envelope_uses_deterministic_nulls_when_runtime_data_missing() {
     let task_id = unique_task_id("task-delivery-missing");
 

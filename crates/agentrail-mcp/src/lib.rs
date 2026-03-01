@@ -700,6 +700,30 @@ fn resolve_start_command_and_args(args: &Value) -> Result<(String, Vec<String>)>
     Ok((command, command_args))
 }
 
+fn command_basename(command: &str) -> String {
+    Path::new(command)
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or(command)
+        .to_ascii_lowercase()
+}
+
+fn is_non_steerable_codex_exec_shape(command: &str, args: &[String]) -> bool {
+    let base = command_basename(command);
+    if base == "codex-guarded-exec.sh" || base == "codex-guarded-exec" {
+        return true;
+    }
+    if base == "codex" {
+        return args
+            .first()
+            .is_some_and(|value| value.eq_ignore_ascii_case("exec"));
+    }
+    args.iter().any(|arg| {
+        let lowered = arg.to_ascii_lowercase();
+        lowered.contains("codex exec") || lowered.contains("codex-guarded-exec")
+    })
+}
+
 fn validate_delivery_submit_preflight(args: &Value) -> Result<()> {
     let steer_required = optional_bool(args, "steer_required", false)?;
     if !steer_required {
@@ -715,6 +739,18 @@ fn validate_delivery_submit_preflight(args: &Value) -> Result<()> {
     if !interactive_command {
         anyhow::bail!(
             "invalid delivery_submit: steer_required=true requires interactive_command=true"
+        );
+    }
+
+    let command = optional_string(args, "command").ok_or_else(|| {
+        anyhow::anyhow!(
+            "invalid delivery_submit: steer_required=true requires explicit interactive command"
+        )
+    })?;
+    let command_args = optional_string_array(args, "args")?;
+    if is_non_steerable_codex_exec_shape(&command, &command_args) {
+        anyhow::bail!(
+            "invalid delivery_submit: steer_required=true rejects non-steerable codex exec command shape; use interactive codex session (no exec) or set steer_required=false"
         );
     }
 
