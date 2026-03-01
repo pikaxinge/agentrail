@@ -7,18 +7,21 @@ use axum::{
     routing::{get, post},
 };
 use serde_json::{Value, json};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::future::Future;
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, OnceLock};
-use std::time::Duration;
+use std::sync::{
+    Mutex, OnceLock,
+    atomic::{AtomicU64, Ordering},
+};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter};
 use tracing::{info, warn};
 
 use agentrail_core::{Phase, PhaseStatus, Plan, Step, StepStatus};
 use agentrail_runner::{AgentRunner, ProcessRunner, TaskHandle, TaskSpec, TaskStatus, TmuxRunner};
-use agentrail_store::{TaskRecord, TaskRuntimeState, TaskStore};
+use agentrail_store::{TaskRecord, TaskRuntimeState, TaskStore, TaskStoreSnapshot};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RuntimeRunnerMode {
@@ -43,19 +46,101 @@ impl RuntimeRunnerMode {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CleanupRetentionMode {
+    Purge,
+    Retain,
+}
+
+impl CleanupRetentionMode {
+    fn parse(raw: Option<&str>) -> Result<Self> {
+        match raw.unwrap_or("purge") {
+            "purge" => Ok(Self::Purge),
+            "retain" => Ok(Self::Retain),
+            other => anyhow::bail!("unsupported retention_mode: {other}"),
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Purge => "purge",
+            Self::Retain => "retain",
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 struct RuntimeTaskSession {
     session_id: String,
     runner_mode: RuntimeRunnerMode,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DeliveryEvent {
+    cursor: u64,
+    task_id: String,
+    event_type: String,
+    timestamp: u64,
+    state: String,
+    runtime_state: String,
+    session_id: Option<String>,
+}
+
+impl DeliveryEvent {
+    fn as_json(&self) -> Value {
+        json!({
+            "cursor": self.cursor,
+            "task_id": self.task_id,
+            "event_type": self.event_type,
+            "timestamp": self.timestamp,
+            "state": self.state,
+            "runtime_state": self.runtime_state,
+            "session_id": self.session_id
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DeliveryEventSignature {
+    event_type: String,
+    state: String,
+    runtime_state: String,
+    session_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DeliveryStatusObservation {
+    state: String,
+    runtime_state: String,
+    session_id: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct DeliverySubscription {
+    cursor: u64,
+    task_id: Option<String>,
+}
+
 #[derive(Debug)]
 struct RuntimeState {
     store: TaskStore,
     sessions: HashMap<String, RuntimeTaskSession>,
+    delivery_events: Vec<DeliveryEvent>,
+    next_delivery_cursor: u64,
+    delivery_subscriptions: HashMap<String, DeliverySubscription>,
+    last_event_signature_by_task: HashMap<String, DeliveryEventSignature>,
+    last_status_observation_by_task: HashMap<String, DeliveryStatusObservation>,
+}
+
+#[derive(Debug, Clone)]
+struct RuntimeCleanupTarget {
+    task_id: String,
+    record: Option<TaskRecord>,
+    session: Option<RuntimeTaskSession>,
 }
 
 static RUNTIME_STATE: OnceLock<Mutex<RuntimeState>> = OnceLock::new();
+static DELIVERY_SUBSCRIBER_SEQ: AtomicU64 = AtomicU64::new(1);
 
 fn runtime_state() -> &'static Mutex<RuntimeState> {
     RUNTIME_STATE.get_or_init(|| {
@@ -66,6 +151,11 @@ fn runtime_state() -> &'static Mutex<RuntimeState> {
         Mutex::new(RuntimeState {
             store: TaskStore::connect(dsn),
             sessions: HashMap::new(),
+            delivery_events: Vec::new(),
+            next_delivery_cursor: 1,
+            delivery_subscriptions: HashMap::new(),
+            last_event_signature_by_task: HashMap::new(),
+            last_status_observation_by_task: HashMap::new(),
         })
     })
 }
@@ -86,10 +176,179 @@ fn runtime_state_label(state: TaskRuntimeState) -> &'static str {
     }
 }
 
+fn delivery_timestamp_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
+fn next_subscriber_id() -> String {
+    let seq = DELIVERY_SUBSCRIBER_SEQ.fetch_add(1, Ordering::Relaxed);
+    format!("delivery-sub-{seq}")
+}
+
+fn runtime_state_mutex() -> Result<std::sync::MutexGuard<'static, RuntimeState>> {
+    runtime_state()
+        .lock()
+        .map_err(|_| anyhow::anyhow!("runtime state lock poisoned"))
+}
+
+fn reset_delivery_tracking(runtime: &mut RuntimeState, task_id: &str) {
+    runtime.last_event_signature_by_task.remove(task_id);
+    runtime.last_status_observation_by_task.remove(task_id);
+}
+
+fn emit_delivery_event(
+    runtime: &mut RuntimeState,
+    task_id: &str,
+    event_type: &str,
+    state: &str,
+    runtime_state: &str,
+    session_id: Option<String>,
+) {
+    let signature = DeliveryEventSignature {
+        event_type: event_type.to_string(),
+        state: state.to_string(),
+        runtime_state: runtime_state.to_string(),
+        session_id: session_id.clone(),
+    };
+    if runtime
+        .last_event_signature_by_task
+        .get(task_id)
+        .is_some_and(|existing| *existing == signature)
+    {
+        return;
+    }
+
+    let cursor = runtime.next_delivery_cursor;
+    runtime.next_delivery_cursor = runtime.next_delivery_cursor.saturating_add(1);
+    runtime.delivery_events.push(DeliveryEvent {
+        cursor,
+        task_id: task_id.to_string(),
+        event_type: event_type.to_string(),
+        timestamp: delivery_timestamp_ms(),
+        state: state.to_string(),
+        runtime_state: runtime_state.to_string(),
+        session_id,
+    });
+    runtime
+        .last_event_signature_by_task
+        .insert(task_id.to_string(), signature);
+}
+
+fn emit_delivery_status_events(
+    task_id: &str,
+    state: &str,
+    runtime_state: &str,
+    session_id: Option<String>,
+) -> Result<()> {
+    let mut runtime = runtime_state_mutex()?;
+    let observation = DeliveryStatusObservation {
+        state: state.to_string(),
+        runtime_state: runtime_state.to_string(),
+        session_id: session_id.clone(),
+    };
+    let changed = runtime
+        .last_status_observation_by_task
+        .get(task_id)
+        .is_none_or(|existing| *existing != observation);
+
+    if changed {
+        emit_delivery_event(
+            &mut runtime,
+            task_id,
+            "status_changed",
+            state,
+            runtime_state,
+            session_id.clone(),
+        );
+        runtime
+            .last_status_observation_by_task
+            .insert(task_id.to_string(), observation);
+    }
+
+    if matches!(state, "completed" | "failed" | "stopped") {
+        emit_delivery_event(
+            &mut runtime,
+            task_id,
+            state,
+            state,
+            runtime_state,
+            session_id,
+        );
+    }
+
+    Ok(())
+}
+
+fn runtime_state_from_label(label: &str) -> Result<TaskRuntimeState> {
+    match label {
+        "queued" => Ok(TaskRuntimeState::Queued),
+        "preparing" => Ok(TaskRuntimeState::Preparing),
+        "running" => Ok(TaskRuntimeState::Running),
+        "review_failed" => Ok(TaskRuntimeState::ReviewFailed),
+        "fixing" => Ok(TaskRuntimeState::Fixing),
+        "validating" => Ok(TaskRuntimeState::Validating),
+        "ready_to_merge" => Ok(TaskRuntimeState::ReadyToMerge),
+        "merged" => Ok(TaskRuntimeState::Merged),
+        "failed_retryable" => Ok(TaskRuntimeState::FailedRetryable),
+        "failed_terminal" => Ok(TaskRuntimeState::FailedTerminal),
+        "needs_attention" => Ok(TaskRuntimeState::NeedsAttention),
+        _ => anyhow::bail!("invalid runtime state label: {label}"),
+    }
+}
+
 fn optional_string(args: &Value, field: &str) -> Option<String> {
     args.get(field)
         .and_then(Value::as_str)
         .map(ToString::to_string)
+}
+
+fn validate_delivery_cursor_bounds(
+    tool_name: &str,
+    cursor_field: &str,
+    requested_cursor: u64,
+    latest_cursor: u64,
+) -> Result<()> {
+    if requested_cursor > latest_cursor {
+        anyhow::bail!(
+            "invalid {cursor_field} for {tool_name}: {requested_cursor} is ahead of latest cursor {latest_cursor}"
+        );
+    }
+    Ok(())
+}
+
+fn parse_optional_u64(args: &Value, field: &str) -> Result<Option<u64>> {
+    let Some(value) = args.get(field) else {
+        return Ok(None);
+    };
+
+    if let Some(raw) = value.as_u64() {
+        return Ok(Some(raw));
+    }
+    if let Some(raw) = value.as_str() {
+        let parsed = raw
+            .parse::<u64>()
+            .map_err(|_| anyhow::anyhow!("invalid {field}: must be unsigned integer"))?;
+        return Ok(Some(parsed));
+    }
+
+    anyhow::bail!("invalid {field}: must be unsigned integer")
+}
+
+fn require_u64_field(tool_name: &str, args: &Value, field: &str) -> Result<u64> {
+    parse_optional_u64(args, field)?
+        .ok_or_else(|| anyhow::anyhow!("missing {field}"))
+        .inspect(|_| {
+            info!(
+                operation = "mcp_tool_call",
+                tool = tool_name,
+                field = field,
+                outcome = "validated",
+                "validated MCP tool call arguments"
+            );
+        })
 }
 
 fn optional_u32(args: &Value, field: &str, default: u32) -> Result<u32> {
@@ -103,6 +362,40 @@ fn optional_u32(args: &Value, field: &str, default: u32) -> Result<u32> {
                 .map_err(|_| anyhow::anyhow!("invalid {field}: out of range for u32"))?)
         }
     }
+}
+
+fn optional_bool(args: &Value, field: &str, default: bool) -> Result<bool> {
+    match args.get(field) {
+        None => Ok(default),
+        Some(value) => value
+            .as_bool()
+            .ok_or_else(|| anyhow::anyhow!("invalid {field}: must be boolean")),
+    }
+}
+
+fn optional_u64(args: &Value, field: &str) -> Result<Option<u64>> {
+    let Some(value) = args.get(field) else {
+        return Ok(None);
+    };
+    let raw = value
+        .as_u64()
+        .ok_or_else(|| anyhow::anyhow!("invalid {field}: must be unsigned integer"))?;
+    Ok(Some(raw))
+}
+
+fn optional_i64(args: &Value, field: &str) -> Result<Option<i64>> {
+    let Some(value) = args.get(field) else {
+        return Ok(None);
+    };
+    if let Some(raw) = value.as_i64() {
+        return Ok(Some(raw));
+    }
+    if let Some(raw) = value.as_u64() {
+        return Ok(Some(i64::try_from(raw).map_err(|_| {
+            anyhow::anyhow!("invalid {field}: out of range for i64")
+        })?));
+    }
+    anyhow::bail!("invalid {field}: must be integer");
 }
 
 fn optional_string_array(args: &Value, field: &str) -> Result<Vec<String>> {
@@ -119,6 +412,86 @@ fn optional_string_array(args: &Value, field: &str) -> Result<Vec<String>> {
                 .ok_or_else(|| anyhow::anyhow!("invalid {field}: array must contain strings"))
         })
         .collect()
+}
+
+fn now_unix_timestamp_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .and_then(|duration| u64::try_from(duration.as_millis()).ok())
+        .unwrap_or(0)
+}
+
+fn delivery_logs_truncated(orchestration: &Value, tail: u32) -> bool {
+    if tail == 0 {
+        return false;
+    }
+
+    let Some(logs) = orchestration.get("logs").and_then(Value::as_str) else {
+        return false;
+    };
+
+    let line_count = if logs.is_empty() {
+        0
+    } else {
+        logs.lines().count()
+    };
+    line_count >= tail as usize
+}
+
+fn delivery_status_normalized_v1(orchestration: &Value, tail: u32) -> Value {
+    let field = |name: &str| orchestration.get(name).cloned().unwrap_or(Value::Null);
+
+    json!({
+        "tool": "delivery_status",
+        "task_id": field("task_id"),
+        "state": field("state"),
+        "runtime_state": field("runtime_state"),
+        "runner_mode": field("runner_mode"),
+        "session_id": field("session_id"),
+        "assigned_worker": field("assigned_worker"),
+        "retry_count": field("retry_count"),
+        "retry_budget": field("retry_budget"),
+        "timestamps": {
+            "updated_at": now_unix_timestamp_ms()
+        },
+        "logs": {
+            "tail": tail,
+            "truncated": delivery_logs_truncated(orchestration, tail)
+        }
+    })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ReportCursor {
+    updated_epoch_ms: i64,
+    task_id: String,
+}
+
+fn encode_report_cursor(cursor: &ReportCursor) -> String {
+    json!({
+        "updated_epoch_ms": cursor.updated_epoch_ms,
+        "task_id": cursor.task_id
+    })
+    .to_string()
+}
+
+fn decode_report_cursor(raw: &str) -> Result<ReportCursor> {
+    let parsed: Value = serde_json::from_str(raw)
+        .map_err(|error| anyhow::anyhow!("invalid cursor: expected JSON object ({error})"))?;
+    let updated_epoch_ms = parsed
+        .get("updated_epoch_ms")
+        .and_then(Value::as_i64)
+        .ok_or_else(|| anyhow::anyhow!("invalid cursor: missing updated_epoch_ms"))?;
+    let task_id = parsed
+        .get("task_id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("invalid cursor: missing task_id"))?
+        .to_string();
+    Ok(ReportCursor {
+        updated_epoch_ms,
+        task_id,
+    })
 }
 
 fn block_on_result<T>(future: impl Future<Output = Result<T>>) -> Result<T> {
@@ -173,6 +546,13 @@ async fn runner_logs(mode: RuntimeRunnerMode, session_id: &str, tail: usize) -> 
     }
 }
 
+async fn runner_stop(mode: RuntimeRunnerMode, session_id: &str) -> Result<()> {
+    match mode {
+        RuntimeRunnerMode::Process => ProcessRunner.stop(session_id).await,
+        RuntimeRunnerMode::Tmux => TmuxRunner.stop(session_id).await,
+    }
+}
+
 fn map_runner_to_runtime_state(state: &str) -> Option<TaskRuntimeState> {
     match state {
         "running" => Some(TaskRuntimeState::Running),
@@ -193,24 +573,74 @@ fn runtime_state_is_terminal(state: TaskRuntimeState) -> bool {
     )
 }
 
+fn runtime_state_is_active(state: TaskRuntimeState) -> bool {
+    matches!(
+        state,
+        TaskRuntimeState::Preparing | TaskRuntimeState::Running
+    )
+}
+
+fn runtime_state_is_finished_or_abandoned(state: TaskRuntimeState) -> bool {
+    matches!(
+        state,
+        TaskRuntimeState::ReadyToMerge
+            | TaskRuntimeState::Merged
+            | TaskRuntimeState::FailedRetryable
+            | TaskRuntimeState::FailedTerminal
+            | TaskRuntimeState::NeedsAttention
+    )
+}
+
+fn can_transition_to_failed_retryable(state: TaskRuntimeState) -> bool {
+    matches!(
+        state,
+        TaskRuntimeState::Preparing
+            | TaskRuntimeState::Running
+            | TaskRuntimeState::ReviewFailed
+            | TaskRuntimeState::Fixing
+            | TaskRuntimeState::Validating
+            | TaskRuntimeState::ReadyToMerge
+    )
+}
+
+fn can_transition_to_failed_terminal(state: TaskRuntimeState) -> bool {
+    matches!(
+        state,
+        TaskRuntimeState::Queued
+            | TaskRuntimeState::Preparing
+            | TaskRuntimeState::Running
+            | TaskRuntimeState::ReviewFailed
+            | TaskRuntimeState::Fixing
+            | TaskRuntimeState::Validating
+            | TaskRuntimeState::ReadyToMerge
+            | TaskRuntimeState::FailedRetryable
+            | TaskRuntimeState::NeedsAttention
+    )
+}
+
+fn is_session_not_found_error(error: &anyhow::Error) -> bool {
+    error.to_string().contains("session not found")
+}
+
 fn clear_runtime_session(task_id: &str) -> Result<()> {
-    let mut runtime = runtime_state()
-        .lock()
-        .map_err(|_| anyhow::anyhow!("runtime state lock poisoned"))?;
+    let mut runtime = runtime_state_mutex()?;
     runtime.sessions.remove(task_id);
     Ok(())
 }
 
-fn ensure_task_preparing(task_id: &str, worker_id: &str, retry_budget: u32) -> Result<()> {
-    let runtime = runtime_state()
-        .lock()
-        .map_err(|_| anyhow::anyhow!("runtime state lock poisoned"))?;
+fn ensure_task_preparing(
+    task_id: &str,
+    worker_id: &str,
+    retry_budget: u32,
+    scope_id: Option<&str>,
+) -> Result<()> {
+    let mut runtime = runtime_state_mutex()?;
 
     match runtime.store.get_task(task_id)? {
         None => {
-            runtime
-                .store
-                .upsert_task(&TaskRecord::new(task_id, worker_id, retry_budget))?;
+            let mut task = TaskRecord::new(task_id, worker_id, retry_budget);
+            task.scope_id = scope_id.map(ToString::to_string);
+            runtime.store.upsert_task(&task)?;
         }
         Some(existing) => match existing.state {
             TaskRuntimeState::Preparing | TaskRuntimeState::Running => {
@@ -220,11 +650,21 @@ fn ensure_task_preparing(task_id: &str, worker_id: &str, retry_budget: u32) -> R
                 runtime
                     .store
                     .reassign_worker(task_id, worker_id.to_string())?;
+                if let Some(scope_id) = scope_id {
+                    runtime
+                        .store
+                        .set_scope(task_id, Some(scope_id.to_string()))?;
+                }
             }
             TaskRuntimeState::FailedRetryable | TaskRuntimeState::NeedsAttention => {
                 runtime
                     .store
                     .reassign_worker(task_id, worker_id.to_string())?;
+                if let Some(scope_id) = scope_id {
+                    runtime
+                        .store
+                        .set_scope(task_id, Some(scope_id.to_string()))?;
+                }
                 runtime
                     .store
                     .transition(task_id, TaskRuntimeState::Queued)?;
@@ -251,6 +691,7 @@ fn ensure_task_preparing(task_id: &str, worker_id: &str, retry_budget: u32) -> R
     runtime
         .store
         .transition(task_id, TaskRuntimeState::Preparing)?;
+    reset_delivery_tracking(&mut runtime, task_id);
     Ok(())
 }
 
@@ -302,12 +743,13 @@ fn register_running_session(
 async fn orchestrate_start_runtime(args: Value) -> Result<Value> {
     let task_id = require_task_id("orchestrate_start", &args)?.to_string();
     let worker_id = optional_string(&args, "worker_id").unwrap_or_else(|| "worker-default".into());
+    let scope_id = optional_string(&args, "scope_id");
     let retry_budget = optional_u32(&args, "retry_budget", 3)?;
     let runner_mode = RuntimeRunnerMode::parse(args.get("runner_mode").and_then(Value::as_str))?;
     let (command, command_args) = resolve_start_command_and_args(&args)?;
     let workdir = optional_string(&args, "workdir").unwrap_or_else(|| ".".to_string());
 
-    ensure_task_preparing(&task_id, &worker_id, retry_budget)?;
+    ensure_task_preparing(&task_id, &worker_id, retry_budget, scope_id.as_deref())?;
 
     let spec = TaskSpec {
         id: task_id.clone(),
@@ -348,9 +790,7 @@ async fn orchestrate_start_runtime(args: Value) -> Result<Value> {
 
 async fn task_runtime_status(task_id: &str, tail: usize) -> Result<Value> {
     let (session, record) = {
-        let runtime = runtime_state()
-            .lock()
-            .map_err(|_| anyhow::anyhow!("runtime state lock poisoned"))?;
+        let runtime = runtime_state_mutex()?;
         (
             runtime.sessions.get(task_id).cloned(),
             runtime.store.get_task(task_id)?,
@@ -403,9 +843,7 @@ async fn task_runtime_status(task_id: &str, tail: usize) -> Result<Value> {
         }
     };
     if let Some(target) = map_runner_to_runtime_state(&status.state) {
-        let runtime = runtime_state()
-            .lock()
-            .map_err(|_| anyhow::anyhow!("runtime state lock poisoned"))?;
+        let runtime = runtime_state_mutex()?;
         if let Some(current) = runtime.store.get_task(task_id)?
             && current.state != target
             && current.state != TaskRuntimeState::Merged
@@ -416,9 +854,7 @@ async fn task_runtime_status(task_id: &str, tail: usize) -> Result<Value> {
     }
 
     let latest = {
-        let runtime = runtime_state()
-            .lock()
-            .map_err(|_| anyhow::anyhow!("runtime state lock poisoned"))?;
+        let runtime = runtime_state_mutex()?;
         runtime
             .store
             .get_task(task_id)?
@@ -432,6 +868,13 @@ async fn task_runtime_status(task_id: &str, tail: usize) -> Result<Value> {
             return Err(error);
         }
     };
+    let runtime_state = runtime_state_label(latest.state).to_string();
+    emit_delivery_status_events(
+        task_id,
+        &status.state,
+        &runtime_state,
+        Some(session.session_id.clone()),
+    )?;
 
     if runner_state_is_terminal(&status.state) || runtime_state_is_terminal(latest.state) {
         let _ = clear_runtime_session(task_id);
@@ -441,7 +884,7 @@ async fn task_runtime_status(task_id: &str, tail: usize) -> Result<Value> {
         "tool": "orchestrate_status",
         "task_id": task_id,
         "state": status.state,
-        "runtime_state": runtime_state_label(latest.state),
+        "runtime_state": runtime_state,
         "session_id": session.session_id,
         "runner_mode": session.runner_mode.as_str(),
         "assigned_worker": latest.assigned_worker,
@@ -491,14 +934,151 @@ async fn orchestrate_steer_runtime(args: Value) -> Result<Value> {
     }))
 }
 
-fn runtime_report() -> Result<Value> {
-    let runtime = runtime_state()
-        .lock()
-        .map_err(|_| anyhow::anyhow!("runtime state lock poisoned"))?;
-    let snapshot = runtime.store.export_snapshot()?;
+fn runtime_cleanup_targets(task_id_filter: Option<&str>) -> Result<Vec<RuntimeCleanupTarget>> {
+    let runtime = runtime_state_mutex()?;
 
-    let mut summary = json!({
-        "total": snapshot.tasks.len(),
+    if let Some(task_id) = task_id_filter {
+        return Ok(vec![RuntimeCleanupTarget {
+            task_id: task_id.to_string(),
+            record: runtime.store.get_task(task_id)?,
+            session: runtime.sessions.get(task_id).cloned(),
+        }]);
+    }
+
+    let snapshot = runtime.store.export_snapshot()?;
+    let mut known_task_ids = HashSet::new();
+    let mut targets = Vec::new();
+    for record in snapshot.tasks {
+        known_task_ids.insert(record.id.clone());
+        targets.push(RuntimeCleanupTarget {
+            task_id: record.id.clone(),
+            record: Some(record.clone()),
+            session: runtime.sessions.get(&record.id).cloned(),
+        });
+    }
+
+    for (task_id, session) in &runtime.sessions {
+        if !known_task_ids.contains(task_id) {
+            targets.push(RuntimeCleanupTarget {
+                task_id: task_id.clone(),
+                record: None,
+                session: Some(session.clone()),
+            });
+        }
+    }
+
+    Ok(targets)
+}
+
+fn task_matches_prune_filters(
+    task: &TaskRecord,
+    scope_id: Option<&str>,
+    state_filter: &HashSet<TaskRuntimeState>,
+    updated_before_epoch_ms: i64,
+) -> bool {
+    if let Some(scope) = scope_id
+        && task.scope_id.as_deref() != Some(scope)
+    {
+        return false;
+    }
+    if !state_filter.is_empty() && !state_filter.contains(&task.state) {
+        return false;
+    }
+    task.updated_epoch_ms < updated_before_epoch_ms
+}
+
+fn purge_runtime_tasks(task_ids: &HashSet<String>) -> Result<usize> {
+    if task_ids.is_empty() {
+        return Ok(0);
+    }
+
+    let mut runtime = runtime_state_mutex()?;
+    let snapshot = runtime.store.export_snapshot()?;
+    let before = snapshot.tasks.len();
+    let retained = snapshot
+        .tasks
+        .into_iter()
+        .filter(|task| !task_ids.contains(&task.id))
+        .collect::<Vec<_>>();
+    let removed = before.saturating_sub(retained.len());
+    runtime
+        .store
+        .import_snapshot(TaskStoreSnapshot { tasks: retained })?;
+    for task_id in task_ids {
+        runtime.sessions.remove(task_id);
+        reset_delivery_tracking(&mut runtime, task_id);
+    }
+    Ok(removed)
+}
+
+async fn delivery_stop_runtime(args: Value) -> Result<Value> {
+    let task_id = require_task_id("delivery_stop", &args)?.to_string();
+    let reason = optional_string(&args, "reason");
+
+    let (session, record_before) = {
+        let runtime = runtime_state_mutex()?;
+        (
+            runtime.sessions.get(&task_id).cloned(),
+            runtime.store.get_task(&task_id)?,
+        )
+    };
+
+    let active_or_session = session.is_some()
+        || record_before
+            .as_ref()
+            .map(|task| runtime_state_is_active(task.state))
+            .unwrap_or(false);
+
+    let mut stop_propagated = false;
+    if let Some(active_session) = session.as_ref() {
+        match runner_stop(active_session.runner_mode, &active_session.session_id).await {
+            Ok(()) => {
+                stop_propagated = true;
+            }
+            Err(error) if is_session_not_found_error(&error) => {}
+            Err(error) => return Err(error),
+        }
+        let _ = clear_runtime_session(&task_id);
+    }
+
+    let runtime_state = {
+        let runtime = runtime_state_mutex()?;
+        if let Some(task) = runtime.store.get_task(&task_id)? {
+            if active_or_session
+                && task.state != TaskRuntimeState::FailedRetryable
+                && can_transition_to_failed_retryable(task.state)
+            {
+                let _ = runtime
+                    .store
+                    .transition(&task_id, TaskRuntimeState::FailedRetryable)?;
+            }
+            let latest = runtime.store.get_task(&task_id)?.ok_or_else(|| {
+                anyhow::anyhow!("task not found after stop transition: {task_id}")
+            })?;
+            runtime_state_label(latest.state).to_string()
+        } else {
+            "unknown".to_string()
+        }
+    };
+
+    if active_or_session {
+        let session_id = session.as_ref().map(|active| active.session_id.clone());
+        emit_delivery_status_events(&task_id, "stopped", &runtime_state, session_id)?;
+    }
+
+    Ok(json!({
+        "tool": "delivery_stop",
+        "task_id": task_id,
+        "status": if active_or_session { "stopped" } else { "already_stopped" },
+        "runtime_state": runtime_state,
+        "stop_propagated": stop_propagated,
+        "reason": reason
+    }))
+}
+
+fn runtime_summary_template(total: usize) -> Value {
+    json!({
+        "total": total,
         "queued": 0,
         "preparing": 0,
         "running": 0,
@@ -510,9 +1090,12 @@ fn runtime_report() -> Result<Value> {
         "failed_retryable": 0,
         "failed_terminal": 0,
         "needs_attention": 0
-    });
+    })
+}
 
-    for task in &snapshot.tasks {
+fn build_runtime_summary(tasks: &[TaskRecord]) -> Value {
+    let mut summary = runtime_summary_template(tasks.len());
+    for task in tasks {
         let key = runtime_state_label(task.state);
         if let Some(slot) = summary.get_mut(key)
             && let Some(raw) = slot.as_u64()
@@ -520,14 +1103,108 @@ fn runtime_report() -> Result<Value> {
             *slot = json!(raw + 1);
         }
     }
+    summary
+}
 
-    let tasks = snapshot
+fn task_is_after_cursor(task: &TaskRecord, cursor: &ReportCursor) -> bool {
+    task.updated_epoch_ms < cursor.updated_epoch_ms
+        || (task.updated_epoch_ms == cursor.updated_epoch_ms && task.id > cursor.task_id)
+}
+
+fn runtime_report(args: &Value) -> Result<Value> {
+    let scope_id = optional_string(args, "scope_id");
+    let state_labels = optional_string_array(args, "states")?;
+    let mut state_filter = HashSet::new();
+    for label in &state_labels {
+        runtime_state_from_label(label)?;
+        state_filter.insert(label.clone());
+    }
+
+    let updated_since_epoch_ms = optional_i64(args, "updated_since_epoch_ms")?;
+    if let Some(updated_since_epoch_ms) = updated_since_epoch_ms
+        && updated_since_epoch_ms < 0
+    {
+        anyhow::bail!("invalid updated_since_epoch_ms: must be non-negative");
+    }
+
+    let limit = optional_u64(args, "limit")?
+        .map(|raw| usize::try_from(raw).map_err(|_| anyhow::anyhow!("invalid limit: out of range")))
+        .transpose()?;
+    if let Some(limit) = limit
+        && limit == 0
+    {
+        anyhow::bail!("invalid limit: must be >= 1");
+    }
+
+    let cursor = optional_string(args, "cursor")
+        .map(|raw| decode_report_cursor(raw.as_str()))
+        .transpose()?;
+
+    let runtime = runtime_state_mutex()?;
+    let snapshot = runtime.store.export_snapshot()?;
+
+    let uses_report_query = scope_id.is_some()
+        || !state_filter.is_empty()
+        || updated_since_epoch_ms.is_some()
+        || limit.is_some()
+        || cursor.is_some();
+
+    let mut filtered = snapshot
         .tasks
+        .into_iter()
+        .filter(|task| {
+            if let Some(scope_id) = scope_id.as_deref()
+                && task.scope_id.as_deref() != Some(scope_id)
+            {
+                return false;
+            }
+            if !state_filter.is_empty() && !state_filter.contains(runtime_state_label(task.state)) {
+                return false;
+            }
+            if let Some(updated_since_epoch_ms) = updated_since_epoch_ms
+                && task.updated_epoch_ms < updated_since_epoch_ms
+            {
+                return false;
+            }
+            true
+        })
+        .collect::<Vec<_>>();
+
+    if uses_report_query {
+        filtered.sort_by(|left, right| {
+            right
+                .updated_epoch_ms
+                .cmp(&left.updated_epoch_ms)
+                .then_with(|| left.id.cmp(&right.id))
+        });
+    }
+
+    let summary = build_runtime_summary(&filtered);
+
+    if let Some(cursor) = cursor {
+        filtered.retain(|task| task_is_after_cursor(task, &cursor));
+    }
+
+    let mut next_cursor = None;
+    if let Some(limit) = limit
+        && filtered.len() > limit
+    {
+        let last_task = &filtered[limit - 1];
+        next_cursor = Some(encode_report_cursor(&ReportCursor {
+            updated_epoch_ms: last_task.updated_epoch_ms,
+            task_id: last_task.id.clone(),
+        }));
+        filtered.truncate(limit);
+    }
+
+    let tasks = filtered
         .iter()
         .map(|task| {
             json!({
                 "task_id": task.id,
+                "scope_id": task.scope_id,
                 "state": runtime_state_label(task.state),
+                "updated_epoch_ms": task.updated_epoch_ms,
                 "assigned_worker": task.assigned_worker,
                 "retry_count": task.retry_count,
                 "retry_budget": task.retry_budget
@@ -537,16 +1214,378 @@ fn runtime_report() -> Result<Value> {
 
     Ok(json!({
         "tool": "delivery_report",
+        "scope_id": scope_id,
         "summary": summary,
-        "tasks": tasks
+        "tasks": tasks,
+        "next_cursor": next_cursor
+    }))
+}
+
+async fn delivery_cleanup_runtime(args: Value) -> Result<Value> {
+    let has_prune_filters = args.get("scope_id").is_some()
+        || args.get("states").is_some()
+        || args.get("updated_before_epoch_ms").is_some();
+
+    if has_prune_filters {
+        let scope_id = optional_string(&args, "scope_id");
+        let state_labels = optional_string_array(&args, "states")?;
+        let mut states = Vec::new();
+        for label in &state_labels {
+            states.push(runtime_state_from_label(label)?);
+        }
+        let state_filter = states.iter().copied().collect::<HashSet<_>>();
+
+        let updated_before_epoch_ms = optional_i64(&args, "updated_before_epoch_ms")?
+            .ok_or_else(|| anyhow::anyhow!("missing updated_before_epoch_ms"))?;
+        if updated_before_epoch_ms < 0 {
+            anyhow::bail!("invalid updated_before_epoch_ms: must be non-negative");
+        }
+
+        let candidates = {
+            let runtime = runtime_state_mutex()?;
+            let snapshot = runtime.store.export_snapshot()?;
+            snapshot
+                .tasks
+                .into_iter()
+                .filter_map(|task| {
+                    if !task_matches_prune_filters(
+                        &task,
+                        scope_id.as_deref(),
+                        &state_filter,
+                        updated_before_epoch_ms,
+                    ) {
+                        return None;
+                    }
+                    let session = runtime.sessions.get(&task.id).cloned();
+                    Some((task.id, task.state, session))
+                })
+                .collect::<Vec<_>>()
+        };
+
+        let mut stale_session_task_ids = HashSet::new();
+        let mut active_task_ids = HashSet::new();
+        for (task_id, task_state, session) in &candidates {
+            if runtime_state_is_active(*task_state) {
+                active_task_ids.insert(task_id.clone());
+            }
+
+            if let Some(session) = session {
+                match runner_status(session.runner_mode, &session.session_id).await {
+                    Ok(status) => {
+                        if runner_state_is_terminal(&status.state) {
+                            stale_session_task_ids.insert(task_id.clone());
+                        } else {
+                            active_task_ids.insert(task_id.clone());
+                        }
+                    }
+                    Err(error) if is_session_not_found_error(&error) => {
+                        stale_session_task_ids.insert(task_id.clone());
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+        }
+
+        let mut runtime = runtime_state_mutex()?;
+        for task_id in &stale_session_task_ids {
+            runtime.sessions.remove(task_id);
+        }
+
+        for (task_id, _, _) in &candidates {
+            let Some(task) = runtime.store.get_task(task_id)? else {
+                continue;
+            };
+            if !task_matches_prune_filters(
+                &task,
+                scope_id.as_deref(),
+                &state_filter,
+                updated_before_epoch_ms,
+            ) {
+                continue;
+            }
+            if runtime_state_is_active(task.state) || runtime.sessions.contains_key(task_id) {
+                active_task_ids.insert(task_id.clone());
+            }
+        }
+
+        if !active_task_ids.is_empty() {
+            let mut active = active_task_ids.into_iter().collect::<Vec<_>>();
+            active.sort_unstable();
+            anyhow::bail!(
+                "retention prune refused for active task(s): {}",
+                active.join(", ")
+            );
+        }
+
+        let deleted_task_ids = runtime.store.prune_tasks(
+            scope_id.as_deref(),
+            &states,
+            Some(updated_before_epoch_ms),
+        )?;
+        for task_id in &deleted_task_ids {
+            runtime.sessions.remove(task_id);
+            reset_delivery_tracking(&mut runtime, task_id);
+        }
+
+        let deleted_count = deleted_task_ids.len();
+        return Ok(json!({
+            "tool": "delivery_cleanup",
+            "status": "ok",
+            "mode": "retention_prune",
+            "scope_id": scope_id,
+            "states": state_labels,
+            "updated_before_epoch_ms": updated_before_epoch_ms,
+            "deleted_count": deleted_count,
+            "deleted_task_ids": deleted_task_ids,
+            "cleaned_count": deleted_count,
+            "retained_count": 0,
+            "skipped_count": 0
+        }));
+    }
+
+    let task_id_filter = optional_string(&args, "task_id");
+    let force = optional_bool(&args, "force", false)?;
+    let retention_mode =
+        CleanupRetentionMode::parse(args.get("retention_mode").and_then(Value::as_str))?;
+
+    let targets = runtime_cleanup_targets(task_id_filter.as_deref())?;
+
+    let mut purged_task_ids = HashSet::new();
+    let mut retained_count = 0usize;
+    let mut cleaned_count = 0usize;
+    let mut skipped_count = 0usize;
+    let mut task_results = Vec::new();
+
+    for target in targets {
+        let mut record_state = target.record.as_ref().map(|task| task.state);
+        let mut active = record_state.map(runtime_state_is_active).unwrap_or(false);
+
+        if let Some(session) = target.session.as_ref() {
+            match runner_status(session.runner_mode, &session.session_id).await {
+                Ok(status) => {
+                    active = !runner_state_is_terminal(&status.state);
+                }
+                Err(error) if is_session_not_found_error(&error) => {
+                    active = false;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+
+        if active && !force {
+            anyhow::bail!(
+                "cleanup refused for active task {}: retry with force=true",
+                target.task_id
+            );
+        }
+
+        if let Some(session) = target.session.as_ref() {
+            if force {
+                match runner_stop(session.runner_mode, &session.session_id).await {
+                    Ok(()) => {}
+                    Err(error) if is_session_not_found_error(&error) => {}
+                    Err(error) => return Err(error),
+                }
+            }
+            let _ = clear_runtime_session(&target.task_id);
+        }
+
+        let eligible = force
+            || record_state
+                .map(runtime_state_is_finished_or_abandoned)
+                .unwrap_or(true);
+
+        if !eligible {
+            skipped_count += 1;
+            task_results.push(json!({
+                "task_id": target.task_id,
+                "action": "skipped_not_finished",
+                "runtime_state": record_state.map(runtime_state_label).unwrap_or("unknown")
+            }));
+            continue;
+        }
+
+        match retention_mode {
+            CleanupRetentionMode::Purge => {
+                if target.record.is_some() {
+                    purged_task_ids.insert(target.task_id.clone());
+                    cleaned_count += 1;
+                } else {
+                    skipped_count += 1;
+                }
+                task_results.push(json!({
+                    "task_id": target.task_id,
+                    "action": "purged",
+                    "runtime_state": "removed"
+                }));
+            }
+            CleanupRetentionMode::Retain => {
+                if force && let Some(current) = record_state {
+                    if can_transition_to_failed_terminal(current) {
+                        let runtime = runtime_state_mutex()?;
+                        let _ = runtime
+                            .store
+                            .transition(&target.task_id, TaskRuntimeState::FailedTerminal)?;
+                        record_state = Some(TaskRuntimeState::FailedTerminal);
+                    }
+                }
+                retained_count += usize::from(target.record.is_some());
+                task_results.push(json!({
+                    "task_id": target.task_id,
+                    "action": "retained",
+                    "runtime_state": record_state.map(runtime_state_label).unwrap_or("unknown")
+                }));
+            }
+        }
+    }
+
+    if !purged_task_ids.is_empty() {
+        cleaned_count = purge_runtime_tasks(&purged_task_ids)?;
+    }
+    let mut deleted_task_ids = purged_task_ids.into_iter().collect::<Vec<_>>();
+    deleted_task_ids.sort_unstable();
+    let deleted_count = deleted_task_ids.len();
+
+    Ok(json!({
+        "tool": "delivery_cleanup",
+        "status": "ok",
+        "mode": "lifecycle",
+        "force": force,
+        "retention_mode": retention_mode.as_str(),
+        "cleaned_count": cleaned_count,
+        "retained_count": retained_count,
+        "skipped_count": skipped_count,
+        "tasks": task_results,
+        "deleted_count": deleted_count,
+        "deleted_task_ids": deleted_task_ids
+    }))
+}
+
+fn task_matches_filter(event_task_id: &str, filter: Option<&str>) -> bool {
+    match filter {
+        Some(task_id) => event_task_id == task_id,
+        None => true,
+    }
+}
+
+fn delivery_events_subscribe(args: Value) -> Result<Value> {
+    let subscriber_id = optional_string(&args, "subscriber_id").unwrap_or_else(next_subscriber_id);
+    let requested_cursor = parse_optional_u64(&args, "cursor")?;
+    let requested_task_id = optional_string(&args, "task_id");
+
+    let mut runtime = runtime_state_mutex()?;
+    let latest_cursor = runtime.next_delivery_cursor.saturating_sub(1);
+    if let Some(cursor) = requested_cursor {
+        validate_delivery_cursor_bounds(
+            "delivery_events_subscribe",
+            "cursor",
+            cursor,
+            latest_cursor,
+        )?;
+    }
+    let subscription = runtime
+        .delivery_subscriptions
+        .entry(subscriber_id.clone())
+        .or_insert_with(|| DeliverySubscription {
+            cursor: latest_cursor,
+            task_id: requested_task_id.clone(),
+        });
+
+    if let Some(cursor) = requested_cursor {
+        subscription.cursor = cursor;
+    }
+    if requested_task_id.is_some() {
+        subscription.task_id = requested_task_id.clone();
+    }
+
+    Ok(json!({
+        "tool": "delivery_events_subscribe",
+        "subscriber_id": subscriber_id,
+        "cursor": subscription.cursor,
+        "task_id": subscription.task_id,
+        "semantics": "at_least_once_with_ack"
+    }))
+}
+
+fn delivery_events_next(args: Value) -> Result<Value> {
+    let subscriber_id = require_string_field("delivery_events_next", &args, "subscriber_id")?;
+    let requested_cursor = parse_optional_u64(&args, "cursor")?;
+    let requested_task_id = optional_string(&args, "task_id");
+    let limit = optional_u32(&args, "limit", 50)? as usize;
+    let limit = limit.clamp(1, 500);
+
+    let runtime = runtime_state_mutex()?;
+    let subscription = runtime
+        .delivery_subscriptions
+        .get(subscriber_id)
+        .ok_or_else(|| anyhow::anyhow!("unknown subscriber_id: {subscriber_id}"))?;
+    let latest_cursor = runtime.next_delivery_cursor.saturating_sub(1);
+    let start_cursor = requested_cursor.unwrap_or(subscription.cursor);
+    validate_delivery_cursor_bounds(
+        "delivery_events_next",
+        "cursor",
+        start_cursor,
+        latest_cursor,
+    )?;
+    let filter_task = requested_task_id
+        .as_deref()
+        .or(subscription.task_id.as_deref());
+
+    let mut next_cursor = start_cursor;
+    let mut events = Vec::new();
+    for event in &runtime.delivery_events {
+        if event.cursor <= start_cursor || !task_matches_filter(&event.task_id, filter_task) {
+            continue;
+        }
+        next_cursor = event.cursor;
+        events.push(event.as_json());
+        if events.len() >= limit {
+            break;
+        }
+    }
+    let has_more = runtime.delivery_events.iter().any(|event| {
+        event.cursor > next_cursor
+            && task_matches_filter(&event.task_id, filter_task)
+            && event.cursor > start_cursor
+    });
+
+    Ok(json!({
+        "tool": "delivery_events_next",
+        "subscriber_id": subscriber_id,
+        "cursor": start_cursor,
+        "next_cursor": next_cursor,
+        "has_more": has_more,
+        "events": events
+    }))
+}
+
+fn delivery_events_ack(args: Value) -> Result<Value> {
+    let subscriber_id = require_string_field("delivery_events_ack", &args, "subscriber_id")?;
+    let requested_cursor = require_u64_field("delivery_events_ack", &args, "cursor")?;
+    let mut runtime = runtime_state_mutex()?;
+    let latest_cursor = runtime.next_delivery_cursor.saturating_sub(1);
+    validate_delivery_cursor_bounds(
+        "delivery_events_ack",
+        "cursor",
+        requested_cursor,
+        latest_cursor,
+    )?;
+    let subscription = runtime
+        .delivery_subscriptions
+        .get_mut(subscriber_id)
+        .ok_or_else(|| anyhow::anyhow!("unknown subscriber_id: {subscriber_id}"))?;
+    subscription.cursor = subscription.cursor.max(requested_cursor);
+
+    Ok(json!({
+        "tool": "delivery_events_ack",
+        "subscriber_id": subscriber_id,
+        "acked_cursor": subscription.cursor
     }))
 }
 
 async fn poll_runtime_once() -> Result<()> {
     let task_ids = {
-        let runtime = runtime_state()
-            .lock()
-            .map_err(|_| anyhow::anyhow!("runtime state lock poisoned"))?;
+        let runtime = runtime_state_mutex()?;
         runtime.sessions.keys().cloned().collect::<Vec<_>>()
     };
 
@@ -942,6 +1981,7 @@ fn mcp_tools_descriptor() -> Value {
                 "type":"object",
                 "properties": {
                     "task_id": {"type":"string"},
+                    "scope_id": {"type":"string"},
                     "worker_id": {"type":"string"},
                     "runner_mode": {"type":"string", "enum": ["process", "tmux"]},
                     "command": {"type":"string"},
@@ -986,6 +2026,7 @@ fn mcp_tools_descriptor() -> Value {
                 "type":"object",
                 "properties": {
                     "task_id": {"type":"string"},
+                    "scope_id": {"type":"string"},
                     "worker_id": {"type":"string"},
                     "runner_mode": {"type":"string", "enum": ["process", "tmux"]},
                     "command": {"type":"string"},
@@ -1001,7 +2042,7 @@ fn mcp_tools_descriptor() -> Value {
         },
         {
             "name":"delivery_status",
-            "description":"High-level runtime status API for chat orchestrators",
+            "description":"High-level runtime status API for chat orchestrators with normalized v1 machine-first envelope",
             "inputSchema": {
                 "type":"object",
                 "properties": {
@@ -1024,13 +2065,104 @@ fn mcp_tools_descriptor() -> Value {
             }
         },
         {
+            "name":"delivery_stop",
+            "description":"High-level stop API for chat orchestrators",
+            "inputSchema": {
+                "type":"object",
+                "properties": {
+                    "task_id": {"type":"string"},
+                    "reason": {"type":"string"}
+                },
+                "required": ["task_id"]
+            }
+        },
+        {
+            "name":"delivery_cleanup",
+            "description":"Lifecycle cleanup with stop/retain controls, plus optional scoped retention pruning filters",
+            "inputSchema": {
+                "type":"object",
+                "properties": {
+                    "task_id": {"type":"string"},
+                    "force": {"type":"boolean"},
+                    "retention_mode": {"type":"string", "enum": ["purge", "retain"]},
+                    "scope_id": {"type":"string"},
+                    "states": {
+                        "type":"array",
+                        "items": {"type":"string"}
+                    },
+                    "updated_before_epoch_ms": {"type":"integer"}
+                },
+                "allOf": [
+                    {
+                        "if": {
+                            "anyOf": [
+                                {"required": ["scope_id"]},
+                                {"required": ["states"]}
+                            ]
+                        },
+                        "then": {
+                            "required": ["updated_before_epoch_ms"]
+                        }
+                    }
+                ]
+            }
+        },
+        {
+            "name":"delivery_events_subscribe",
+            "description":"Subscribe to lifecycle events for delivery tasks",
+            "inputSchema": {
+                "type":"object",
+                "properties": {
+                    "subscriber_id": {"type":"string"},
+                    "cursor": {"type":"integer"},
+                    "task_id": {"type":"string"}
+                }
+            }
+        },
+        {
+            "name":"delivery_events_next",
+            "description":"Read the next page of lifecycle events after a cursor",
+            "inputSchema": {
+                "type":"object",
+                "properties": {
+                    "subscriber_id": {"type":"string"},
+                    "cursor": {"type":"integer"},
+                    "task_id": {"type":"string"},
+                    "limit": {"type":"integer"}
+                },
+                "required": ["subscriber_id"]
+            }
+        },
+        {
+            "name":"delivery_events_ack",
+            "description":"Acknowledge events up to a cursor for at-least-once delivery",
+            "inputSchema": {
+                "type":"object",
+                "properties": {
+                    "subscriber_id": {"type":"string"},
+                    "cursor": {"type":"integer"}
+                },
+                "required": ["subscriber_id", "cursor"]
+            }
+        },
+        {
             "name":"delivery_report",
             "description":"Return aggregated runtime report for all tracked tasks",
             "inputSchema": {
                 "type":"object",
-                "properties": {}
+                "properties": {
+                    "scope_id": {"type":"string"},
+                    "states": {
+                        "type":"array",
+                        "items": {"type":"string"}
+                    },
+                    "updated_since_epoch_ms": {"type":"integer"},
+                    "limit": {"type":"integer"},
+                    "cursor": {"type":"string"}
+                }
             }
-        }
+        },
+
     ])
 }
 
@@ -1127,6 +2259,33 @@ pub fn handle_tool_call_with_allowed_root(
         "orchestrate_steer" => block_on_result(orchestrate_steer_runtime(args)),
         "delivery_submit" => {
             let orchestration = block_on_result(orchestrate_start_runtime(args))?;
+            if let Some(task_id) = orchestration.get("task_id").and_then(Value::as_str) {
+                let runtime_state = orchestration
+                    .get("runtime_state")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown");
+                let session_id = orchestration
+                    .get("session_id")
+                    .and_then(Value::as_str)
+                    .map(ToString::to_string);
+                let mut runtime = runtime_state_mutex()?;
+                emit_delivery_event(
+                    &mut runtime,
+                    task_id,
+                    "submitted",
+                    "submitted",
+                    runtime_state,
+                    session_id.clone(),
+                );
+                emit_delivery_event(
+                    &mut runtime,
+                    task_id,
+                    "running",
+                    "running",
+                    runtime_state,
+                    session_id,
+                );
+            }
             Ok(json!({
                 "tool": "delivery_submit",
                 "task_id": orchestration["task_id"],
@@ -1134,13 +2293,16 @@ pub fn handle_tool_call_with_allowed_root(
             }))
         }
         "delivery_status" => {
+            let tail = optional_u32(&args, "tail", 120)?;
             let orchestration = block_on_result(orchestrate_status_runtime(args))?;
+            let normalized = delivery_status_normalized_v1(&orchestration, tail);
             Ok(json!({
                 "tool": "delivery_status",
                 "task_id": orchestration["task_id"],
                 "state": orchestration["state"],
                 "runtime_state": orchestration["runtime_state"],
-                "orchestration": orchestration
+                "orchestration": orchestration,
+                "normalized": normalized
             }))
         }
         "delivery_steer" => {
@@ -1152,7 +2314,12 @@ pub fn handle_tool_call_with_allowed_root(
                 "orchestration": orchestration
             }))
         }
-        "delivery_report" => runtime_report(),
+        "delivery_events_subscribe" => delivery_events_subscribe(args),
+        "delivery_events_next" => delivery_events_next(args),
+        "delivery_events_ack" => delivery_events_ack(args),
+        "delivery_stop" => block_on_result(delivery_stop_runtime(args)),
+        "delivery_cleanup" => block_on_result(delivery_cleanup_runtime(args)),
+        "delivery_report" => runtime_report(&args),
         "plan_status" => {
             let plan_path = require_plan_path(tool_name, &args, allowed_root)?;
             let (plan, _) = load_plan(&plan_path)?;

@@ -76,7 +76,134 @@ fn tools_list_contains_plan_tools() {
     assert!(tools.iter().any(|t| t["name"] == "delivery_submit"));
     assert!(tools.iter().any(|t| t["name"] == "delivery_status"));
     assert!(tools.iter().any(|t| t["name"] == "delivery_steer"));
+    assert!(
+        tools
+            .iter()
+            .any(|t| t["name"] == "delivery_events_subscribe")
+    );
+    assert!(tools.iter().any(|t| t["name"] == "delivery_events_next"));
+    assert!(tools.iter().any(|t| t["name"] == "delivery_events_ack"));
+    assert!(tools.iter().any(|t| t["name"] == "delivery_stop"));
+    assert!(tools.iter().any(|t| t["name"] == "delivery_cleanup"));
     assert!(tools.iter().any(|t| t["name"] == "delivery_report"));
+}
+
+#[test]
+fn delivery_status_tool_description_mentions_normalized_v1_contract() {
+    let req = json!({
+        "jsonrpc":"2.0",
+        "id":22,
+        "method":"tools/list",
+        "params":{}
+    });
+
+    let res = handle_mcp_request(req)
+        .expect("tools/list should succeed")
+        .expect("tools/list should return response");
+    let tools = res["result"]["tools"]
+        .as_array()
+        .expect("tools should be an array");
+    let delivery_status = tools
+        .iter()
+        .find(|tool| tool["name"] == "delivery_status")
+        .expect("delivery_status tool must be present");
+    let description = delivery_status["description"]
+        .as_str()
+        .expect("delivery_status description should be a string");
+
+    assert!(
+        description.contains("normalized v1"),
+        "description should announce normalized v1 contract, got: {description}"
+    );
+}
+
+#[test]
+fn tools_list_includes_delivery_stop_and_cleanup_schemas() {
+    let req = json!({
+        "jsonrpc":"2.0",
+        "id":23,
+        "method":"tools/list",
+        "params":{}
+    });
+
+    let res = handle_mcp_request(req)
+        .expect("tools/list should succeed")
+        .expect("tools/list should return response");
+    let tools = res["result"]["tools"]
+        .as_array()
+        .expect("tools should be an array");
+
+    let stop = tools
+        .iter()
+        .find(|t| t["name"] == "delivery_stop")
+        .expect("delivery_stop descriptor should exist");
+    assert_eq!(stop["inputSchema"]["required"], json!(["task_id"]));
+    assert_eq!(
+        stop["inputSchema"]["properties"]["reason"]["type"],
+        json!("string")
+    );
+
+    let cleanup = tools
+        .iter()
+        .find(|t| t["name"] == "delivery_cleanup")
+        .expect("delivery_cleanup descriptor should exist");
+    assert_eq!(
+        cleanup["inputSchema"]["properties"]["force"]["type"],
+        json!("boolean")
+    );
+    assert_eq!(
+        cleanup["inputSchema"]["properties"]["retention_mode"]["enum"],
+        json!(["purge", "retain"])
+    );
+    assert_eq!(
+        cleanup["inputSchema"]["properties"]["scope_id"]["type"],
+        json!("string")
+    );
+    assert_eq!(
+        cleanup["inputSchema"]["properties"]["states"]["type"],
+        json!("array")
+    );
+    assert_eq!(
+        cleanup["inputSchema"]["properties"]["updated_before_epoch_ms"]["type"],
+        json!("integer")
+    );
+    assert_eq!(
+        cleanup["inputSchema"]["allOf"][0]["if"]["anyOf"][0]["required"],
+        json!(["scope_id"])
+    );
+    assert_eq!(
+        cleanup["inputSchema"]["allOf"][0]["if"]["anyOf"][1]["required"],
+        json!(["states"])
+    );
+    assert_eq!(
+        cleanup["inputSchema"]["allOf"][0]["then"]["required"],
+        json!(["updated_before_epoch_ms"])
+    );
+
+    let report = tools
+        .iter()
+        .find(|t| t["name"] == "delivery_report")
+        .expect("delivery_report descriptor should exist");
+    assert_eq!(
+        report["inputSchema"]["properties"]["scope_id"]["type"],
+        json!("string")
+    );
+    assert_eq!(
+        report["inputSchema"]["properties"]["states"]["type"],
+        json!("array")
+    );
+    assert_eq!(
+        report["inputSchema"]["properties"]["updated_since_epoch_ms"]["type"],
+        json!("integer")
+    );
+    assert_eq!(
+        report["inputSchema"]["properties"]["limit"]["type"],
+        json!("integer")
+    );
+    assert_eq!(
+        report["inputSchema"]["properties"]["cursor"]["type"],
+        json!("string")
+    );
 }
 
 #[test]
