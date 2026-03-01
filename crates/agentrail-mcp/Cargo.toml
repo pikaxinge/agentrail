@@ -1,0 +1,21 @@
+[package]
+name = "agentrail-mcp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lib]
+name = "agentrail_mcp"
+path = "src/lib.rs"
+
+[[bin]]
+name = "agentrail-mcp"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true

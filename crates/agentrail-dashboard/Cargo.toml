@@ -1,0 +1,10 @@
+[package]
+name = "agentrail-dashboard"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+agentrail-core = { path = "../agentrail-core" }
+serde_json.workspace = true

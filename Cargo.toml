@@ -1,0 +1,33 @@
+[workspace]
+members = [
+  "crates/agentrail-core",
+  "crates/agentrail-plan-io",
+  "crates/agentrail-store",
+  "crates/agentrail-runner",
+  "crates/agentrail-dashboard",
+  "crates/agentrail-mcp",
+  "crates/agentrail-cli",
+  "crates/agentrail-compat-tests",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+authors = ["agentrail contributors"]
+rust-version = "1.87"
+
+[workspace.dependencies]
+anyhow = "1"
+async-trait = "0.1"
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+sha2 = "0.10"
+tempfile = "3"
+thiserror = "2"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "process", "io-util", "sync", "time"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
