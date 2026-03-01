@@ -1,0 +1,4 @@
+{
+  "operation": "orchestrate_plan",
+  "max_parallel": 4
+}

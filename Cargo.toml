@@ -5,6 +5,7 @@ members = [
   "crates/agentrail-store",
   "crates/agentrail-runner",
   "crates/agentrail-dashboard",
+  "crates/agentrail-orchestrator",
   "crates/agentrail-mcp",
   "crates/agentrail-cli",
   "crates/agentrail-compat-tests",

@@ -1,0 +1,25 @@
+[package]
+name = "agentrail-orchestrator"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+serde.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+agentrail-runner = { path = "../agentrail-runner" }
+agentrail-store = { path = "../agentrail-store" }
+
+[dev-dependencies]
+serde_json.workspace = true
+async-trait.workspace = true
+tokio.workspace = true
+tracing-subscriber.workspace = true
+criterion = "0.5"
+
+[[bench]]
+name = "scheduler_throughput"
+harness = false
