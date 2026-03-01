@@ -123,4 +123,5 @@ cargo run -p agentrail-cli -- serve --transport http --bind 127.0.0.1:8787
 - Product requirements: `docs/requirements/PRODUCT_REQUIREMENTS.md`
 - Architecture: `docs/architecture/SYSTEM_ARCHITECTURE.md`
 - Roadmap issues: `docs/roadmap/ROADMAP_ISSUES.md`
+- CI protection: `docs/operations/CI_PROTECTION.md`
 - Design and implementation plans: `docs/plans/`
