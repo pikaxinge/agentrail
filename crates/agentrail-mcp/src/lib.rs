@@ -118,6 +118,13 @@ struct DeliveryStatusObservation {
     session_id: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DeliverySteerObservation {
+    sent_at: u64,
+    observed_at: Option<u64>,
+    apply_hint: String,
+}
+
 #[derive(Debug, Clone)]
 struct DeliverySubscription {
     cursor: u64,
@@ -133,6 +140,7 @@ struct RuntimeState {
     delivery_subscriptions: HashMap<String, DeliverySubscription>,
     last_event_signature_by_task: HashMap<String, DeliveryEventSignature>,
     last_status_observation_by_task: HashMap<String, DeliveryStatusObservation>,
+    last_steer_observation_by_task: HashMap<String, DeliverySteerObservation>,
 }
 
 #[derive(Debug, Clone)]
@@ -260,6 +268,7 @@ fn runtime_state() -> &'static Mutex<RuntimeState> {
             delivery_subscriptions: HashMap::new(),
             last_event_signature_by_task: HashMap::new(),
             last_status_observation_by_task: HashMap::new(),
+            last_steer_observation_by_task: HashMap::new(),
         })
     })
 }
@@ -301,6 +310,7 @@ fn runtime_state_mutex() -> Result<std::sync::MutexGuard<'static, RuntimeState>>
 fn reset_delivery_tracking(runtime: &mut RuntimeState, task_id: &str) {
     runtime.last_event_signature_by_task.remove(task_id);
     runtime.last_status_observation_by_task.remove(task_id);
+    runtime.last_steer_observation_by_task.remove(task_id);
 }
 
 fn emit_delivery_event(
@@ -382,6 +392,71 @@ fn emit_delivery_status_events(
             session_id,
         );
     }
+
+    Ok(())
+}
+
+fn record_delivery_steer_sent(task_id: &str, session_id: &str) -> Result<u64> {
+    let sent_at = delivery_timestamp_ms();
+    let mut runtime = runtime_state_mutex()?;
+    let (state, runtime_state) = if let Some(task) = runtime.store.get_task(task_id)? {
+        let state = runtime_state_label(task.state).to_string();
+        (state.clone(), state)
+    } else {
+        ("unknown".to_string(), "unknown".to_string())
+    };
+
+    emit_delivery_event(
+        &mut runtime,
+        task_id,
+        "steer_sent",
+        &state,
+        &runtime_state,
+        Some(session_id.to_string()),
+    );
+    runtime.last_steer_observation_by_task.insert(
+        task_id.to_string(),
+        DeliverySteerObservation {
+            sent_at,
+            observed_at: None,
+            apply_hint: "transport_sent".to_string(),
+        },
+    );
+
+    Ok(sent_at)
+}
+
+fn maybe_record_delivery_steer_observed(
+    task_id: &str,
+    session_id: &str,
+    state: &str,
+    runtime_state: &str,
+) -> Result<()> {
+    let mut runtime = runtime_state_mutex()?;
+    let Some(existing) = runtime.last_steer_observation_by_task.get(task_id).cloned() else {
+        return Ok(());
+    };
+    if existing.observed_at.is_some() {
+        return Ok(());
+    }
+
+    let observed_at = delivery_timestamp_ms();
+    runtime.last_steer_observation_by_task.insert(
+        task_id.to_string(),
+        DeliverySteerObservation {
+            sent_at: existing.sent_at,
+            observed_at: Some(observed_at),
+            apply_hint: "session_alive_after_steer".to_string(),
+        },
+    );
+    emit_delivery_event(
+        &mut runtime,
+        task_id,
+        "steer_observed",
+        state,
+        runtime_state,
+        Some(session_id.to_string()),
+    );
 
     Ok(())
 }
@@ -556,6 +631,9 @@ fn delivery_status_normalized_v1(orchestration: &Value, tail: u32) -> Value {
         "assigned_worker": field("assigned_worker"),
         "retry_count": field("retry_count"),
         "retry_budget": field("retry_budget"),
+        "last_steer_sent_at": field("last_steer_sent_at"),
+        "last_steer_observed_at": field("last_steer_observed_at"),
+        "last_steer_apply_hint": field("last_steer_apply_hint"),
         "timestamps": {
             "updated_at": now_unix_timestamp_ms()
         },
@@ -914,11 +992,12 @@ async fn orchestrate_start_runtime(args: Value) -> Result<Value> {
 }
 
 async fn task_runtime_status(task_id: &str, tail: usize) -> Result<Value> {
-    let (session, record) = {
+    let (session, record, steer_observation) = {
         let runtime = runtime_state_mutex()?;
         (
             runtime.sessions.get(task_id).cloned(),
             runtime.store.get_task(task_id)?,
+            runtime.last_steer_observation_by_task.get(task_id).cloned(),
         )
     };
 
@@ -930,7 +1009,10 @@ async fn task_runtime_status(task_id: &str, tail: usize) -> Result<Value> {
             "tool": "orchestrate_status",
             "task_id": task_id,
             "state": "unknown",
-            "runtime_state": "unknown"
+            "runtime_state": "unknown",
+            "last_steer_sent_at": steer_observation.as_ref().map(|observation| observation.sent_at),
+            "last_steer_observed_at": steer_observation.as_ref().and_then(|observation| observation.observed_at),
+            "last_steer_apply_hint": steer_observation.as_ref().map(|observation| observation.apply_hint.clone())
         }));
     };
 
@@ -945,7 +1027,10 @@ async fn task_runtime_status(task_id: &str, tail: usize) -> Result<Value> {
             "runtime_state": runtime_state_label(record.state),
             "assigned_worker": record.assigned_worker,
             "retry_count": record.retry_count,
-            "retry_budget": record.retry_budget
+            "retry_budget": record.retry_budget,
+            "last_steer_sent_at": steer_observation.as_ref().map(|observation| observation.sent_at),
+            "last_steer_observed_at": steer_observation.as_ref().and_then(|observation| observation.observed_at),
+            "last_steer_apply_hint": steer_observation.as_ref().map(|observation| observation.apply_hint.clone())
         }));
     }
 
@@ -956,7 +1041,10 @@ async fn task_runtime_status(task_id: &str, tail: usize) -> Result<Value> {
             "state": runtime_state_label(record.state),
             "runtime_state": runtime_state_label(record.state),
             "retry_count": record.retry_count,
-            "retry_budget": record.retry_budget
+            "retry_budget": record.retry_budget,
+            "last_steer_sent_at": steer_observation.as_ref().map(|observation| observation.sent_at),
+            "last_steer_observed_at": steer_observation.as_ref().and_then(|observation| observation.observed_at),
+            "last_steer_apply_hint": steer_observation.as_ref().map(|observation| observation.apply_hint.clone())
         }));
     };
 
@@ -994,12 +1082,22 @@ async fn task_runtime_status(task_id: &str, tail: usize) -> Result<Value> {
         }
     };
     let runtime_state = runtime_state_label(latest.state).to_string();
+    maybe_record_delivery_steer_observed(
+        task_id,
+        &session.session_id,
+        &status.state,
+        &runtime_state,
+    )?;
     emit_delivery_status_events(
         task_id,
         &status.state,
         &runtime_state,
         Some(session.session_id.clone()),
     )?;
+    let steer_observation = {
+        let runtime = runtime_state_mutex()?;
+        runtime.last_steer_observation_by_task.get(task_id).cloned()
+    };
 
     if runner_state_is_terminal(&status.state) || runtime_state_is_terminal(latest.state) {
         let _ = clear_runtime_session(task_id);
@@ -1015,7 +1113,10 @@ async fn task_runtime_status(task_id: &str, tail: usize) -> Result<Value> {
         "assigned_worker": latest.assigned_worker,
         "retry_count": latest.retry_count,
         "retry_budget": latest.retry_budget,
-        "logs": logs
+        "logs": logs,
+        "last_steer_sent_at": steer_observation.as_ref().map(|observation| observation.sent_at),
+        "last_steer_observed_at": steer_observation.as_ref().and_then(|observation| observation.observed_at),
+        "last_steer_apply_hint": steer_observation.as_ref().map(|observation| observation.apply_hint.clone())
     }))
 }
 
@@ -1041,6 +1142,7 @@ async fn orchestrate_steer_runtime(args: Value) -> Result<Value> {
     };
 
     runner_steer(session.runner_mode, &session.session_id, &instruction).await?;
+    let steer_sent_at = record_delivery_steer_sent(&task_id, &session.session_id)?;
 
     info!(
         operation = "mcp_tool_call",
@@ -1055,7 +1157,10 @@ async fn orchestrate_steer_runtime(args: Value) -> Result<Value> {
         "tool": "orchestrate_steer",
         "task_id": task_id,
         "status": "sent",
-        "session_id": session.session_id
+        "session_id": session.session_id,
+        "last_steer_sent_at": steer_sent_at,
+        "last_steer_observed_at": Value::Null,
+        "last_steer_apply_hint": "transport_sent"
     }))
 }
 
@@ -2622,6 +2727,9 @@ pub fn handle_tool_call_with_allowed_root(
                 "tool": "delivery_steer",
                 "task_id": orchestration["task_id"],
                 "status": orchestration["status"],
+                "last_steer_sent_at": orchestration["last_steer_sent_at"],
+                "last_steer_observed_at": orchestration["last_steer_observed_at"],
+                "last_steer_apply_hint": orchestration["last_steer_apply_hint"],
                 "orchestration": orchestration
             }))
         }
@@ -2861,6 +2969,30 @@ mod tests {
     }
 
     #[test]
+    fn delivery_status_normalized_v1_includes_steer_metadata_fields() {
+        let normalized = delivery_status_normalized_v1(
+            &json!({
+                "task_id": "task-1",
+                "state": "running",
+                "runtime_state": "running",
+                "runner_mode": "tmux",
+                "session_id": "session-1",
+                "assigned_worker": "worker-a",
+                "retry_count": 0,
+                "retry_budget": 3,
+                "last_steer_sent_at": 111_u64,
+                "last_steer_observed_at": Value::Null,
+                "last_steer_apply_hint": "transport_sent"
+            }),
+            12,
+        );
+
+        assert_eq!(normalized["last_steer_sent_at"], 111_u64);
+        assert!(normalized["last_steer_observed_at"].is_null());
+        assert_eq!(normalized["last_steer_apply_hint"], "transport_sent");
+    }
+
+    #[test]
     fn runtime_store_config_defaults_to_sqlite_file_backed_dsn() {
         let config = resolve_runtime_store_config(None);
         assert_eq!(config.dsn, DEFAULT_RUNTIME_STORE_DSN);
@@ -2969,6 +3101,86 @@ mod tests {
         assert!(
             has_field_value(&logs, "outcome", "unsupported"),
             "expected unsupported outcome field in tracing output, got: {logs}"
+        );
+    }
+
+    #[test]
+    fn record_delivery_steer_sent_updates_observation_and_emits_event() {
+        let task_id = unique_test_task_id("steer-observation");
+        {
+            let runtime = runtime_state().lock().expect("runtime lock");
+            runtime
+                .store
+                .upsert_task(&TaskRecord::new(task_id.clone(), "worker-a", 2))
+                .expect("seed task");
+            runtime
+                .store
+                .transition(&task_id, TaskRuntimeState::Preparing)
+                .expect("queued -> preparing");
+            runtime
+                .store
+                .transition(&task_id, TaskRuntimeState::Running)
+                .expect("preparing -> running");
+        }
+
+        let sent_at =
+            record_delivery_steer_sent(&task_id, "tmux-session-1").expect("record steer sent");
+
+        let runtime = runtime_state().lock().expect("runtime lock");
+        let observation = runtime
+            .last_steer_observation_by_task
+            .get(&task_id)
+            .expect("steer observation should be present");
+        assert_eq!(observation.sent_at, sent_at);
+        assert!(observation.observed_at.is_none());
+        assert_eq!(observation.apply_hint, "transport_sent");
+        assert!(runtime.delivery_events.iter().any(|event| {
+            event.task_id == task_id
+                && event.event_type == "steer_sent"
+                && event.session_id.as_deref() == Some("tmux-session-1")
+        }));
+    }
+
+    #[test]
+    fn maybe_record_delivery_steer_observed_sets_observed_once() {
+        let task_id = unique_test_task_id("steer-observed");
+        {
+            let runtime = runtime_state().lock().expect("runtime lock");
+            runtime
+                .store
+                .upsert_task(&TaskRecord::new(task_id.clone(), "worker-a", 2))
+                .expect("seed task");
+            runtime
+                .store
+                .transition(&task_id, TaskRuntimeState::Preparing)
+                .expect("queued -> preparing");
+            runtime
+                .store
+                .transition(&task_id, TaskRuntimeState::Running)
+                .expect("preparing -> running");
+        }
+
+        let _ = record_delivery_steer_sent(&task_id, "tmux-session-2").expect("record steer sent");
+        maybe_record_delivery_steer_observed(&task_id, "tmux-session-2", "running", "running")
+            .expect("record steer observed");
+        maybe_record_delivery_steer_observed(&task_id, "tmux-session-2", "running", "running")
+            .expect("idempotent observed update");
+
+        let runtime = runtime_state().lock().expect("runtime lock");
+        let observation = runtime
+            .last_steer_observation_by_task
+            .get(&task_id)
+            .expect("steer observation should be present");
+        assert!(observation.observed_at.is_some());
+        assert_eq!(observation.apply_hint, "session_alive_after_steer");
+        assert_eq!(
+            runtime
+                .delivery_events
+                .iter()
+                .filter(|event| event.task_id == task_id && event.event_type == "steer_observed")
+                .count(),
+            1,
+            "steer_observed event should be emitted once"
         );
     }
 

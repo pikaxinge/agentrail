@@ -347,6 +347,9 @@ fn delivery_submit_status_and_report_are_available() {
         normalized_keys,
         vec![
             "assigned_worker",
+            "last_steer_apply_hint",
+            "last_steer_observed_at",
+            "last_steer_sent_at",
             "logs",
             "retry_budget",
             "retry_count",
@@ -386,6 +389,9 @@ fn delivery_submit_status_and_report_are_available() {
         status["normalized"]["retry_budget"],
         status["orchestration"]["retry_budget"]
     );
+    assert!(status["normalized"]["last_steer_sent_at"].is_null());
+    assert!(status["normalized"]["last_steer_observed_at"].is_null());
+    assert!(status["normalized"]["last_steer_apply_hint"].is_null());
     assert!(status["normalized"]["timestamps"]["updated_at"].is_number());
     assert_eq!(status["normalized"]["logs"]["tail"], 5);
     assert!(status["normalized"]["logs"]["truncated"].is_boolean());
@@ -477,6 +483,9 @@ fn delivery_status_normalized_envelope_uses_deterministic_nulls_when_runtime_dat
     assert!(status["normalized"]["assigned_worker"].is_null());
     assert!(status["normalized"]["retry_count"].is_null());
     assert!(status["normalized"]["retry_budget"].is_null());
+    assert!(status["normalized"]["last_steer_sent_at"].is_null());
+    assert!(status["normalized"]["last_steer_observed_at"].is_null());
+    assert!(status["normalized"]["last_steer_apply_hint"].is_null());
     assert!(status["normalized"]["timestamps"]["updated_at"].is_number());
     assert_eq!(status["normalized"]["logs"]["tail"], 9);
     assert_eq!(status["normalized"]["logs"]["truncated"], false);
