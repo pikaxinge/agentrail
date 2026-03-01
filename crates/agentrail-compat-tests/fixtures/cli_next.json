@@ -1,0 +1,7 @@
+{
+  "operation": "next",
+  "step": {
+    "id": "step-a",
+    "status": "pending"
+  }
+}

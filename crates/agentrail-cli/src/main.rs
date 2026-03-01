@@ -1,6 +1,10 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use serde_json::json;
+use std::collections::HashMap;
+use std::path::PathBuf;
+
+use agentrail_core::{Phase, PhaseStatus, Plan, Step, StepStatus};
 
 #[derive(Debug, Parser)]
 #[command(name = "agentrail")]
@@ -13,7 +17,36 @@ struct Cli {
 #[derive(Debug, Subcommand)]
 enum Commands {
     Version,
-    Status,
+    Status {
+        #[arg(long)]
+        plan: PathBuf,
+    },
+    Show {
+        #[arg(long)]
+        plan: PathBuf,
+        #[arg(long)]
+        step_id: String,
+    },
+    Next {
+        #[arg(long)]
+        plan: PathBuf,
+    },
+    Claim {
+        #[arg(long)]
+        plan: PathBuf,
+        #[arg(long)]
+        step_id: String,
+        #[arg(long)]
+        agent: String,
+    },
+    Complete {
+        #[arg(long)]
+        plan: PathBuf,
+        #[arg(long)]
+        step_id: String,
+        #[arg(long)]
+        evidence: String,
+    },
     Dashboard,
     Orchestrate {
         #[command(subcommand)]
@@ -55,8 +88,130 @@ async fn main() -> Result<()> {
         Commands::Version => {
             println!("agentrail 0.1.0");
         }
-        Commands::Status => {
-            println!("status: bootstrap skeleton ready");
+        Commands::Status { plan } => {
+            let (loaded_plan, _) = agentrail_plan_io::load_plan(&plan)?;
+            let (pending, claimed, done) = step_counts(&loaded_plan);
+            println!(
+                "{}",
+                json!({
+                    "operation": "status",
+                    "project": loaded_plan.project,
+                    "phase_count": loaded_plan.phases.len(),
+                    "step_counts": {
+                        "pending": pending,
+                        "claimed": claimed,
+                        "done": done
+                    }
+                })
+            );
+        }
+        Commands::Show { plan, step_id } => {
+            let (loaded_plan, _) = agentrail_plan_io::load_plan(&plan)?;
+            let step = find_step(&loaded_plan, &step_id)
+                .ok_or_else(|| anyhow::anyhow!("step not found: {step_id}"))?;
+            println!(
+                "{}",
+                json!({
+                    "operation": "show",
+                    "step": step
+                })
+            );
+        }
+        Commands::Next { plan } => {
+            let (loaded_plan, _) = agentrail_plan_io::load_plan(&plan)?;
+            let step = next_ready_step(&loaded_plan);
+            println!(
+                "{}",
+                json!({
+                    "operation": "next",
+                    "step": step
+                })
+            );
+        }
+        Commands::Claim {
+            plan,
+            step_id,
+            agent,
+        } => {
+            let plan_path = plan;
+            let (mut loaded_plan, hash) = agentrail_plan_io::load_plan(&plan_path)?;
+            {
+                let (phase, step) = find_step_with_phase(&loaded_plan, &step_id)
+                    .ok_or_else(|| anyhow::anyhow!("step not found: {step_id}"))?;
+                if step.status != StepStatus::Pending {
+                    anyhow::bail!(
+                        "invalid state transition: claim requires pending -> claimed, current={:?}",
+                        step.status
+                    );
+                }
+                let step_status_by_id = step_status_map(&loaded_plan);
+                let phase_status_by_id = phase_status_map(&loaded_plan);
+                if !phase_ready_for_work(phase, &phase_status_by_id)
+                    || !step_dependencies_ready(step, &step_status_by_id)
+                {
+                    anyhow::bail!("dependencies not ready: {step_id}");
+                }
+            }
+            {
+                let step = find_step_mut(&mut loaded_plan, &step_id)
+                    .ok_or_else(|| anyhow::anyhow!("step not found: {step_id}"))?;
+                step.status = StepStatus::Claimed;
+                step.claimed_by = Some(agent);
+                step.evidence = None;
+            }
+            agentrail_core::recalc_lock_status(&mut loaded_plan);
+            agentrail_plan_io::save_plan(&loaded_plan, &plan_path, Some(&hash))?;
+            let step = find_step(&loaded_plan, &step_id)
+                .ok_or_else(|| anyhow::anyhow!("step not found after claim: {step_id}"))?;
+            println!(
+                "{}",
+                json!({
+                    "operation": "claim",
+                    "step": step
+                })
+            );
+        }
+        Commands::Complete {
+            plan,
+            step_id,
+            evidence,
+        } => {
+            let plan_path = plan;
+            let (mut loaded_plan, hash) = agentrail_plan_io::load_plan(&plan_path)?;
+            {
+                let (phase, step) = find_step_with_phase(&loaded_plan, &step_id)
+                    .ok_or_else(|| anyhow::anyhow!("step not found: {step_id}"))?;
+                if step.status != StepStatus::Claimed {
+                    anyhow::bail!(
+                        "invalid state transition: complete requires claimed -> done, current={:?}",
+                        step.status
+                    );
+                }
+                let step_status_by_id = step_status_map(&loaded_plan);
+                let phase_status_by_id = phase_status_map(&loaded_plan);
+                if !phase_ready_for_work(phase, &phase_status_by_id)
+                    || !step_dependencies_ready(step, &step_status_by_id)
+                {
+                    anyhow::bail!("dependencies not ready: {step_id}");
+                }
+            }
+            {
+                let step = find_step_mut(&mut loaded_plan, &step_id)
+                    .ok_or_else(|| anyhow::anyhow!("step not found: {step_id}"))?;
+                step.status = StepStatus::Done;
+                step.evidence = Some(evidence);
+            }
+            agentrail_core::recalc_lock_status(&mut loaded_plan);
+            agentrail_plan_io::save_plan(&loaded_plan, &plan_path, Some(&hash))?;
+            let step = find_step(&loaded_plan, &step_id)
+                .ok_or_else(|| anyhow::anyhow!("step not found after complete: {step_id}"))?;
+            println!(
+                "{}",
+                json!({
+                    "operation": "complete",
+                    "step": step
+                })
+            );
         }
         Commands::Dashboard => {
             println!("dashboard: TODO (static HTML generation)");
@@ -111,4 +266,100 @@ async fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+fn find_step<'a>(plan: &'a Plan, step_id: &str) -> Option<&'a Step> {
+    plan.phases
+        .iter()
+        .flat_map(|phase| phase.steps.iter())
+        .find(|step| step.id == step_id)
+}
+
+fn find_step_with_phase<'a>(plan: &'a Plan, step_id: &str) -> Option<(&'a Phase, &'a Step)> {
+    plan.phases.iter().find_map(|phase| {
+        phase
+            .steps
+            .iter()
+            .find(|step| step.id == step_id)
+            .map(|step| (phase, step))
+    })
+}
+
+fn find_step_mut<'a>(plan: &'a mut Plan, step_id: &str) -> Option<&'a mut Step> {
+    for phase in &mut plan.phases {
+        if let Some(step) = phase.steps.iter_mut().find(|step| step.id == step_id) {
+            return Some(step);
+        }
+    }
+    None
+}
+
+fn step_counts(plan: &Plan) -> (usize, usize, usize) {
+    let mut pending = 0;
+    let mut claimed = 0;
+    let mut done = 0;
+
+    for step in plan.phases.iter().flat_map(|phase| phase.steps.iter()) {
+        match step.status {
+            StepStatus::Pending => pending += 1,
+            StepStatus::Claimed => claimed += 1,
+            StepStatus::Done => done += 1,
+            StepStatus::Skipped | StepStatus::Rejected => {}
+        }
+    }
+
+    (pending, claimed, done)
+}
+
+fn next_ready_step(plan: &Plan) -> Option<&Step> {
+    let step_status_by_id = step_status_map(plan);
+    let phase_status_by_id = phase_status_map(plan);
+
+    for phase in &plan.phases {
+        if !phase_ready_for_work(phase, &phase_status_by_id) {
+            continue;
+        }
+        if let Some(step) = phase.steps.iter().find(|step| {
+            step.status == StepStatus::Pending && step_dependencies_ready(step, &step_status_by_id)
+        }) {
+            return Some(step);
+        }
+    }
+
+    None
+}
+
+fn step_status_map(plan: &Plan) -> HashMap<String, StepStatus> {
+    plan.phases
+        .iter()
+        .flat_map(|phase| phase.steps.iter())
+        .map(|step| (step.id.clone(), step.status.clone()))
+        .collect()
+}
+
+fn phase_status_map(plan: &Plan) -> HashMap<String, PhaseStatus> {
+    plan.phases
+        .iter()
+        .map(|phase| (phase.id.clone(), phase.status.clone()))
+        .collect()
+}
+
+fn step_dependencies_ready(step: &Step, step_status_by_id: &HashMap<String, StepStatus>) -> bool {
+    step.depends_on.iter().all(|dep| {
+        matches!(
+            step_status_by_id.get(dep),
+            Some(StepStatus::Done) | Some(StepStatus::Skipped)
+        )
+    })
+}
+
+fn phase_ready_for_work(phase: &Phase, phase_status_by_id: &HashMap<String, PhaseStatus>) -> bool {
+    if phase.status == PhaseStatus::Locked {
+        return false;
+    }
+
+    phase
+        .depends_on
+        .iter()
+        .all(|dep| matches!(phase_status_by_id.get(dep), Some(PhaseStatus::Done)))
 }

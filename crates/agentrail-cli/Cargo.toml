@@ -10,8 +10,10 @@ name = "agentrail"
 path = "src/main.rs"
 
 [dependencies]
+agentrail-core = { path = "../agentrail-core" }
 agentrail-mcp = { path = "../agentrail-mcp" }
 agentrail-orchestrator = { path = "../agentrail-orchestrator" }
+agentrail-plan-io = { path = "../agentrail-plan-io" }
 anyhow.workspace = true
 clap.workspace = true
 serde_json.workspace = true
@@ -21,3 +23,4 @@ tokio.workspace = true
 assert_cmd = "2"
 predicates = "3"
 serde_json.workspace = true
+tempfile.workspace = true

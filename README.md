@@ -22,6 +22,14 @@ The M1-M5 foundation is implemented:
 - compatibility fixtures and contract tests
 - scheduler benchmark scaffold and operations runbook
 
+The M6 CLI plan command slice is now implemented:
+
+- `status --plan <path>`
+- `show --plan <path> --step-id <id>`
+- `next --plan <path>`
+- `claim --plan <path> --step-id <id> --agent <name>`
+- `complete --plan <path> --step-id <id> --evidence <text>`
+
 ## Quick start
 
 ```bash
@@ -35,6 +43,13 @@ cargo run -p agentrail-cli -- --help
 cargo run -p agentrail-cli -- orchestrate plan --max-parallel 4
 cargo run -p agentrail-cli -- orchestrate tick --retry-count 1 --retry-budget 3 --reassigned-once false
 cargo run -p agentrail-cli -- orchestrate resume --task-id task-42
+
+# 2.1) Plan operations (M6 slice)
+cargo run -p agentrail-cli -- status --plan ./plan.yaml
+cargo run -p agentrail-cli -- show --plan ./plan.yaml --step-id step-a
+cargo run -p agentrail-cli -- next --plan ./plan.yaml
+cargo run -p agentrail-cli -- claim --plan ./plan.yaml --step-id step-a --agent worker-1
+cargo run -p agentrail-cli -- complete --plan ./plan.yaml --step-id step-a --evidence "tests:ok"
 
 # 3) Run MCP server
 cargo run -p agentrail-mcp -- --transport stdio

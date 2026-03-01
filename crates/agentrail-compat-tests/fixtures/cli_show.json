@@ -1,0 +1,11 @@
+{
+  "operation": "show",
+  "step": {
+    "id": "step-a",
+    "name": "Step A",
+    "status": "pending",
+    "depends_on": [],
+    "claimed_by": null,
+    "evidence": null
+  }
+}

@@ -1,0 +1,8 @@
+{
+  "operation": "claim",
+  "step": {
+    "id": "step-a",
+    "status": "claimed",
+    "claimed_by": "worker-1"
+  }
+}

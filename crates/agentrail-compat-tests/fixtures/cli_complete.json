@@ -1,0 +1,8 @@
+{
+  "operation": "complete",
+  "step": {
+    "id": "step-a",
+    "status": "done",
+    "evidence": "tests:ok"
+  }
+}
