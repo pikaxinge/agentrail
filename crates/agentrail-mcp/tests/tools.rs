@@ -4,6 +4,7 @@ use std::{
 };
 
 use agentrail_mcp::handle_tool_call;
+use agentrail_store::TaskStore;
 use serde_json::json;
 use tempfile::tempdir;
 
@@ -108,6 +109,13 @@ fn report_task_ids(report: &serde_json::Value) -> Vec<String> {
                 .to_string()
         })
         .collect()
+}
+
+fn runtime_store_dsn() -> String {
+    std::env::var("AGENTRAIL_RUNTIME_DSN")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| "sqlite://.agentrail/runtime.db".to_string())
 }
 
 #[test]
@@ -742,6 +750,82 @@ fn delivery_events_reconnect_with_cursor_replays_without_loss() {
         resumed_cursors, expected_all,
         "reconnect replay should reconstruct the same event stream"
     );
+}
+
+#[test]
+fn runtime_attempts_and_sessions_persist_for_launches_and_reconnect() {
+    let tmp = tempdir().expect("tempdir");
+    let task_id = unique_task_id("task-attempt-persist");
+
+    let first_start = handle_tool_call(
+        "orchestrate_start",
+        json!({
+            "task_id": task_id,
+            "worker_id": "worker-a",
+            "runner_mode": "process",
+            "command": "bash",
+            "args": ["-lc", "sleep 5"],
+            "workdir": tmp.path().display().to_string()
+        }),
+    )
+    .expect("first start should succeed");
+    assert!(first_start["session_id"].is_string());
+
+    let stop = handle_tool_call(
+        "delivery_stop",
+        json!({
+            "task_id": task_id,
+            "reason": "test-stop"
+        }),
+    )
+    .expect("stop should succeed");
+    assert_eq!(stop["status"], "stopped");
+
+    let second_start = handle_tool_call(
+        "orchestrate_start",
+        json!({
+            "task_id": task_id,
+            "worker_id": "worker-a",
+            "runner_mode": "process",
+            "command": "bash",
+            "args": ["-lc", "true"],
+            "workdir": tmp.path().display().to_string()
+        }),
+    )
+    .expect("second start should succeed");
+    assert!(second_start["session_id"].is_string());
+    let _ = wait_for_runtime_state(&task_id, "ready_to_merge");
+
+    let dsn = runtime_store_dsn();
+    assert!(
+        dsn.starts_with("sqlite://"),
+        "this test requires sqlite-backed runtime store, got: {dsn}"
+    );
+    let store = TaskStore::connect(dsn.clone());
+    let attempts = store
+        .list_task_attempts(&task_id)
+        .expect("attempt query should succeed");
+    assert_eq!(attempts.len(), 2, "expected one row per launch");
+    assert_eq!(attempts[0].attempt_number, 1);
+    assert_eq!(attempts[1].attempt_number, 2);
+
+    let sessions = store
+        .list_task_sessions(&task_id)
+        .expect("session query should succeed");
+    assert_eq!(sessions.len(), 2);
+    assert!(
+        sessions
+            .iter()
+            .all(|session| session.ended_epoch_ms.is_some()),
+        "terminal sessions should be retained with ended timestamp: {sessions:?}"
+    );
+
+    drop(store);
+    let reopened = TaskStore::connect(dsn);
+    let reopened_attempts = reopened
+        .list_task_attempts(&task_id)
+        .expect("attempt query after reconnect should succeed");
+    assert_eq!(reopened_attempts.len(), 2);
 }
 
 #[test]

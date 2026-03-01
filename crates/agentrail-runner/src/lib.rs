@@ -141,6 +141,15 @@ fn unique_tmux_session_id(sequence: u64) -> String {
     format!("tmux-{pid}-{ts_nanos}-{sequence}")
 }
 
+fn unique_process_session_id(sequence: u64) -> String {
+    let ts_nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    let pid = std::process::id();
+    format!("process-{pid}-{ts_nanos}-{sequence}")
+}
+
 fn process_sessions() -> &'static StdMutex<HashMap<String, Arc<SessionRecord>>> {
     PROCESS_SESSIONS.get_or_init(|| StdMutex::new(HashMap::new()))
 }
@@ -763,7 +772,7 @@ impl AgentRunner for ProcessRunner {
         }
 
         let sequence = SESSION_COUNTER.fetch_add(1, Ordering::Relaxed);
-        let session_id = format!("process-{sequence}");
+        let session_id = unique_process_session_id(sequence);
         let record = Arc::new(SessionRecord {
             task_id: spec.id.clone(),
             logs,

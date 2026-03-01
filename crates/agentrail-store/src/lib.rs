@@ -150,6 +150,29 @@ pub struct TaskStoreSnapshot {
     pub tasks: Vec<TaskRecord>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TaskAttemptRecord {
+    pub id: i64,
+    pub task_id: String,
+    pub attempt_number: u32,
+    pub session_id: String,
+    pub runner_mode: String,
+    pub started_epoch_ms: i64,
+    pub terminal_state: Option<String>,
+    pub ended_epoch_ms: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TaskSessionRecord {
+    pub session_id: String,
+    pub task_id: String,
+    pub attempt_number: u32,
+    pub runner_mode: String,
+    pub started_epoch_ms: i64,
+    pub terminal_state: Option<String>,
+    pub ended_epoch_ms: Option<i64>,
+}
+
 #[derive(Debug)]
 pub struct TaskStore {
     pub dsn: String,
@@ -204,11 +227,40 @@ impl TaskStore {
                 updated_epoch_ms INTEGER NOT NULL DEFAULT 0
             );",
         )?;
+        connection.execute_batch(
+            "CREATE TABLE IF NOT EXISTS task_attempts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                task_id TEXT NOT NULL,
+                attempt_number INTEGER NOT NULL,
+                session_id TEXT NOT NULL,
+                runner_mode TEXT NOT NULL,
+                started_epoch_ms INTEGER NOT NULL DEFAULT 0,
+                terminal_state TEXT,
+                ended_epoch_ms INTEGER
+            );
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_task_attempts_task_attempt
+                ON task_attempts (task_id, attempt_number);
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_task_attempts_session
+                ON task_attempts (session_id);",
+        )?;
+        connection.execute_batch(
+            "CREATE TABLE IF NOT EXISTS task_sessions (
+                session_id TEXT PRIMARY KEY,
+                task_id TEXT NOT NULL,
+                attempt_number INTEGER NOT NULL,
+                runner_mode TEXT NOT NULL,
+                started_epoch_ms INTEGER NOT NULL DEFAULT 0,
+                terminal_state TEXT,
+                ended_epoch_ms INTEGER
+            );
+            CREATE INDEX IF NOT EXISTS idx_task_sessions_task
+                ON task_sessions (task_id, started_epoch_ms);",
+        )?;
 
-        if !Self::table_has_column(&connection, "scope_id")? {
+        if !Self::table_has_column(&connection, "tasks", "scope_id")? {
             connection.execute("ALTER TABLE tasks ADD COLUMN scope_id TEXT", [])?;
         }
-        if !Self::table_has_column(&connection, "updated_epoch_ms")? {
+        if !Self::table_has_column(&connection, "tasks", "updated_epoch_ms")? {
             connection.execute(
                 "ALTER TABLE tasks ADD COLUMN updated_epoch_ms INTEGER NOT NULL DEFAULT 0",
                 [],
@@ -220,6 +272,8 @@ impl TaskStore {
              WHERE updated_epoch_ms <= 0",
             params![current_epoch_ms()],
         )?;
+        Self::ensure_task_attempts_schema(&connection)?;
+        Self::ensure_task_sessions_schema(&connection)?;
 
         Ok(connection)
     }
@@ -235,8 +289,12 @@ impl TaskStore {
         Ok(())
     }
 
-    fn table_has_column(connection: &Connection, column_name: &str) -> Result<bool> {
-        let mut statement = connection.prepare("PRAGMA table_info(tasks)")?;
+    fn table_has_column(
+        connection: &Connection,
+        table_name: &str,
+        column_name: &str,
+    ) -> Result<bool> {
+        let mut statement = connection.prepare(&format!("PRAGMA table_info({table_name})"))?;
         let mut rows = statement.query([])?;
         while let Some(row) = rows.next()? {
             let existing: String = row.get(1)?;
@@ -245,6 +303,62 @@ impl TaskStore {
             }
         }
         Ok(false)
+    }
+
+    fn ensure_task_attempts_schema(connection: &Connection) -> Result<()> {
+        if !Self::table_has_column(connection, "task_attempts", "started_epoch_ms")? {
+            connection.execute(
+                "ALTER TABLE task_attempts ADD COLUMN started_epoch_ms INTEGER NOT NULL DEFAULT 0",
+                [],
+            )?;
+        }
+        if !Self::table_has_column(connection, "task_attempts", "terminal_state")? {
+            connection.execute(
+                "ALTER TABLE task_attempts ADD COLUMN terminal_state TEXT",
+                [],
+            )?;
+        }
+        if !Self::table_has_column(connection, "task_attempts", "ended_epoch_ms")? {
+            connection.execute(
+                "ALTER TABLE task_attempts ADD COLUMN ended_epoch_ms INTEGER",
+                [],
+            )?;
+        }
+        connection.execute(
+            "UPDATE task_attempts
+             SET started_epoch_ms = ?1
+             WHERE started_epoch_ms <= 0",
+            params![current_epoch_ms()],
+        )?;
+        Ok(())
+    }
+
+    fn ensure_task_sessions_schema(connection: &Connection) -> Result<()> {
+        if !Self::table_has_column(connection, "task_sessions", "started_epoch_ms")? {
+            connection.execute(
+                "ALTER TABLE task_sessions ADD COLUMN started_epoch_ms INTEGER NOT NULL DEFAULT 0",
+                [],
+            )?;
+        }
+        if !Self::table_has_column(connection, "task_sessions", "terminal_state")? {
+            connection.execute(
+                "ALTER TABLE task_sessions ADD COLUMN terminal_state TEXT",
+                [],
+            )?;
+        }
+        if !Self::table_has_column(connection, "task_sessions", "ended_epoch_ms")? {
+            connection.execute(
+                "ALTER TABLE task_sessions ADD COLUMN ended_epoch_ms INTEGER",
+                [],
+            )?;
+        }
+        connection.execute(
+            "UPDATE task_sessions
+             SET started_epoch_ms = ?1
+             WHERE started_epoch_ms <= 0",
+            params![current_epoch_ms()],
+        )?;
+        Ok(())
     }
 
     fn with_connection<T>(&self, operation: impl FnOnce(&Connection) -> Result<T>) -> Result<T> {
@@ -301,6 +415,56 @@ impl TaskStore {
             retry_count,
             retry_budget,
             updated_epoch_ms,
+        })
+    }
+
+    fn read_task_attempt_row(row: &rusqlite::Row<'_>) -> Result<TaskAttemptRecord> {
+        let id: i64 = row.get(0)?;
+        let task_id: String = row.get(1)?;
+        let attempt_number_raw: i64 = row.get(2)?;
+        let session_id: String = row.get(3)?;
+        let runner_mode: String = row.get(4)?;
+        let started_epoch_ms: i64 = row.get(5)?;
+        let terminal_state: Option<String> = row.get(6)?;
+        let ended_epoch_ms: Option<i64> = row.get(7)?;
+        let attempt_number = u32::try_from(attempt_number_raw).map_err(|_| {
+            anyhow!("invalid attempt_number in store for task {task_id}: {attempt_number_raw}")
+        })?;
+
+        Ok(TaskAttemptRecord {
+            id,
+            task_id,
+            attempt_number,
+            session_id,
+            runner_mode,
+            started_epoch_ms,
+            terminal_state,
+            ended_epoch_ms,
+        })
+    }
+
+    fn read_task_session_row(row: &rusqlite::Row<'_>) -> Result<TaskSessionRecord> {
+        let session_id: String = row.get(0)?;
+        let task_id: String = row.get(1)?;
+        let attempt_number_raw: i64 = row.get(2)?;
+        let runner_mode: String = row.get(3)?;
+        let started_epoch_ms: i64 = row.get(4)?;
+        let terminal_state: Option<String> = row.get(5)?;
+        let ended_epoch_ms: Option<i64> = row.get(6)?;
+        let attempt_number = u32::try_from(attempt_number_raw).map_err(|_| {
+            anyhow!(
+                "invalid attempt_number in session store for task {task_id}: {attempt_number_raw}"
+            )
+        })?;
+
+        Ok(TaskSessionRecord {
+            session_id,
+            task_id,
+            attempt_number,
+            runner_mode,
+            started_epoch_ms,
+            terminal_state,
+            ended_epoch_ms,
         })
     }
 
@@ -569,6 +733,108 @@ impl TaskStore {
             }
 
             Ok(to_delete)
+        })
+    }
+
+    pub fn register_task_attempt(
+        &self,
+        task_id: &str,
+        session_id: &str,
+        runner_mode: &str,
+    ) -> Result<TaskAttemptRecord> {
+        self.with_transaction(|tx| {
+            let next_attempt_raw: i64 = tx.query_row(
+                "SELECT COALESCE(MAX(attempt_number), 0) + 1
+                 FROM task_attempts
+                 WHERE task_id = ?1",
+                params![task_id],
+                |row| row.get(0),
+            )?;
+            let next_attempt = u32::try_from(next_attempt_raw).map_err(|_| {
+                anyhow!("attempt_number overflow for task {task_id}: {next_attempt_raw}")
+            })?;
+            let started_epoch_ms = current_epoch_ms();
+            tx.execute(
+                "INSERT INTO task_attempts (task_id, attempt_number, session_id, runner_mode, started_epoch_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![task_id, next_attempt, session_id, runner_mode, started_epoch_ms],
+            )?;
+            tx.execute(
+                "INSERT INTO task_sessions (session_id, task_id, attempt_number, runner_mode, started_epoch_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT(session_id) DO UPDATE SET
+                    task_id = excluded.task_id,
+                    attempt_number = excluded.attempt_number,
+                    runner_mode = excluded.runner_mode,
+                    started_epoch_ms = excluded.started_epoch_ms",
+                params![session_id, task_id, next_attempt, runner_mode, started_epoch_ms],
+            )?;
+            let id = tx.last_insert_rowid();
+            Ok(TaskAttemptRecord {
+                id,
+                task_id: task_id.to_string(),
+                attempt_number: next_attempt,
+                session_id: session_id.to_string(),
+                runner_mode: runner_mode.to_string(),
+                started_epoch_ms,
+                terminal_state: None,
+                ended_epoch_ms: None,
+            })
+        })
+    }
+
+    pub fn finalize_task_session(&self, session_id: &str, terminal_state: &str) -> Result<()> {
+        self.with_transaction(|tx| {
+            let ended_epoch_ms = current_epoch_ms();
+            tx.execute(
+                "UPDATE task_sessions
+                 SET terminal_state = COALESCE(terminal_state, ?1),
+                     ended_epoch_ms = COALESCE(ended_epoch_ms, ?2)
+                 WHERE session_id = ?3",
+                params![terminal_state, ended_epoch_ms, session_id],
+            )?;
+            tx.execute(
+                "UPDATE task_attempts
+                 SET terminal_state = COALESCE(terminal_state, ?1),
+                     ended_epoch_ms = COALESCE(ended_epoch_ms, ?2)
+                 WHERE session_id = ?3",
+                params![terminal_state, ended_epoch_ms, session_id],
+            )?;
+            Ok(())
+        })
+    }
+
+    pub fn list_task_attempts(&self, task_id: &str) -> Result<Vec<TaskAttemptRecord>> {
+        self.with_connection(|connection| {
+            let mut statement = connection.prepare(
+                "SELECT id, task_id, attempt_number, session_id, runner_mode, started_epoch_ms, terminal_state, ended_epoch_ms
+                 FROM task_attempts
+                 WHERE task_id = ?1
+                 ORDER BY attempt_number ASC",
+            )?;
+            let mut rows = statement.query(params![task_id])?;
+            let mut attempts = Vec::new();
+            while let Some(row) = rows.next()? {
+                attempts.push(Self::read_task_attempt_row(row)?);
+            }
+            Ok(attempts)
+        })
+    }
+
+    pub fn list_task_sessions(&self, task_id: &str) -> Result<Vec<TaskSessionRecord>> {
+        self.with_connection(|connection| {
+            let mut statement = connection.prepare(
+                "SELECT session_id, task_id, attempt_number, runner_mode, started_epoch_ms, terminal_state, ended_epoch_ms
+                 FROM task_sessions
+                 WHERE task_id = ?1
+                 ORDER BY started_epoch_ms ASC, session_id ASC",
+            )?;
+            let mut rows = statement.query(params![task_id])?;
+            let mut sessions = Vec::new();
+            while let Some(row) = rows.next()? {
+                sessions.push(Self::read_task_session_row(row)?);
+            }
+            Ok(sessions)
         })
     }
 }
