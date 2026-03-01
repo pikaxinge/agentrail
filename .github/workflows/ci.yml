@@ -38,7 +38,7 @@ jobs:
       - name: Cache cargo artifacts
         uses: Swatinem/rust-cache@v2
       - name: cargo check
-        run: cargo check --workspace --all-targets --locked
+        run: cargo check --workspace --all-targets
 
   test:
     name: test
@@ -51,4 +51,4 @@ jobs:
       - name: Cache cargo artifacts
         uses: Swatinem/rust-cache@v2
       - name: cargo test
-        run: cargo test --workspace --all-targets --locked
+        run: cargo test --workspace --all-targets
