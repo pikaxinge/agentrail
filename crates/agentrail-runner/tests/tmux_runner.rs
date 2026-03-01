@@ -279,6 +279,44 @@ async fn steer_pause_resume_stop_and_status_work_best_effort() {
 }
 
 #[tokio::test]
+async fn interactive_stdout_tty_command_starts_successfully() {
+    if skip_if_no_tmux() {
+        return;
+    }
+
+    let tmux_runner = runner();
+    let tmp = tempdir().expect("tempdir");
+    let handle = tmux_runner
+        .start(TaskSpec {
+            id: "task-interactive-tty".to_string(),
+            command: "bash".to_string(),
+            args: vec![
+                "-lc".to_string(),
+                "if [ ! -t 1 ]; then echo stdout is not tty; exit 1; fi; echo tty-ok".to_string(),
+            ],
+            workdir: workdir_string(tmp.path()),
+        })
+        .await
+        .expect("start should succeed");
+
+    let final_state = wait_for_terminal_state(&tmux_runner, &handle.session_id, 40).await;
+    assert_eq!(final_state, "completed");
+
+    let logs = tmux_runner
+        .logs(&handle.session_id, 40)
+        .await
+        .expect("logs should succeed");
+    assert!(
+        logs.contains("tty-ok"),
+        "expected tty confirmation in logs: {logs}"
+    );
+    assert!(
+        !logs.contains("stdout is not tty"),
+        "interactive command unexpectedly saw non-tty stdout: {logs}"
+    );
+}
+
+#[tokio::test]
 async fn unknown_tmux_session_returns_error() {
     if skip_if_no_tmux() {
         return;
