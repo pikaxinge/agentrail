@@ -32,6 +32,7 @@ This document defines how coding agents should operate in `agentrail`.
 
 For full session orchestration (DAG decomposition, parallel workers, review loop, CI gates, and cleanup), see:
 - `docs/operations/SESSION_ORCHESTRATION_WORKFLOW.md`
+- `docs/operations/BOOTSTRAP_LOOP.md`
 
 ## Required verification before commit
 Run all of the following from repository root:

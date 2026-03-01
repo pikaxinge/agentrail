@@ -5,6 +5,7 @@ This runbook defines how a session-level orchestrator executes development tasks
 ## Scope
 - Use this flow for feature delivery, bugfix batches, and cross-module refactors.
 - Use it with isolated worktrees and branch-protected PR merging.
+- For self-improving orchestration, pair this runbook with `BOOTSTRAP_LOOP.md`.
 
 ## Workflow
 1. Confirm target, scope boundaries, and acceptance criteria.
@@ -29,6 +30,14 @@ This runbook defines how a session-level orchestrator executes development tasks
     - remove temporary worktrees
     - prune stale worktree metadata
     - clean large local build artifacts as needed (`cargo clean`)
+
+## MCP-Only Mode
+- For bootstrap hardening, execution should use MCP tool surfaces as the default control path.
+- Non-MCP actions (`shell`/direct file edits/manual git surgery) are break-glass actions and must be logged as friction events.
+- Required MCP surfaces for orchestration loop:
+  - planning: `plan_next`, `plan_claim`, `plan_complete`, `plan_status`, `plan_show`
+  - runtime: `orchestrate_start`, `orchestrate_status`, `orchestrate_steer`
+  - delivery: `delivery_submit`, `delivery_status`, `delivery_steer`, `delivery_stop`, `delivery_cleanup`, `delivery_report`, `delivery_events_*`
 
 ## Branch Protection Alignment
 - Do not force push.
