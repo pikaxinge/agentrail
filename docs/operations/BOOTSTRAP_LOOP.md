@@ -19,6 +19,7 @@ This document defines the self-improving loop for session orchestration.
 1. Receive task and acceptance criteria.
 2. Execute orchestration run using MCP tools first.
 3. Validate result (`fmt`, `check`, `test`, PR gates).
+   - run `scripts/revive-sccache.sh` before compile/test steps to avoid wrapper deadlocks.
 4. Run post-run reflection:
    - what blocked smooth execution
    - which steps required break-glass actions
@@ -46,3 +47,22 @@ All conditions should hold for at least 5 consecutive tasks:
 - friction list (if any)
 - linked issues for each friction item
 - closure note describing what improved in the next run
+
+## Guarded Worker Contract
+To avoid autonomous no-action loops, bootstrap rounds must use a guarded codex launcher.
+
+Recommended invocation inside `delivery_submit`:
+
+```bash
+scripts/codex-guarded-exec.sh \
+  --workdir /path/to/repo \
+  --timeout-sec 300 \
+  -- \
+  --dangerously-bypass-approvals-and-sandbox \
+  -C /path/to/repo \
+  "your implementation prompt"
+```
+
+Behavior:
+- If the worker fails to mutate the workspace before timeout, the guard exits with code `124`.
+- This creates a deterministic failure signal so orchestrator can stop/retry instead of waiting indefinitely.

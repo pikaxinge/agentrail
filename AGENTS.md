@@ -87,6 +87,11 @@ Round open gate (must pass before next tmux round starts):
   - `orchestrate_*`
   - `delivery_*`
 
+### Autonomous worker guard (required)
+- For non-interactive coding rounds launched through MCP, use `scripts/codex-guarded-exec.sh`.
+- The guard must enforce a no-edit timeout and fail fast when the worker loops in read/search without mutating the workspace.
+- Do not run raw `codex exec` directly for autonomous delivery rounds unless explicitly debugging guard behavior.
+
 ### Smoothness targets
 - `non_mcp_actions = 0` (target).
 - high CI first-pass rate.
@@ -97,6 +102,7 @@ The loop is not complete at merge. It is complete only after: merge -> retrospec
 
 ## Required verification before commit
 Run all of the following from repository root:
+- `scripts/revive-sccache.sh`
 - `cargo fmt --all`
 - `cargo check --workspace`
 - `cargo test --workspace`

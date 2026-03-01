@@ -20,6 +20,7 @@ This runbook defines how a session-level orchestrator executes development tasks
 10. Run spec-compliance review, then code-quality review.
 11. Send review findings back to workers until no blocking findings remain.
 12. Run CI-equivalent verification on integration branch:
+    - `scripts/revive-sccache.sh`
     - `cargo fmt --all -- --check`
     - `cargo check --workspace --all-targets --locked`
     - `cargo test --workspace --all-targets --locked`
@@ -34,6 +35,7 @@ This runbook defines how a session-level orchestrator executes development tasks
 ## MCP-Only Mode
 - For bootstrap hardening, execution should use MCP tool surfaces as the default control path.
 - Non-MCP actions (`shell`/direct file edits/manual git surgery) are break-glass actions and must be logged as friction events.
+- For autonomous codex workers, use `scripts/codex-guarded-exec.sh` to fail fast on no-edit loops.
 - Required MCP surfaces for orchestration loop:
   - planning: `plan_next`, `plan_claim`, `plan_complete`, `plan_status`, `plan_show`
   - runtime: `orchestrate_start`, `orchestrate_status`, `orchestrate_steer`
