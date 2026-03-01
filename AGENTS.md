@@ -30,6 +30,9 @@ This document defines how coding agents should operate in `agentrail`.
 4. Run required verification commands.
 5. Commit focused changes with clear message.
 
+For full session orchestration (DAG decomposition, parallel workers, review loop, CI gates, and cleanup), see:
+- `docs/operations/SESSION_ORCHESTRATION_WORKFLOW.md`
+
 ## Required verification before commit
 Run all of the following from repository root:
 - `cargo fmt --all`
