@@ -591,7 +591,10 @@ async fn terminate_process_group(child: &mut Child) -> Result<()> {
 mod unix_guard_tests {
     use std::path::Path;
 
-    use super::{TaskSpec, build_tmux_shell_command, should_signal_process_group};
+    use super::{
+        TaskSpec, build_tmux_shell_command, command_as_shell_line, shell_escape_double,
+        should_signal_process_group,
+    };
 
     #[test]
     fn should_signal_process_group_rejects_reserved_groups() {
@@ -629,8 +632,10 @@ mod unix_guard_tests {
             shell.contains("script -q -e -f -c"),
             "expected script-based pty logging command, got: {shell}"
         );
+        let expected_c_arg = shell_escape_double(&command_as_shell_line(&spec.command, &spec.args));
+        let expected_snippet = format!("script -q -e -f -c {expected_c_arg}");
         assert!(
-            shell.contains("script -q -e -f -c \\\"'bash' '-lc' 'echo hello'\\\""),
+            shell.contains(&expected_snippet),
             "script command should pass a single command string via -c, got: {shell}"
         );
         assert!(
