@@ -1,0 +1,82 @@
+name: "Self-Bootstrap Friction"
+description: "Track one orchestration friction item discovered during MCP-only bootstrap runs."
+title: "bootstrap-friction: <short-title>"
+labels:
+  - bootstrap
+  - friction
+body:
+  - type: textarea
+    id: context
+    attributes:
+      label: Run Context
+      description: Which run exposed this friction?
+      placeholder: "PR #, task_id, date/time, branch"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: friction_type
+    attributes:
+      label: Friction Type
+      options:
+        - non_mcp_action_required
+        - mcp_surface_gap
+        - orchestration_state_gap
+        - review_loop_gap
+        - ci_gate_gap
+        - observability_gap
+    validations:
+      required: true
+
+  - type: textarea
+    id: observed_behavior
+    attributes:
+      label: Observed Behavior
+      description: What happened and why was it not smooth?
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected_behavior
+    attributes:
+      label: Expected Behavior
+      description: What should happen in a smooth MCP-only loop?
+    validations:
+      required: true
+
+  - type: textarea
+    id: impact
+    attributes:
+      label: Impact
+      description: How did this affect delivery?
+      placeholder: "Delay, reruns, failed checks, manual patching, owner intervention"
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed Fix
+      description: Minimal change to remove this friction in future runs.
+    validations:
+      required: true
+
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: Acceptance Criteria
+      description: Concrete checks that prove this friction is removed.
+      placeholder: |
+        1. ...
+        2. ...
+        3. ...
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: policy
+    attributes:
+      label: Policy Acknowledgement
+      options:
+        - label: "If this required non-MCP action, it is logged and linked to this issue."
+          required: true
