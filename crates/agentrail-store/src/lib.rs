@@ -1,9 +1,7 @@
-use std::{
-    collections::{HashMap, HashSet},
-    sync::Mutex,
-};
+use std::{collections::HashSet, sync::Mutex};
 
 use anyhow::{Result, anyhow, bail};
+use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -23,6 +21,39 @@ pub enum TaskRuntimeState {
 }
 
 impl TaskRuntimeState {
+    fn as_db_str(self) -> &'static str {
+        match self {
+            TaskRuntimeState::Queued => "queued",
+            TaskRuntimeState::Preparing => "preparing",
+            TaskRuntimeState::Running => "running",
+            TaskRuntimeState::ReviewFailed => "review_failed",
+            TaskRuntimeState::Fixing => "fixing",
+            TaskRuntimeState::Validating => "validating",
+            TaskRuntimeState::ReadyToMerge => "ready_to_merge",
+            TaskRuntimeState::Merged => "merged",
+            TaskRuntimeState::FailedRetryable => "failed_retryable",
+            TaskRuntimeState::FailedTerminal => "failed_terminal",
+            TaskRuntimeState::NeedsAttention => "needs_attention",
+        }
+    }
+
+    fn from_db_str(value: &str) -> Result<Self> {
+        match value {
+            "queued" => Ok(TaskRuntimeState::Queued),
+            "preparing" => Ok(TaskRuntimeState::Preparing),
+            "running" => Ok(TaskRuntimeState::Running),
+            "review_failed" => Ok(TaskRuntimeState::ReviewFailed),
+            "fixing" => Ok(TaskRuntimeState::Fixing),
+            "validating" => Ok(TaskRuntimeState::Validating),
+            "ready_to_merge" => Ok(TaskRuntimeState::ReadyToMerge),
+            "merged" => Ok(TaskRuntimeState::Merged),
+            "failed_retryable" => Ok(TaskRuntimeState::FailedRetryable),
+            "failed_terminal" => Ok(TaskRuntimeState::FailedTerminal),
+            "needs_attention" => Ok(TaskRuntimeState::NeedsAttention),
+            _ => bail!("invalid task runtime state in store: {value}"),
+        }
+    }
+
     fn can_transition_to(self, next: TaskRuntimeState) -> bool {
         use TaskRuntimeState::*;
 
@@ -96,62 +127,175 @@ pub struct TaskStoreSnapshot {
     pub tasks: Vec<TaskRecord>,
 }
 
-#[derive(Debug, Default)]
-struct InMemoryRuntimeStore {
-    tasks: HashMap<String, TaskRecord>,
-}
-
 #[derive(Debug)]
 pub struct TaskStore {
     pub dsn: String,
-    runtime: Mutex<InMemoryRuntimeStore>,
+    runtime: RuntimeBackend,
+}
+
+#[derive(Debug)]
+enum RuntimeBackend {
+    Ready(Mutex<Connection>),
+    InitError(String),
 }
 
 impl TaskStore {
     pub fn connect(dsn: impl Into<String>) -> Self {
-        Self {
-            dsn: dsn.into(),
-            runtime: Mutex::new(InMemoryRuntimeStore::default()),
+        let dsn = dsn.into();
+        let runtime = match Self::open_connection(&dsn) {
+            Ok(connection) => RuntimeBackend::Ready(Mutex::new(connection)),
+            Err(error) => RuntimeBackend::InitError(error.to_string()),
+        };
+
+        Self { dsn, runtime }
+    }
+
+    fn open_connection(dsn: &str) -> Result<Connection> {
+        let (connection, file_backed) = match dsn.strip_prefix("sqlite://") {
+            Some(path) => (Connection::open(path)?, true),
+            None if dsn.starts_with("memory://") => (Connection::open_in_memory()?, false),
+            None => bail!("unsupported task store dsn: {dsn}"),
+        };
+
+        if file_backed {
+            connection.pragma_update(None, "journal_mode", "WAL")?;
+            let journal_mode: String =
+                connection
+                    .pragma_query_value(None, "journal_mode", |row| row.get::<_, String>(0))?;
+            if journal_mode.to_lowercase() != "wal" {
+                bail!("failed to enable WAL journal_mode, got: {journal_mode}");
+            }
+        }
+
+        connection.execute_batch(
+            "CREATE TABLE IF NOT EXISTS tasks (
+                id TEXT PRIMARY KEY,
+                assigned_worker TEXT NOT NULL,
+                state TEXT NOT NULL,
+                retry_count INTEGER NOT NULL,
+                retry_budget INTEGER NOT NULL
+            );",
+        )?;
+
+        Ok(connection)
+    }
+
+    fn with_connection<T>(&self, operation: impl FnOnce(&Connection) -> Result<T>) -> Result<T> {
+        match &self.runtime {
+            RuntimeBackend::Ready(runtime) => {
+                let runtime = runtime
+                    .lock()
+                    .map_err(|_| anyhow!("task store lock poisoned"))?;
+                operation(&runtime)
+            }
+            RuntimeBackend::InitError(error) => bail!("task store init error: {error}"),
         }
     }
 
     fn with_transaction<T>(
         &self,
-        operation: impl FnOnce(&mut InMemoryRuntimeStore) -> Result<T>,
+        operation: impl FnOnce(&rusqlite::Transaction<'_>) -> Result<T>,
     ) -> Result<T> {
-        // Keep this boundary while the store is in-memory so it can map to a future SQL transaction.
-        let mut runtime = self
-            .runtime
-            .lock()
-            .map_err(|_| anyhow!("task store lock poisoned"))?;
-        operation(&mut runtime)
+        match &self.runtime {
+            RuntimeBackend::Ready(runtime) => {
+                let mut runtime = runtime
+                    .lock()
+                    .map_err(|_| anyhow!("task store lock poisoned"))?;
+
+                let tx = runtime.transaction()?;
+                let result = operation(&tx)?;
+                tx.commit()?;
+                Ok(result)
+            }
+            RuntimeBackend::InitError(error) => bail!("task store init error: {error}"),
+        }
+    }
+
+    fn read_task_row(row: &rusqlite::Row<'_>) -> Result<TaskRecord> {
+        let id: String = row.get(0)?;
+        let assigned_worker: String = row.get(1)?;
+        let state_text: String = row.get(2)?;
+        let retry_count: i64 = row.get(3)?;
+        let retry_budget: i64 = row.get(4)?;
+
+        let state = TaskRuntimeState::from_db_str(state_text.as_str())?;
+        let retry_count = u32::try_from(retry_count)
+            .map_err(|_| anyhow!("invalid retry_count in store for task {id}: {retry_count}"))?;
+        let retry_budget = u32::try_from(retry_budget)
+            .map_err(|_| anyhow!("invalid retry_budget in store for task {id}: {retry_budget}"))?;
+
+        Ok(TaskRecord {
+            id,
+            assigned_worker,
+            state,
+            retry_count,
+            retry_budget,
+        })
     }
 
     pub fn upsert_task(&self, task: &TaskRecord) -> Result<()> {
-        self.with_transaction(|runtime| {
-            if runtime.tasks.contains_key(task.id.as_str()) {
+        self.with_transaction(|tx| {
+            let exists: Option<i64> = tx
+                .query_row(
+                    "SELECT 1 FROM tasks WHERE id = ?1",
+                    params![task.id],
+                    |row| row.get(0),
+                )
+                .optional()?;
+
+            if exists.is_some() {
                 bail!("task already exists: {}", task.id);
             }
 
-            runtime.tasks.insert(task.id.clone(), task.clone());
+            tx.execute(
+                "INSERT INTO tasks (id, assigned_worker, state, retry_count, retry_budget)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    task.id,
+                    task.assigned_worker,
+                    task.state.as_db_str(),
+                    task.retry_count,
+                    task.retry_budget
+                ],
+            )?;
             Ok(())
         })
     }
 
     pub fn get_task(&self, id: &str) -> Result<Option<TaskRecord>> {
-        self.with_transaction(|runtime| Ok(runtime.tasks.get(id).cloned()))
+        self.with_connection(|connection| {
+            let mut statement = connection.prepare(
+                "SELECT id, assigned_worker, state, retry_count, retry_budget
+                 FROM tasks
+                 WHERE id = ?1",
+            )?;
+            let mut rows = statement.query(params![id])?;
+
+            match rows.next()? {
+                Some(row) => Ok(Some(Self::read_task_row(row)?)),
+                None => Ok(None),
+            }
+        })
     }
 
     pub fn export_snapshot(&self) -> Result<TaskStoreSnapshot> {
-        self.with_transaction(|runtime| {
-            let mut tasks: Vec<TaskRecord> = runtime.tasks.values().cloned().collect();
-            tasks.sort_by(|a, b| a.id.cmp(&b.id));
+        self.with_connection(|connection| {
+            let mut statement = connection.prepare(
+                "SELECT id, assigned_worker, state, retry_count, retry_budget
+                 FROM tasks
+                 ORDER BY id ASC",
+            )?;
+            let mut rows = statement.query([])?;
+            let mut tasks = Vec::new();
+            while let Some(row) = rows.next()? {
+                tasks.push(Self::read_task_row(row)?);
+            }
             Ok(TaskStoreSnapshot { tasks })
         })
     }
 
     pub fn import_snapshot(&self, snapshot: TaskStoreSnapshot) -> Result<()> {
-        self.with_transaction(move |runtime| {
+        self.with_transaction(move |tx| {
             let mut seen_ids = HashSet::with_capacity(snapshot.tasks.len());
             for task in &snapshot.tasks {
                 if !seen_ids.insert(task.id.as_str()) {
@@ -159,23 +303,37 @@ impl TaskStore {
                 }
             }
 
-            let mut imported_tasks = HashMap::with_capacity(snapshot.tasks.len());
-            for task in snapshot.tasks {
-                imported_tasks.insert(task.id.clone(), task);
-            }
+            tx.execute("DELETE FROM tasks", [])?;
 
-            runtime.tasks = imported_tasks;
+            for task in snapshot.tasks {
+                tx.execute(
+                    "INSERT INTO tasks (id, assigned_worker, state, retry_count, retry_budget)
+                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                    params![
+                        task.id,
+                        task.assigned_worker,
+                        task.state.as_db_str(),
+                        task.retry_count,
+                        task.retry_budget
+                    ],
+                )?;
+            }
             Ok(())
         })
     }
 
     pub fn transition(&self, id: &str, next_state: TaskRuntimeState) -> Result<TaskRecord> {
-        self.with_transaction(|runtime| {
-            let task = runtime
-                .tasks
-                .get_mut(id)
-                .ok_or_else(|| anyhow!("task not found: {id}"))?;
-
+        self.with_transaction(|tx| {
+            let mut statement = tx.prepare(
+                "SELECT id, assigned_worker, state, retry_count, retry_budget
+                 FROM tasks
+                 WHERE id = ?1",
+            )?;
+            let mut rows = statement.query(params![id])?;
+            let Some(row) = rows.next()? else {
+                return Err(anyhow!("task not found: {id}"));
+            };
+            let mut task = Self::read_task_row(row)?;
             if !task.state.can_transition_to(next_state) {
                 bail!(
                     "invalid transition for task {id}: {:?} -> {:?}",
@@ -185,17 +343,28 @@ impl TaskStore {
             }
 
             task.state = next_state;
+            tx.execute(
+                "UPDATE tasks
+                 SET state = ?1
+                 WHERE id = ?2",
+                params![task.state.as_db_str(), id],
+            )?;
             Ok(task.clone())
         })
     }
 
     pub fn increment_retry(&self, id: &str) -> Result<TaskRecord> {
-        self.with_transaction(|runtime| {
-            let task = runtime
-                .tasks
-                .get_mut(id)
-                .ok_or_else(|| anyhow!("task not found: {id}"))?;
-
+        self.with_transaction(|tx| {
+            let mut statement = tx.prepare(
+                "SELECT id, assigned_worker, state, retry_count, retry_budget
+                 FROM tasks
+                 WHERE id = ?1",
+            )?;
+            let mut rows = statement.query(params![id])?;
+            let Some(row) = rows.next()? else {
+                return Err(anyhow!("task not found: {id}"));
+            };
+            let mut task = Self::read_task_row(row)?;
             if task.state.is_terminal() {
                 bail!("cannot increment retry in terminal state: {:?}", task.state);
             }
@@ -209,6 +378,12 @@ impl TaskStore {
             }
 
             task.retry_count += 1;
+            tx.execute(
+                "UPDATE tasks
+                 SET retry_count = ?1
+                 WHERE id = ?2",
+                params![task.retry_count, id],
+            )?;
             Ok(task.clone())
         })
     }
@@ -218,17 +393,28 @@ impl TaskStore {
         id: &str,
         assigned_worker: impl Into<String>,
     ) -> Result<TaskRecord> {
-        self.with_transaction(|runtime| {
-            let task = runtime
-                .tasks
-                .get_mut(id)
-                .ok_or_else(|| anyhow!("task not found: {id}"))?;
-
+        self.with_transaction(|tx| {
+            let mut statement = tx.prepare(
+                "SELECT id, assigned_worker, state, retry_count, retry_budget
+                 FROM tasks
+                 WHERE id = ?1",
+            )?;
+            let mut rows = statement.query(params![id])?;
+            let Some(row) = rows.next()? else {
+                return Err(anyhow!("task not found: {id}"));
+            };
+            let mut task = Self::read_task_row(row)?;
             if task.state.is_terminal() {
                 bail!("cannot reassign worker in terminal state: {:?}", task.state);
             }
 
             task.assigned_worker = assigned_worker.into();
+            tx.execute(
+                "UPDATE tasks
+                 SET assigned_worker = ?1
+                 WHERE id = ?2",
+                params![task.assigned_worker, id],
+            )?;
             Ok(task.clone())
         })
     }
