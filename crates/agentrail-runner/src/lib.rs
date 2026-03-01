@@ -493,6 +493,30 @@ fn signal_process_group(pgid: u32, signal: &str) -> bool {
 }
 
 #[cfg(unix)]
+fn should_signal_process_group(child_pgid: u32, controller_pgid: Option<u32>) -> bool {
+    if child_pgid <= 1 {
+        return false;
+    }
+    if let Some(controller_pgid) = controller_pgid {
+        if child_pgid == controller_pgid {
+            return false;
+        }
+    }
+    true
+}
+
+#[cfg(unix)]
+fn safe_target_process_group(child_pid: u32, controller_pid: u32) -> Option<u32> {
+    let child_pgid = process_group_id(child_pid)?;
+    let controller_pgid = process_group_id(controller_pid);
+    if should_signal_process_group(child_pgid, controller_pgid) {
+        Some(child_pgid)
+    } else {
+        None
+    }
+}
+
+#[cfg(unix)]
 fn pid_alive(pid: u32) -> bool {
     std::process::Command::new("kill")
         .args(["-0", &pid.to_string()])
@@ -517,17 +541,14 @@ async fn terminate_process_group(child: &mut Child) -> Result<()> {
     };
     let descendants = collect_descendant_pids(pid);
 
-    let pgid = format!("-{pid}");
-    let term_sent = std::process::Command::new("kill")
-        .args(["-TERM", &pgid])
-        .status()
-        .map(|status| status.success())
-        .unwrap_or(false);
+    let _ = signal_pid(pid, "-TERM");
+    for descendant in &descendants {
+        let _ = signal_pid(*descendant, "-TERM");
+    }
 
-    if term_sent
-        && tokio::time::timeout(Duration::from_millis(500), child.wait())
-            .await
-            .is_ok()
+    if tokio::time::timeout(Duration::from_millis(500), child.wait())
+        .await
+        .is_ok()
     {
         for descendant in descendants {
             if pid_alive(descendant) {
@@ -537,30 +558,13 @@ async fn terminate_process_group(child: &mut Child) -> Result<()> {
         return Ok(());
     }
 
-    let kill_sent = std::process::Command::new("kill")
-        .args(["-KILL", &pgid])
-        .status()
-        .map(|status| status.success())
-        .unwrap_or(false);
-
-    if kill_sent
-        && tokio::time::timeout(Duration::from_millis(500), child.wait())
-            .await
-            .is_ok()
-    {
-        for descendant in descendants {
-            if pid_alive(descendant) {
-                terminate_pid_force(descendant).await;
-            }
-        }
-        return Ok(());
-    }
-
-    if let Err(error) = child.kill().await {
-        if child.try_wait()?.is_none() {
-            return Err(error.into());
+    let _ = signal_pid(pid, "-KILL");
+    for descendant in &descendants {
+        if pid_alive(*descendant) {
+            let _ = signal_pid(*descendant, "-KILL");
         }
     }
+
     tokio::time::timeout(Duration::from_millis(500), child.wait())
         .await
         .map_err(|_| anyhow!("process did not exit after kill timeout"))??;
@@ -572,6 +576,28 @@ async fn terminate_process_group(child: &mut Child) -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(all(test, unix))]
+mod unix_guard_tests {
+    use super::should_signal_process_group;
+
+    #[test]
+    fn should_signal_process_group_rejects_reserved_groups() {
+        assert!(!should_signal_process_group(0, Some(42)));
+        assert!(!should_signal_process_group(1, Some(42)));
+    }
+
+    #[test]
+    fn should_signal_process_group_rejects_controller_group() {
+        assert!(!should_signal_process_group(1234, Some(1234)));
+    }
+
+    #[test]
+    fn should_signal_process_group_allows_distinct_group() {
+        assert!(should_signal_process_group(1234, Some(5678)));
+        assert!(should_signal_process_group(1234, None));
+    }
 }
 
 fn spawn_log_reader<R>(reader: R, logs: Arc<Mutex<VecDeque<String>>>)
@@ -924,7 +950,7 @@ impl AgentRunner for TmuxRunner {
         {
             let pid = tmux_pane_pid(&session.tmux_session)?
                 .ok_or_else(|| anyhow!("unable to determine pane pid for {session_id}"))?;
-            if let Some(pgid) = process_group_id(pid) {
+            if let Some(pgid) = safe_target_process_group(pid, std::process::id()) {
                 if signal_process_group(pgid, "-STOP") {
                     return Ok(());
                 }
@@ -952,7 +978,7 @@ impl AgentRunner for TmuxRunner {
         {
             let pid = tmux_pane_pid(&session.tmux_session)?
                 .ok_or_else(|| anyhow!("unable to determine pane pid for {session_id}"))?;
-            if let Some(pgid) = process_group_id(pid) {
+            if let Some(pgid) = safe_target_process_group(pid, std::process::id()) {
                 if signal_process_group(pgid, "-CONT") {
                     return Ok(());
                 }
