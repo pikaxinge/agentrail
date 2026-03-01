@@ -12,7 +12,7 @@ use std::fs;
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter};
 use tracing::{info, warn};
 
@@ -119,6 +119,54 @@ fn optional_string_array(args: &Value, field: &str) -> Result<Vec<String>> {
                 .ok_or_else(|| anyhow::anyhow!("invalid {field}: array must contain strings"))
         })
         .collect()
+}
+
+fn now_unix_timestamp_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .and_then(|duration| u64::try_from(duration.as_millis()).ok())
+        .unwrap_or(0)
+}
+
+fn delivery_logs_truncated(orchestration: &Value, tail: u32) -> bool {
+    if tail == 0 {
+        return false;
+    }
+
+    let Some(logs) = orchestration.get("logs").and_then(Value::as_str) else {
+        return false;
+    };
+
+    let line_count = if logs.is_empty() {
+        0
+    } else {
+        logs.lines().count()
+    };
+    line_count >= tail as usize
+}
+
+fn delivery_status_normalized_v1(orchestration: &Value, tail: u32) -> Value {
+    let field = |name: &str| orchestration.get(name).cloned().unwrap_or(Value::Null);
+
+    json!({
+        "tool": "delivery_status",
+        "task_id": field("task_id"),
+        "state": field("state"),
+        "runtime_state": field("runtime_state"),
+        "runner_mode": field("runner_mode"),
+        "session_id": field("session_id"),
+        "assigned_worker": field("assigned_worker"),
+        "retry_count": field("retry_count"),
+        "retry_budget": field("retry_budget"),
+        "timestamps": {
+            "updated_at": now_unix_timestamp_ms()
+        },
+        "logs": {
+            "tail": tail,
+            "truncated": delivery_logs_truncated(orchestration, tail)
+        }
+    })
 }
 
 fn block_on_result<T>(future: impl Future<Output = Result<T>>) -> Result<T> {
@@ -1001,7 +1049,7 @@ fn mcp_tools_descriptor() -> Value {
         },
         {
             "name":"delivery_status",
-            "description":"High-level runtime status API for chat orchestrators",
+            "description":"High-level runtime status API for chat orchestrators with normalized v1 machine-first envelope",
             "inputSchema": {
                 "type":"object",
                 "properties": {
@@ -1134,13 +1182,16 @@ pub fn handle_tool_call_with_allowed_root(
             }))
         }
         "delivery_status" => {
+            let tail = optional_u32(&args, "tail", 120)?;
             let orchestration = block_on_result(orchestrate_status_runtime(args))?;
+            let normalized = delivery_status_normalized_v1(&orchestration, tail);
             Ok(json!({
                 "tool": "delivery_status",
                 "task_id": orchestration["task_id"],
                 "state": orchestration["state"],
                 "runtime_state": orchestration["runtime_state"],
-                "orchestration": orchestration
+                "orchestration": orchestration,
+                "normalized": normalized
             }))
         }
         "delivery_steer" => {

@@ -264,18 +264,104 @@ fn delivery_submit_status_and_report_are_available() {
     let status = handle_tool_call(
         "delivery_status",
         json!({
-            "task_id": submit["task_id"]
+            "task_id": submit["task_id"],
+            "tail": 5
         }),
     )
     .expect("delivery_status should succeed");
     assert_eq!(status["tool"], "delivery_status");
     assert!(status["state"].is_string());
     assert!(status["runtime_state"].is_string());
+    assert!(status["orchestration"].is_object());
+
+    let normalized = status["normalized"]
+        .as_object()
+        .expect("delivery_status normalized envelope should exist");
+    let mut normalized_keys = normalized.keys().map(String::as_str).collect::<Vec<_>>();
+    normalized_keys.sort_unstable();
+    assert_eq!(
+        normalized_keys,
+        vec![
+            "assigned_worker",
+            "logs",
+            "retry_budget",
+            "retry_count",
+            "runner_mode",
+            "runtime_state",
+            "session_id",
+            "state",
+            "task_id",
+            "timestamps",
+            "tool"
+        ]
+    );
+    assert_eq!(status["normalized"]["tool"], "delivery_status");
+    assert_eq!(status["normalized"]["task_id"], status["task_id"]);
+    assert_eq!(status["normalized"]["state"], status["state"]);
+    assert_eq!(
+        status["normalized"]["runtime_state"],
+        status["runtime_state"]
+    );
+    assert_eq!(
+        status["normalized"]["runner_mode"],
+        status["orchestration"]["runner_mode"]
+    );
+    assert_eq!(
+        status["normalized"]["session_id"],
+        status["orchestration"]["session_id"]
+    );
+    assert_eq!(
+        status["normalized"]["assigned_worker"],
+        status["orchestration"]["assigned_worker"]
+    );
+    assert_eq!(
+        status["normalized"]["retry_count"],
+        status["orchestration"]["retry_count"]
+    );
+    assert_eq!(
+        status["normalized"]["retry_budget"],
+        status["orchestration"]["retry_budget"]
+    );
+    assert!(status["normalized"]["timestamps"]["updated_at"].is_number());
+    assert_eq!(status["normalized"]["logs"]["tail"], 5);
+    assert!(status["normalized"]["logs"]["truncated"].is_boolean());
 
     let report = handle_tool_call("delivery_report", json!({})).expect("report should succeed");
     assert_eq!(report["tool"], "delivery_report");
     assert!(report["summary"]["total"].is_number());
     assert!(report["tasks"].is_array());
+}
+
+#[test]
+fn delivery_status_normalized_envelope_uses_deterministic_nulls_when_runtime_data_missing() {
+    let task_id = unique_task_id("task-delivery-missing");
+
+    let status = handle_tool_call(
+        "delivery_status",
+        json!({
+            "task_id": task_id,
+            "tail": 9
+        }),
+    )
+    .expect("delivery_status should succeed for unknown task_id");
+
+    assert_eq!(status["tool"], "delivery_status");
+    assert_eq!(status["state"], "unknown");
+    assert_eq!(status["runtime_state"], "unknown");
+    assert!(status["orchestration"].is_object());
+
+    assert_eq!(status["normalized"]["tool"], "delivery_status");
+    assert_eq!(status["normalized"]["task_id"], status["task_id"]);
+    assert_eq!(status["normalized"]["state"], "unknown");
+    assert_eq!(status["normalized"]["runtime_state"], "unknown");
+    assert!(status["normalized"]["runner_mode"].is_null());
+    assert!(status["normalized"]["session_id"].is_null());
+    assert!(status["normalized"]["assigned_worker"].is_null());
+    assert!(status["normalized"]["retry_count"].is_null());
+    assert!(status["normalized"]["retry_budget"].is_null());
+    assert!(status["normalized"]["timestamps"]["updated_at"].is_number());
+    assert_eq!(status["normalized"]["logs"]["tail"], 9);
+    assert_eq!(status["normalized"]["logs"]["truncated"], false);
 }
 
 #[test]

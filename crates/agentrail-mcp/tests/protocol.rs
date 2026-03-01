@@ -80,6 +80,35 @@ fn tools_list_contains_plan_tools() {
 }
 
 #[test]
+fn delivery_status_tool_description_mentions_normalized_v1_contract() {
+    let req = json!({
+        "jsonrpc":"2.0",
+        "id":22,
+        "method":"tools/list",
+        "params":{}
+    });
+
+    let res = handle_mcp_request(req)
+        .expect("tools/list should succeed")
+        .expect("tools/list should return response");
+    let tools = res["result"]["tools"]
+        .as_array()
+        .expect("tools should be an array");
+    let delivery_status = tools
+        .iter()
+        .find(|tool| tool["name"] == "delivery_status")
+        .expect("delivery_status tool must be present");
+    let description = delivery_status["description"]
+        .as_str()
+        .expect("delivery_status description should be a string");
+
+    assert!(
+        description.contains("normalized v1"),
+        "description should announce normalized v1 contract, got: {description}"
+    );
+}
+
+#[test]
 fn tools_call_plan_status_returns_payload_in_text_content() {
     let plan_path = write_plan_fixture();
     let req = json!({
