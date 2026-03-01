@@ -11,6 +11,7 @@ path = "src/main.rs"
 
 [dependencies]
 agentrail-core = { path = "../agentrail-core" }
+agentrail-dashboard = { path = "../agentrail-dashboard" }
 agentrail-mcp = { path = "../agentrail-mcp" }
 agentrail-orchestrator = { path = "../agentrail-orchestrator" }
 agentrail-plan-io = { path = "../agentrail-plan-io" }

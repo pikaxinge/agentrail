@@ -1,5 +1,7 @@
 use std::{fs, path::PathBuf};
 
+use agentrail_core::{Phase, PhaseStatus, Plan, Step, StepStatus};
+use serde_json::json;
 use serde_json::Value;
 
 fn fixture_path(name: &str) -> PathBuf {
@@ -85,6 +87,31 @@ fn orchestrator_contract_fixtures_exist_and_parse() {
     assert_eq!(mcp_plan_complete["tool"], "plan_complete");
     assert_eq!(mcp_plan_complete["operation"], "complete");
     assert_eq!(mcp_plan_complete["step"]["status"], "done");
+
+    let dashboard = load_fixture("dashboard_summary.json");
+    assert_eq!(dashboard["operation"], "dashboard");
+    let plan = sample_plan();
+    let summary = agentrail_dashboard::summarize(&plan);
+    let generated_dashboard = json!({
+        "operation": "dashboard",
+        "project": agentrail_dashboard::ascii_safe(&plan.project),
+        "summary": {
+            "total": summary.total,
+            "running": summary.running,
+            "completed": summary.completed,
+            "failed": summary.failed,
+            "needs_attention": summary.needs_attention
+        }
+    });
+    assert_eq!(dashboard, generated_dashboard);
+
+    let dag = load_text_fixture("dag_mermaid.txt");
+    let generated_dag = agentrail_dashboard::render_mermaid_dag(&plan);
+    assert_eq!(dag, generated_dag);
+
+    let report = load_text_fixture("report_markdown.md");
+    let generated_report = agentrail_dashboard::render_markdown_report(&plan);
+    assert_eq!(report, generated_report);
 }
 
 fn load_fixture(name: &str) -> Value {
@@ -93,4 +120,41 @@ fn load_fixture(name: &str) -> Value {
 
     let raw = fs::read_to_string(&path).expect("fixture should be readable");
     serde_json::from_str(&raw).expect("fixture should be valid json")
+}
+
+fn load_text_fixture(name: &str) -> String {
+    let path = fixture_path(name);
+    assert!(path.exists(), "missing fixture: {}", path.display());
+    fs::read_to_string(path).expect("text fixture should be readable")
+}
+
+fn sample_plan() -> Plan {
+    Plan {
+        version: 1,
+        project: "demo".to_string(),
+        phases: vec![Phase {
+            id: "phase-1".to_string(),
+            name: "Phase 1".to_string(),
+            status: PhaseStatus::InProgress,
+            depends_on: vec![],
+            steps: vec![
+                Step {
+                    id: "step-a".to_string(),
+                    name: "Step A".to_string(),
+                    status: StepStatus::Claimed,
+                    depends_on: vec![],
+                    claimed_by: Some("worker-a".to_string()),
+                    evidence: None,
+                },
+                Step {
+                    id: "step-b".to_string(),
+                    name: "Step B".to_string(),
+                    status: StepStatus::Pending,
+                    depends_on: vec!["step-a".to_string()],
+                    claimed_by: None,
+                    evidence: None,
+                },
+            ],
+        }],
+    }
 }
