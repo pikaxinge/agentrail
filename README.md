@@ -56,6 +56,15 @@ The M9 dashboard/report CLI slice is now implemented:
 - `dag --plan <path>` (prints Mermaid DAG text)
 - `report --plan <path>` (prints markdown report text)
 
+The M11 runtime orchestration slice is now implemented:
+
+- real MCP runtime tools: `orchestrate_start`, `orchestrate_status`, `orchestrate_steer`
+- high-level MCP chat tools: `delivery_submit`, `delivery_status`, `delivery_steer`, `delivery_report`
+- process-backed task execution via MCP with runtime store integration
+- tmux runner supports start/steer/pause/resume/stop/status/logs (best effort)
+- HTTP MCP transport (`/mcp`) and health endpoint (`/healthz`)
+- `serve` CLI command for long-running MCP service mode
+
 ## Quick start
 
 ```bash
@@ -84,6 +93,10 @@ cargo run -p agentrail-cli -- report --plan ./plan.yaml
 
 # 3) Run MCP server
 cargo run -p agentrail-mcp -- --transport stdio
+cargo run -p agentrail-mcp -- --transport http --bind 127.0.0.1:8787
+
+# 4) Serve mode (same MCP runtime via CLI)
+cargo run -p agentrail-cli -- serve --transport http --bind 127.0.0.1:8787
 ```
 
 ## Repository layout

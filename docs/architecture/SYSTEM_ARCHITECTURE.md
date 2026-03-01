@@ -12,7 +12,11 @@ Chat App -> Orchestrator -> agentrail MCP/CLI -> Core/Storage/Runner -> Worktree
 - `agentrail-cli`: local and CI entrypoints.
   - Plan control: `status/show/next/claim/complete`.
   - Human-facing outputs: `dashboard --plan --out`, `dag --plan`, `report --plan`.
+  - Service mode: `serve --transport stdio|http --bind`.
 - `agentrail-mcp`: tool-facing server endpoint.
+  - Low-level tools: `plan_*`, `orchestrate_*`.
+  - High-level tools: `delivery_submit/status/steer/report`.
+  - Transports: stdio and HTTP (`/mcp`, `/healthz`).
 
 ### Application layer
 - Use cases for status/show/claim/complete/mutate/review/checkpoint.
@@ -29,6 +33,7 @@ Chat App -> Orchestrator -> agentrail MCP/CLI -> Core/Storage/Runner -> Worktree
 - Runner adapters: process and tmux implementations.
 - Dashboard/report renderer: static HTML, Mermaid DAG text, markdown report text.
 - Orchestration runtime: DAG scheduler + gate evaluator + retry/reassignment.
+ - Runtime service loop: periodic runner-state polling and runtime-state reconciliation.
 
 ## 3. Storage strategy
 - Plan state: file-based YAML with hash compare-and-swap.

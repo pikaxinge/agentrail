@@ -1,12 +1,571 @@
 use anyhow::Result;
+use axum::{
+    Json, Router,
+    extract::State,
+    http::StatusCode,
+    response::IntoResponse,
+    routing::{get, post},
+};
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::fs;
+use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
+use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter};
 use tracing::{info, warn};
 
 use agentrail_core::{Phase, PhaseStatus, Plan, Step, StepStatus};
+use agentrail_runner::{AgentRunner, ProcessRunner, TaskHandle, TaskSpec, TaskStatus, TmuxRunner};
+use agentrail_store::{TaskRecord, TaskRuntimeState, TaskStore};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RuntimeRunnerMode {
+    Process,
+    Tmux,
+}
+
+impl RuntimeRunnerMode {
+    fn parse(raw: Option<&str>) -> Result<Self> {
+        match raw.unwrap_or("process") {
+            "process" => Ok(Self::Process),
+            "tmux" => Ok(Self::Tmux),
+            other => anyhow::bail!("unsupported runner_mode: {other}"),
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Process => "process",
+            Self::Tmux => "tmux",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct RuntimeTaskSession {
+    session_id: String,
+    runner_mode: RuntimeRunnerMode,
+}
+
+#[derive(Debug)]
+struct RuntimeState {
+    store: TaskStore,
+    sessions: HashMap<String, RuntimeTaskSession>,
+}
+
+static RUNTIME_STATE: OnceLock<Mutex<RuntimeState>> = OnceLock::new();
+
+fn runtime_state() -> &'static Mutex<RuntimeState> {
+    RUNTIME_STATE.get_or_init(|| {
+        let dsn = std::env::var("AGENTRAIL_RUNTIME_DSN")
+            .ok()
+            .filter(|v| !v.trim().is_empty())
+            .unwrap_or_else(|| "memory://agentrail-runtime".to_string());
+        Mutex::new(RuntimeState {
+            store: TaskStore::connect(dsn),
+            sessions: HashMap::new(),
+        })
+    })
+}
+
+fn runtime_state_label(state: TaskRuntimeState) -> &'static str {
+    match state {
+        TaskRuntimeState::Queued => "queued",
+        TaskRuntimeState::Preparing => "preparing",
+        TaskRuntimeState::Running => "running",
+        TaskRuntimeState::ReviewFailed => "review_failed",
+        TaskRuntimeState::Fixing => "fixing",
+        TaskRuntimeState::Validating => "validating",
+        TaskRuntimeState::ReadyToMerge => "ready_to_merge",
+        TaskRuntimeState::Merged => "merged",
+        TaskRuntimeState::FailedRetryable => "failed_retryable",
+        TaskRuntimeState::FailedTerminal => "failed_terminal",
+        TaskRuntimeState::NeedsAttention => "needs_attention",
+    }
+}
+
+fn optional_string(args: &Value, field: &str) -> Option<String> {
+    args.get(field)
+        .and_then(Value::as_str)
+        .map(ToString::to_string)
+}
+
+fn optional_u32(args: &Value, field: &str, default: u32) -> Result<u32> {
+    match args.get(field) {
+        None => Ok(default),
+        Some(value) => {
+            let raw = value
+                .as_u64()
+                .ok_or_else(|| anyhow::anyhow!("invalid {field}: must be unsigned integer"))?;
+            Ok(u32::try_from(raw)
+                .map_err(|_| anyhow::anyhow!("invalid {field}: out of range for u32"))?)
+        }
+    }
+}
+
+fn optional_string_array(args: &Value, field: &str) -> Result<Vec<String>> {
+    let Some(value) = args.get(field) else {
+        return Ok(Vec::new());
+    };
+    let arr = value
+        .as_array()
+        .ok_or_else(|| anyhow::anyhow!("invalid {field}: must be string array"))?;
+    arr.iter()
+        .map(|v| {
+            v.as_str()
+                .map(ToString::to_string)
+                .ok_or_else(|| anyhow::anyhow!("invalid {field}: array must contain strings"))
+        })
+        .collect()
+}
+
+fn block_on_result<T>(future: impl Future<Output = Result<T>>) -> Result<T> {
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        return tokio::task::block_in_place(|| handle.block_on(future));
+    }
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    rt.block_on(future)
+}
+
+fn resolve_start_command_and_args(args: &Value) -> Result<(String, Vec<String>)> {
+    let command = optional_string(args, "command");
+    let command_defaulted = command.is_none();
+    let command = command.unwrap_or_else(|| "bash".to_string());
+    let parsed_args = optional_string_array(args, "args")?;
+    let command_args = if command_defaulted && parsed_args.is_empty() {
+        vec!["-lc".to_string(), "true".to_string()]
+    } else {
+        parsed_args
+    };
+
+    Ok((command, command_args))
+}
+
+async fn runner_start(mode: RuntimeRunnerMode, spec: TaskSpec) -> Result<TaskHandle> {
+    match mode {
+        RuntimeRunnerMode::Process => ProcessRunner.start(spec).await,
+        RuntimeRunnerMode::Tmux => TmuxRunner.start(spec).await,
+    }
+}
+
+async fn runner_status(mode: RuntimeRunnerMode, session_id: &str) -> Result<TaskStatus> {
+    match mode {
+        RuntimeRunnerMode::Process => ProcessRunner.status(session_id).await,
+        RuntimeRunnerMode::Tmux => TmuxRunner.status(session_id).await,
+    }
+}
+
+async fn runner_steer(mode: RuntimeRunnerMode, session_id: &str, instruction: &str) -> Result<()> {
+    match mode {
+        RuntimeRunnerMode::Process => ProcessRunner.steer(session_id, instruction).await,
+        RuntimeRunnerMode::Tmux => TmuxRunner.steer(session_id, instruction).await,
+    }
+}
+
+async fn runner_logs(mode: RuntimeRunnerMode, session_id: &str, tail: usize) -> Result<String> {
+    match mode {
+        RuntimeRunnerMode::Process => ProcessRunner.logs(session_id, tail).await,
+        RuntimeRunnerMode::Tmux => TmuxRunner.logs(session_id, tail).await,
+    }
+}
+
+fn map_runner_to_runtime_state(state: &str) -> Option<TaskRuntimeState> {
+    match state {
+        "running" => Some(TaskRuntimeState::Running),
+        "completed" => Some(TaskRuntimeState::ReadyToMerge),
+        "failed" | "stopped" => Some(TaskRuntimeState::FailedRetryable),
+        _ => None,
+    }
+}
+
+fn runner_state_is_terminal(state: &str) -> bool {
+    matches!(state, "completed" | "failed" | "stopped")
+}
+
+fn runtime_state_is_terminal(state: TaskRuntimeState) -> bool {
+    matches!(
+        state,
+        TaskRuntimeState::Merged | TaskRuntimeState::FailedTerminal
+    )
+}
+
+fn clear_runtime_session(task_id: &str) -> Result<()> {
+    let mut runtime = runtime_state()
+        .lock()
+        .map_err(|_| anyhow::anyhow!("runtime state lock poisoned"))?;
+    runtime.sessions.remove(task_id);
+    Ok(())
+}
+
+fn ensure_task_preparing(task_id: &str, worker_id: &str, retry_budget: u32) -> Result<()> {
+    let runtime = runtime_state()
+        .lock()
+        .map_err(|_| anyhow::anyhow!("runtime state lock poisoned"))?;
+
+    match runtime.store.get_task(task_id)? {
+        None => {
+            runtime
+                .store
+                .upsert_task(&TaskRecord::new(task_id, worker_id, retry_budget))?;
+        }
+        Some(existing) => match existing.state {
+            TaskRuntimeState::Preparing | TaskRuntimeState::Running => {
+                anyhow::bail!("task already active: {task_id}");
+            }
+            TaskRuntimeState::Queued => {
+                runtime
+                    .store
+                    .reassign_worker(task_id, worker_id.to_string())?;
+            }
+            TaskRuntimeState::FailedRetryable | TaskRuntimeState::NeedsAttention => {
+                runtime
+                    .store
+                    .reassign_worker(task_id, worker_id.to_string())?;
+                runtime
+                    .store
+                    .transition(task_id, TaskRuntimeState::Queued)?;
+            }
+            _ => {
+                anyhow::bail!(
+                    "invalid runtime state for orchestrate_start: {task_id} cannot start from {}",
+                    runtime_state_label(existing.state)
+                );
+            }
+        },
+    }
+
+    let latest = runtime
+        .store
+        .get_task(task_id)?
+        .ok_or_else(|| anyhow::anyhow!("task not found in runtime store: {task_id}"))?;
+    if latest.state != TaskRuntimeState::Queued {
+        anyhow::bail!(
+            "invalid runtime state contract for orchestrate_start: expected queued before launch, found {}",
+            runtime_state_label(latest.state)
+        );
+    }
+    runtime
+        .store
+        .transition(task_id, TaskRuntimeState::Preparing)?;
+    Ok(())
+}
+
+fn mark_task_start_failed(task_id: &str) -> Result<()> {
+    let runtime = runtime_state()
+        .lock()
+        .map_err(|_| anyhow::anyhow!("runtime state lock poisoned"))?;
+    let existing = runtime.store.get_task(task_id)?;
+    if let Some(task) = existing
+        && task.state == TaskRuntimeState::Preparing
+    {
+        runtime
+            .store
+            .transition(task_id, TaskRuntimeState::FailedRetryable)?;
+    }
+    Ok(())
+}
+
+fn register_running_session(
+    task_id: &str,
+    runner_mode: RuntimeRunnerMode,
+    session_id: String,
+) -> Result<TaskRuntimeState> {
+    let mut runtime = runtime_state()
+        .lock()
+        .map_err(|_| anyhow::anyhow!("runtime state lock poisoned"))?;
+    let existing = runtime.store.get_task(task_id)?;
+    if let Some(task) = existing
+        && task.state == TaskRuntimeState::Preparing
+    {
+        runtime
+            .store
+            .transition(task_id, TaskRuntimeState::Running)?;
+    }
+    runtime.sessions.insert(
+        task_id.to_string(),
+        RuntimeTaskSession {
+            session_id: session_id.clone(),
+            runner_mode,
+        },
+    );
+    let task = runtime
+        .store
+        .get_task(task_id)?
+        .ok_or_else(|| anyhow::anyhow!("task not found in runtime store: {task_id}"))?;
+    Ok(task.state)
+}
+
+async fn orchestrate_start_runtime(args: Value) -> Result<Value> {
+    let task_id = require_task_id("orchestrate_start", &args)?.to_string();
+    let worker_id = optional_string(&args, "worker_id").unwrap_or_else(|| "worker-default".into());
+    let retry_budget = optional_u32(&args, "retry_budget", 3)?;
+    let runner_mode = RuntimeRunnerMode::parse(args.get("runner_mode").and_then(Value::as_str))?;
+    let (command, command_args) = resolve_start_command_and_args(&args)?;
+    let workdir = optional_string(&args, "workdir").unwrap_or_else(|| ".".to_string());
+
+    ensure_task_preparing(&task_id, &worker_id, retry_budget)?;
+
+    let spec = TaskSpec {
+        id: task_id.clone(),
+        command,
+        args: command_args,
+        workdir,
+    };
+
+    let handle = match runner_start(runner_mode, spec).await {
+        Ok(handle) => handle,
+        Err(error) => {
+            let _ = mark_task_start_failed(&task_id);
+            return Err(error);
+        }
+    };
+
+    let runtime_state = register_running_session(&task_id, runner_mode, handle.session_id.clone())?;
+
+    info!(
+        operation = "mcp_tool_call",
+        tool = "orchestrate_start",
+        task_id = task_id,
+        session_id = handle.session_id,
+        runner_mode = runner_mode.as_str(),
+        outcome = "accepted",
+        "started orchestrated task"
+    );
+
+    Ok(json!({
+        "tool": "orchestrate_start",
+        "task_id": task_id,
+        "status": "accepted",
+        "session_id": handle.session_id,
+        "runner_mode": runner_mode.as_str(),
+        "runtime_state": runtime_state_label(runtime_state)
+    }))
+}
+
+async fn task_runtime_status(task_id: &str, tail: usize) -> Result<Value> {
+    let (session, record) = {
+        let runtime = runtime_state()
+            .lock()
+            .map_err(|_| anyhow::anyhow!("runtime state lock poisoned"))?;
+        (
+            runtime.sessions.get(task_id).cloned(),
+            runtime.store.get_task(task_id)?,
+        )
+    };
+
+    let Some(record) = record else {
+        if session.is_some() {
+            let _ = clear_runtime_session(task_id);
+        }
+        return Ok(json!({
+            "tool": "orchestrate_status",
+            "task_id": task_id,
+            "state": "unknown",
+            "runtime_state": "unknown"
+        }));
+    };
+
+    if runtime_state_is_terminal(record.state) {
+        if session.is_some() {
+            let _ = clear_runtime_session(task_id);
+        }
+        return Ok(json!({
+            "tool": "orchestrate_status",
+            "task_id": task_id,
+            "state": runtime_state_label(record.state),
+            "runtime_state": runtime_state_label(record.state),
+            "assigned_worker": record.assigned_worker,
+            "retry_count": record.retry_count,
+            "retry_budget": record.retry_budget
+        }));
+    }
+
+    let Some(session) = session else {
+        return Ok(json!({
+            "tool": "orchestrate_status",
+            "task_id": task_id,
+            "state": runtime_state_label(record.state),
+            "runtime_state": runtime_state_label(record.state),
+            "retry_count": record.retry_count,
+            "retry_budget": record.retry_budget
+        }));
+    };
+
+    let status = match runner_status(session.runner_mode, &session.session_id).await {
+        Ok(status) => status,
+        Err(error) => {
+            let _ = clear_runtime_session(task_id);
+            return Err(error);
+        }
+    };
+    if let Some(target) = map_runner_to_runtime_state(&status.state) {
+        let runtime = runtime_state()
+            .lock()
+            .map_err(|_| anyhow::anyhow!("runtime state lock poisoned"))?;
+        if let Some(current) = runtime.store.get_task(task_id)?
+            && current.state != target
+            && current.state != TaskRuntimeState::Merged
+            && current.state != TaskRuntimeState::FailedTerminal
+        {
+            let _ = runtime.store.transition(task_id, target);
+        }
+    }
+
+    let latest = {
+        let runtime = runtime_state()
+            .lock()
+            .map_err(|_| anyhow::anyhow!("runtime state lock poisoned"))?;
+        runtime
+            .store
+            .get_task(task_id)?
+            .ok_or_else(|| anyhow::anyhow!("task not found after status refresh: {task_id}"))?
+    };
+
+    let logs = match runner_logs(session.runner_mode, &session.session_id, tail).await {
+        Ok(logs) => logs,
+        Err(error) => {
+            let _ = clear_runtime_session(task_id);
+            return Err(error);
+        }
+    };
+
+    if runner_state_is_terminal(&status.state) || runtime_state_is_terminal(latest.state) {
+        let _ = clear_runtime_session(task_id);
+    }
+
+    Ok(json!({
+        "tool": "orchestrate_status",
+        "task_id": task_id,
+        "state": status.state,
+        "runtime_state": runtime_state_label(latest.state),
+        "session_id": session.session_id,
+        "runner_mode": session.runner_mode.as_str(),
+        "assigned_worker": latest.assigned_worker,
+        "retry_count": latest.retry_count,
+        "retry_budget": latest.retry_budget,
+        "logs": logs
+    }))
+}
+
+async fn orchestrate_status_runtime(args: Value) -> Result<Value> {
+    let task_id = require_task_id("orchestrate_status", &args)?.to_string();
+    let tail = optional_u32(&args, "tail", 120)? as usize;
+    task_runtime_status(&task_id, tail).await
+}
+
+async fn orchestrate_steer_runtime(args: Value) -> Result<Value> {
+    let task_id = require_task_id("orchestrate_steer", &args)?.to_string();
+    let instruction = require_string_field("orchestrate_steer", &args, "instruction")?.to_string();
+
+    let session = {
+        let runtime = runtime_state()
+            .lock()
+            .map_err(|_| anyhow::anyhow!("runtime state lock poisoned"))?;
+        runtime
+            .sessions
+            .get(&task_id)
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("task has no active session: {task_id}"))?
+    };
+
+    runner_steer(session.runner_mode, &session.session_id, &instruction).await?;
+
+    info!(
+        operation = "mcp_tool_call",
+        tool = "orchestrate_steer",
+        task_id = task_id,
+        session_id = session.session_id,
+        outcome = "sent",
+        "sent steering instruction to active task session"
+    );
+
+    Ok(json!({
+        "tool": "orchestrate_steer",
+        "task_id": task_id,
+        "status": "sent",
+        "session_id": session.session_id
+    }))
+}
+
+fn runtime_report() -> Result<Value> {
+    let runtime = runtime_state()
+        .lock()
+        .map_err(|_| anyhow::anyhow!("runtime state lock poisoned"))?;
+    let snapshot = runtime.store.export_snapshot()?;
+
+    let mut summary = json!({
+        "total": snapshot.tasks.len(),
+        "queued": 0,
+        "preparing": 0,
+        "running": 0,
+        "review_failed": 0,
+        "fixing": 0,
+        "validating": 0,
+        "ready_to_merge": 0,
+        "merged": 0,
+        "failed_retryable": 0,
+        "failed_terminal": 0,
+        "needs_attention": 0
+    });
+
+    for task in &snapshot.tasks {
+        let key = runtime_state_label(task.state);
+        if let Some(slot) = summary.get_mut(key)
+            && let Some(raw) = slot.as_u64()
+        {
+            *slot = json!(raw + 1);
+        }
+    }
+
+    let tasks = snapshot
+        .tasks
+        .iter()
+        .map(|task| {
+            json!({
+                "task_id": task.id,
+                "state": runtime_state_label(task.state),
+                "assigned_worker": task.assigned_worker,
+                "retry_count": task.retry_count,
+                "retry_budget": task.retry_budget
+            })
+        })
+        .collect::<Vec<_>>();
+
+    Ok(json!({
+        "tool": "delivery_report",
+        "summary": summary,
+        "tasks": tasks
+    }))
+}
+
+async fn poll_runtime_once() -> Result<()> {
+    let task_ids = {
+        let runtime = runtime_state()
+            .lock()
+            .map_err(|_| anyhow::anyhow!("runtime state lock poisoned"))?;
+        runtime.sessions.keys().cloned().collect::<Vec<_>>()
+    };
+
+    let mut failures = Vec::new();
+    for task_id in task_ids {
+        if let Err(error) = task_runtime_status(&task_id, 50).await {
+            failures.push(format!("{task_id}: {error}"));
+        }
+    }
+
+    if !failures.is_empty() {
+        anyhow::bail!(
+            "runtime poll encountered per-task failures: {}",
+            failures.join("; ")
+        );
+    }
+
+    Ok(())
+}
 
 pub async fn run_stdio() -> Result<()> {
     info!(
@@ -15,6 +574,20 @@ pub async fn run_stdio() -> Result<()> {
         outcome = "ok",
         "agentrail MCP stdio server bootstrap"
     );
+
+    tokio::spawn(async {
+        loop {
+            if let Err(error) = poll_runtime_once().await {
+                warn!(
+                    operation = "runtime_poll",
+                    outcome = "error",
+                    error = %error,
+                    "runtime poll failed"
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+    });
 
     let stdin = tokio::io::stdin();
     let stdout = tokio::io::stdout();
@@ -37,7 +610,9 @@ pub async fn run_stdio() -> Result<()> {
                         "message": format!("parse error: {error}")
                     }
                 });
-                writer.write_all(serde_json::to_string(&response)?.as_bytes()).await?;
+                writer
+                    .write_all(serde_json::to_string(&response)?.as_bytes())
+                    .await?;
                 writer.write_all(b"\n").await?;
                 writer.flush().await?;
                 continue;
@@ -45,7 +620,9 @@ pub async fn run_stdio() -> Result<()> {
         };
 
         if let Some(response) = handle_mcp_request(parsed)? {
-            writer.write_all(serde_json::to_string(&response)?.as_bytes()).await?;
+            writer
+                .write_all(serde_json::to_string(&response)?.as_bytes())
+                .await?;
             writer.write_all(b"\n").await?;
             writer.flush().await?;
         }
@@ -62,6 +639,47 @@ pub async fn run_http(bind: &str) -> Result<()> {
         outcome = "ok",
         "agentrail MCP HTTP server bootstrap"
     );
+    tokio::spawn(async {
+        loop {
+            if let Err(error) = poll_runtime_once().await {
+                warn!(
+                    operation = "runtime_poll",
+                    outcome = "error",
+                    error = %error,
+                    "runtime poll failed"
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+    });
+
+    #[derive(Clone)]
+    struct HttpState;
+
+    async fn health() -> Json<Value> {
+        Json(json!({"status":"ok"}))
+    }
+
+    async fn mcp_handler(
+        State(_state): State<HttpState>,
+        Json(request): Json<Value>,
+    ) -> impl IntoResponse {
+        let (status, body) = handle_http_mcp_request(request);
+        let status = StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+
+        match body {
+            Some(payload) => (status, Json(payload)).into_response(),
+            None => status.into_response(),
+        }
+    }
+
+    let app = Router::new()
+        .route("/healthz", get(health))
+        .route("/mcp", post(mcp_handler))
+        .with_state(HttpState);
+
+    let listener = tokio::net::TcpListener::bind(bind).await?;
+    axum::serve(listener, app).await?;
     Ok(())
 }
 
@@ -316,6 +934,102 @@ fn mcp_tools_descriptor() -> Value {
                 },
                 "required": ["plan_path","step_id","agent","evidence"]
             }
+        },
+        {
+            "name":"orchestrate_start",
+            "description":"Start a runtime task on process/tmux runner",
+            "inputSchema": {
+                "type":"object",
+                "properties": {
+                    "task_id": {"type":"string"},
+                    "worker_id": {"type":"string"},
+                    "runner_mode": {"type":"string", "enum": ["process", "tmux"]},
+                    "command": {"type":"string"},
+                    "args": {
+                        "type":"array",
+                        "items": {"type":"string"}
+                    },
+                    "workdir": {"type":"string"},
+                    "retry_budget": {"type":"integer"}
+                },
+                "required": ["task_id"]
+            }
+        },
+        {
+            "name":"orchestrate_status",
+            "description":"Query runtime status for one task",
+            "inputSchema": {
+                "type":"object",
+                "properties": {
+                    "task_id": {"type":"string"},
+                    "tail": {"type":"integer"}
+                },
+                "required": ["task_id"]
+            }
+        },
+        {
+            "name":"orchestrate_steer",
+            "description":"Send steering instruction to running task session",
+            "inputSchema": {
+                "type":"object",
+                "properties": {
+                    "task_id": {"type":"string"},
+                    "instruction": {"type":"string"}
+                },
+                "required": ["task_id", "instruction"]
+            }
+        },
+        {
+            "name":"delivery_submit",
+            "description":"High-level submit API for chat orchestrators",
+            "inputSchema": {
+                "type":"object",
+                "properties": {
+                    "task_id": {"type":"string"},
+                    "worker_id": {"type":"string"},
+                    "runner_mode": {"type":"string", "enum": ["process", "tmux"]},
+                    "command": {"type":"string"},
+                    "args": {
+                        "type":"array",
+                        "items": {"type":"string"}
+                    },
+                    "workdir": {"type":"string"},
+                    "retry_budget": {"type":"integer"}
+                },
+                "required": ["task_id"]
+            }
+        },
+        {
+            "name":"delivery_status",
+            "description":"High-level runtime status API for chat orchestrators",
+            "inputSchema": {
+                "type":"object",
+                "properties": {
+                    "task_id": {"type":"string"},
+                    "tail": {"type":"integer"}
+                },
+                "required": ["task_id"]
+            }
+        },
+        {
+            "name":"delivery_steer",
+            "description":"High-level steering API for chat orchestrators",
+            "inputSchema": {
+                "type":"object",
+                "properties": {
+                    "task_id": {"type":"string"},
+                    "instruction": {"type":"string"}
+                },
+                "required": ["task_id", "instruction"]
+            }
+        },
+        {
+            "name":"delivery_report",
+            "description":"Return aggregated runtime report for all tracked tasks",
+            "inputSchema": {
+                "type":"object",
+                "properties": {}
+            }
         }
     ])
 }
@@ -364,7 +1078,10 @@ pub fn handle_mcp_request(request: Value) -> Result<Option<Value>> {
                     )));
                 }
             };
-            let arguments = params.get("arguments").cloned().unwrap_or_else(|| json!({}));
+            let arguments = params
+                .get("arguments")
+                .cloned()
+                .unwrap_or_else(|| json!({}));
             match handle_tool_call(name, arguments) {
                 Ok(tool_result) => rpc_result(
                     id,
@@ -386,57 +1103,56 @@ pub fn handle_mcp_request(request: Value) -> Result<Option<Value>> {
     Ok(Some(response))
 }
 
+pub fn handle_http_mcp_request(request: Value) -> (u16, Option<Value>) {
+    let request_id = request.get("id").cloned().unwrap_or(Value::Null);
+
+    match handle_mcp_request(request) {
+        Ok(Some(response)) => (StatusCode::OK.as_u16(), Some(response)),
+        Ok(None) => (StatusCode::NO_CONTENT.as_u16(), None),
+        Err(error) => (
+            StatusCode::OK.as_u16(),
+            Some(rpc_error(request_id, -32000, error.to_string())),
+        ),
+    }
+}
+
 pub fn handle_tool_call_with_allowed_root(
     tool_name: &str,
     args: Value,
     allowed_root: Option<&Path>,
 ) -> Result<Value> {
     match tool_name {
-        "orchestrate_start" => {
-            let task_id = require_task_id(tool_name, &args)?;
-            info!(
-                operation = "mcp_tool_call",
-                tool = tool_name,
-                task_id = task_id,
-                outcome = "accepted",
-                "handled MCP tool call"
-            );
+        "orchestrate_start" => block_on_result(orchestrate_start_runtime(args)),
+        "orchestrate_status" => block_on_result(orchestrate_status_runtime(args)),
+        "orchestrate_steer" => block_on_result(orchestrate_steer_runtime(args)),
+        "delivery_submit" => {
+            let orchestration = block_on_result(orchestrate_start_runtime(args))?;
             Ok(json!({
-                "tool": tool_name,
-                "task_id": task_id,
-                "status": "accepted"
+                "tool": "delivery_submit",
+                "task_id": orchestration["task_id"],
+                "orchestration": orchestration
             }))
         }
-        "orchestrate_status" => {
-            let task_id = require_task_id(tool_name, &args)?;
-            info!(
-                operation = "mcp_tool_call",
-                tool = tool_name,
-                task_id = task_id,
-                outcome = "running",
-                "handled MCP tool call"
-            );
+        "delivery_status" => {
+            let orchestration = block_on_result(orchestrate_status_runtime(args))?;
             Ok(json!({
-                "tool": tool_name,
-                "task_id": task_id,
-                "state": "running"
+                "tool": "delivery_status",
+                "task_id": orchestration["task_id"],
+                "state": orchestration["state"],
+                "runtime_state": orchestration["runtime_state"],
+                "orchestration": orchestration
             }))
         }
-        "orchestrate_steer" => {
-            let task_id = require_task_id(tool_name, &args)?;
-            info!(
-                operation = "mcp_tool_call",
-                tool = tool_name,
-                task_id = task_id,
-                outcome = "sent",
-                "handled MCP tool call"
-            );
+        "delivery_steer" => {
+            let orchestration = block_on_result(orchestrate_steer_runtime(args))?;
             Ok(json!({
-                "tool": tool_name,
-                "task_id": task_id,
-                "status": "sent"
+                "tool": "delivery_steer",
+                "task_id": orchestration["task_id"],
+                "status": orchestration["status"],
+                "orchestration": orchestration
             }))
         }
+        "delivery_report" => runtime_report(),
         "plan_status" => {
             let plan_path = require_plan_path(tool_name, &args, allowed_root)?;
             let (plan, _) = load_plan(&plan_path)?;
@@ -579,6 +1295,7 @@ mod tests {
     use std::{
         io::{self, Write},
         sync::{Arc, Mutex},
+        time::{SystemTime, UNIX_EPOCH},
     };
 
     use super::*;
@@ -620,6 +1337,29 @@ mod tests {
 
     fn has_field_value(logs: &str, field: &str, value: &str) -> bool {
         logs.contains(&format!("{field}={value}")) || logs.contains(&format!("{field}=\"{value}\""))
+    }
+
+    fn unique_test_task_id(prefix: &str) -> String {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("monotonic clock")
+            .as_nanos();
+        format!("{prefix}-{now}")
+    }
+
+    #[test]
+    fn resolve_start_command_defaults_bash_with_safe_args_when_omitted() {
+        let (command, args) = resolve_start_command_and_args(&json!({})).expect("resolve command");
+        assert_eq!(command, "bash");
+        assert_eq!(args, vec!["-lc".to_string(), "true".to_string()]);
+    }
+
+    #[test]
+    fn resolve_start_command_keeps_empty_args_for_explicit_command() {
+        let (command, args) = resolve_start_command_and_args(&json!({"command":"/usr/bin/whoami"}))
+            .expect("resolve command");
+        assert_eq!(command, "/usr/bin/whoami");
+        assert!(args.is_empty());
     }
 
     #[test]
@@ -686,6 +1426,39 @@ mod tests {
         assert!(
             has_field_value(&logs, "outcome", "unsupported"),
             "expected unsupported outcome field in tracing output, got: {logs}"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn poll_runtime_once_reports_task_failures_and_cleans_missing_sessions() {
+        let task_id = unique_test_task_id("poll-missing-session");
+        {
+            let mut runtime = runtime_state().lock().expect("runtime lock");
+            runtime
+                .store
+                .upsert_task(&TaskRecord::new(task_id.clone(), "worker-a", 1))
+                .expect("seed task");
+            runtime.sessions.insert(
+                task_id.clone(),
+                RuntimeTaskSession {
+                    session_id: "process-missing-session".to_string(),
+                    runner_mode: RuntimeRunnerMode::Process,
+                },
+            );
+        }
+
+        let err = poll_runtime_once()
+            .await
+            .expect_err("poll should report per-task failure");
+        assert!(
+            err.to_string().contains(&task_id),
+            "expected task id in poll error: {err}"
+        );
+
+        let runtime = runtime_state().lock().expect("runtime lock");
+        assert!(
+            !runtime.sessions.contains_key(&task_id),
+            "stale missing session should be removed after poll failure"
         );
     }
 }

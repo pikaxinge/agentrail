@@ -48,6 +48,11 @@ Build a Rust-native orchestration control plane that enables chat-driven multi-a
 - Auto-merge when gate matrix is fully green.
 - Auto-clean worktrees and stale runtime state after completion.
 
+### FR-7 Runtime MCP + service mode
+- `orchestrate_start/status/steer` must drive real runner + runtime-store execution, not mock payloads.
+- Add high-level orchestration tools (`delivery_submit/status/steer/report`) for chat-first clients.
+- Service mode must run as long-lived MCP endpoint with HTTP `/mcp` and `/healthz`.
+
 ## 4. Non-functional requirements
 - Throughput: MCP concurrency improves 3-8x vs Python baseline.
 - Latency: hot read paths (`status/next/show`) improve by 40-70%.

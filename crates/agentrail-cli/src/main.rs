@@ -72,6 +72,12 @@ enum Commands {
         #[arg(long, default_value = "127.0.0.1:8787")]
         bind: String,
     },
+    Serve {
+        #[arg(long, default_value = "http")]
+        transport: String,
+        #[arg(long, default_value = "127.0.0.1:8787")]
+        bind: String,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -297,6 +303,15 @@ async fn main() -> Result<()> {
             }
         },
         Commands::Mcp { transport, bind } => {
+            if transport == "stdio" {
+                agentrail_mcp::run_stdio().await?;
+            } else if transport == "http" {
+                agentrail_mcp::run_http(&bind).await?;
+            } else {
+                anyhow::bail!("unsupported transport: {transport}");
+            }
+        }
+        Commands::Serve { transport, bind } => {
             if transport == "stdio" {
                 agentrail_mcp::run_stdio().await?;
             } else if transport == "http" {

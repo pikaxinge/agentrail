@@ -7,12 +7,18 @@ Operational playbook for chat-driven automated delivery with `agentrail` (M1-M5 
 1. Verify toolchain and workspace health.
 2. Verify orchestrator command surface and MCP tool surface.
 3. Verify compatibility fixtures and contract tests.
+4. Verify runtime service mode endpoints (`/healthz`) when HTTP transport is used.
 
 Recommended commands:
 ```bash
 cargo fmt --all
 cargo check --workspace
 cargo test --workspace
+
+# HTTP MCP service smoke check
+cargo run -p agentrail-cli -- serve --transport http --bind 127.0.0.1:8787
+# in another shell
+curl -s http://127.0.0.1:8787/healthz
 ```
 
 ## 3. Runtime workflow
@@ -63,6 +69,7 @@ cargo test --workspace
 - Structured events for task launch, transition, tool calls, and failures.
 - Per-task logs include `task_id`, state transition, and outcome.
 - Gate decisions record required and optional check failures.
+- Runtime poll loop should emit warning-level events on state refresh failures.
 
 ## 9. Human escalation trigger
 Escalate to operator when either condition is true:
