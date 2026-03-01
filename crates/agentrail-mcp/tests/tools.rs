@@ -46,6 +46,56 @@ fn wait_for_runtime_state(task_id: &str, wanted: &str) -> serde_json::Value {
     );
 }
 
+fn unique_subscriber_id(prefix: &str) -> String {
+    unique_task_id(prefix)
+}
+
+fn subscribe_events(task_id: &str) -> (String, u64) {
+    let subscriber_id = unique_subscriber_id("delivery-sub");
+    let response = handle_tool_call(
+        "delivery_events_subscribe",
+        json!({
+            "subscriber_id": subscriber_id,
+            "task_id": task_id
+        }),
+    )
+    .expect("delivery_events_subscribe should succeed");
+
+    (
+        response["subscriber_id"]
+            .as_str()
+            .expect("subscriber_id should be string")
+            .to_string(),
+        response["cursor"]
+            .as_u64()
+            .expect("cursor should be u64 integer"),
+    )
+}
+
+fn next_events(subscriber_id: &str, task_id: &str, limit: u32) -> serde_json::Value {
+    handle_tool_call(
+        "delivery_events_next",
+        json!({
+            "subscriber_id": subscriber_id,
+            "task_id": task_id,
+            "limit": limit
+        }),
+    )
+    .expect("delivery_events_next should succeed")
+}
+
+fn ack_events(subscriber_id: &str, cursor: u64) {
+    let ack = handle_tool_call(
+        "delivery_events_ack",
+        json!({
+            "subscriber_id": subscriber_id,
+            "cursor": cursor
+        }),
+    )
+    .expect("delivery_events_ack should succeed");
+    assert_eq!(ack["acked_cursor"], json!(cursor));
+}
+
 #[test]
 fn orchestrate_start_starts_real_process_and_exposes_session() {
     let tmp = tempdir().expect("tempdir");
@@ -362,6 +412,316 @@ fn delivery_status_normalized_envelope_uses_deterministic_nulls_when_runtime_dat
     assert!(status["normalized"]["timestamps"]["updated_at"].is_number());
     assert_eq!(status["normalized"]["logs"]["tail"], 9);
     assert_eq!(status["normalized"]["logs"]["truncated"], false);
+}
+
+#[test]
+fn delivery_events_emit_ordered_lifecycle_updates() {
+    let tmp = tempdir().expect("tempdir");
+    let task_id = unique_task_id("task-events-ordered");
+    let (subscriber_id, _) = subscribe_events(&task_id);
+
+    let _submit = handle_tool_call(
+        "delivery_submit",
+        json!({
+            "task_id": task_id,
+            "worker_id": "worker-a",
+            "runner_mode": "process",
+            "command": "bash",
+            "args": ["-lc", "sleep 0.15"],
+            "workdir": tmp.path().display().to_string()
+        }),
+    )
+    .expect("delivery_submit should succeed");
+
+    let mut collected = Vec::new();
+    for _ in 0..80 {
+        let _ = handle_tool_call(
+            "delivery_status",
+            json!({
+                "task_id": task_id
+            }),
+        )
+        .expect("delivery_status should succeed");
+
+        let next = next_events(&subscriber_id, &task_id, 16);
+        let events = next["events"].as_array().expect("events should be array");
+        if !events.is_empty() {
+            collected.extend(events.iter().cloned());
+            let last_cursor = next["next_cursor"]
+                .as_u64()
+                .expect("next_cursor should be u64");
+            ack_events(&subscriber_id, last_cursor);
+        }
+
+        if collected
+            .iter()
+            .any(|event| event["event_type"] == "completed")
+        {
+            break;
+        }
+
+        thread::sleep(Duration::from_millis(25));
+    }
+
+    assert!(
+        collected
+            .iter()
+            .any(|event| event["event_type"] == "submitted"),
+        "expected submitted event, got: {collected:?}"
+    );
+    assert!(
+        collected
+            .iter()
+            .any(|event| event["event_type"] == "running"),
+        "expected running event, got: {collected:?}"
+    );
+    assert!(
+        collected
+            .iter()
+            .any(|event| event["event_type"] == "completed"),
+        "expected completed event, got: {collected:?}"
+    );
+
+    let submitted_idx = collected
+        .iter()
+        .position(|event| event["event_type"] == "submitted")
+        .expect("submitted event should exist");
+    let running_idx = collected
+        .iter()
+        .position(|event| event["event_type"] == "running")
+        .expect("running event should exist");
+    let completed_idx = collected
+        .iter()
+        .position(|event| event["event_type"] == "completed")
+        .expect("completed event should exist");
+
+    assert!(submitted_idx < running_idx);
+    assert!(running_idx < completed_idx);
+
+    let cursors = collected
+        .iter()
+        .map(|event| {
+            event["cursor"]
+                .as_u64()
+                .expect("event cursor should be u64 integer")
+        })
+        .collect::<Vec<_>>();
+    let mut sorted = cursors.clone();
+    sorted.sort_unstable();
+    sorted.dedup();
+    assert_eq!(
+        cursors, sorted,
+        "events should be delivered in cursor order"
+    );
+}
+
+#[test]
+fn delivery_events_reconnect_with_cursor_replays_without_loss() {
+    let tmp = tempdir().expect("tempdir");
+    let task_id = unique_task_id("task-events-reconnect");
+    let subscriber_id = unique_subscriber_id("delivery-sub-reconnect");
+
+    let first_subscribe = handle_tool_call(
+        "delivery_events_subscribe",
+        json!({
+            "subscriber_id": subscriber_id,
+            "task_id": task_id
+        }),
+    )
+    .expect("initial subscribe should succeed");
+    let initial_cursor = first_subscribe["cursor"]
+        .as_u64()
+        .expect("initial cursor should be u64");
+
+    let _submit = handle_tool_call(
+        "delivery_submit",
+        json!({
+            "task_id": task_id,
+            "worker_id": "worker-a",
+            "runner_mode": "process",
+            "command": "bash",
+            "args": ["-lc", "sleep 0.25"],
+            "workdir": tmp.path().display().to_string()
+        }),
+    )
+    .expect("delivery_submit should succeed");
+
+    let _ = handle_tool_call(
+        "delivery_status",
+        json!({
+            "task_id": task_id
+        }),
+    )
+    .expect("delivery_status should succeed");
+
+    let first_batch = handle_tool_call(
+        "delivery_events_next",
+        json!({
+            "subscriber_id": subscriber_id,
+            "task_id": task_id,
+            "limit": 2
+        }),
+    )
+    .expect("first delivery_events_next should succeed");
+    let first_events = first_batch["events"]
+        .as_array()
+        .expect("events should be array")
+        .clone();
+    assert!(!first_events.is_empty(), "expected first batch of events");
+    let first_batch_cursor = first_batch["next_cursor"]
+        .as_u64()
+        .expect("next_cursor should be u64");
+    ack_events(&subscriber_id, first_batch_cursor);
+
+    let _reconnected = handle_tool_call(
+        "delivery_events_subscribe",
+        json!({
+            "subscriber_id": subscriber_id,
+            "task_id": task_id,
+            "cursor": first_batch_cursor
+        }),
+    )
+    .expect("reconnect subscribe should succeed");
+
+    let mut resumed_events = Vec::new();
+    for _ in 0..80 {
+        let _ = handle_tool_call(
+            "delivery_status",
+            json!({
+                "task_id": task_id
+            }),
+        )
+        .expect("delivery_status should succeed");
+
+        let next = handle_tool_call(
+            "delivery_events_next",
+            json!({
+                "subscriber_id": subscriber_id,
+                "task_id": task_id,
+                "limit": 16
+            }),
+        )
+        .expect("delivery_events_next after reconnect should succeed");
+        let events = next["events"].as_array().expect("events should be array");
+        if !events.is_empty() {
+            resumed_events.extend(events.iter().cloned());
+            let last_cursor = next["next_cursor"]
+                .as_u64()
+                .expect("next_cursor should be u64");
+            ack_events(&subscriber_id, last_cursor);
+        }
+        if resumed_events
+            .iter()
+            .any(|event| event["event_type"] == "completed")
+        {
+            break;
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+
+    let replay_subscriber = unique_subscriber_id("delivery-sub-replay");
+    let _ = handle_tool_call(
+        "delivery_events_subscribe",
+        json!({
+            "subscriber_id": replay_subscriber,
+            "task_id": task_id,
+            "cursor": initial_cursor
+        }),
+    )
+    .expect("replay subscribe should succeed");
+    let replay_all = handle_tool_call(
+        "delivery_events_next",
+        json!({
+            "subscriber_id": replay_subscriber,
+            "task_id": task_id,
+            "limit": 128
+        }),
+    )
+    .expect("replay fetch should succeed");
+    let expected_all = replay_all["events"]
+        .as_array()
+        .expect("events should be array")
+        .iter()
+        .map(|event| {
+            event["cursor"]
+                .as_u64()
+                .expect("event cursor should be u64 integer")
+        })
+        .collect::<Vec<_>>();
+
+    let mut resumed_cursors = first_events
+        .iter()
+        .chain(resumed_events.iter())
+        .map(|event| {
+            event["cursor"]
+                .as_u64()
+                .expect("event cursor should be u64 integer")
+        })
+        .collect::<Vec<_>>();
+    resumed_cursors.sort_unstable();
+    resumed_cursors.dedup();
+
+    assert_eq!(
+        resumed_cursors, expected_all,
+        "reconnect replay should reconstruct the same event stream"
+    );
+}
+
+#[test]
+fn delivery_events_status_changed_is_deduplicated_for_same_state() {
+    let tmp = tempdir().expect("tempdir");
+    let task_id = unique_task_id("task-events-dedupe");
+    let (subscriber_id, _) = subscribe_events(&task_id);
+
+    let _submit = handle_tool_call(
+        "delivery_submit",
+        json!({
+            "task_id": task_id,
+            "worker_id": "worker-a",
+            "runner_mode": "process",
+            "command": "bash",
+            "args": ["-lc", "sleep 0.35"],
+            "workdir": tmp.path().display().to_string()
+        }),
+    )
+    .expect("delivery_submit should succeed");
+
+    for _ in 0..6 {
+        let _ = handle_tool_call(
+            "delivery_status",
+            json!({
+                "task_id": task_id
+            }),
+        )
+        .expect("delivery_status should succeed");
+        thread::sleep(Duration::from_millis(20));
+    }
+
+    let events_page = next_events(&subscriber_id, &task_id, 64);
+    let events = events_page["events"]
+        .as_array()
+        .expect("events should be array");
+    if let Some(last_cursor) = events_page["next_cursor"].as_u64()
+        && !events.is_empty()
+    {
+        ack_events(&subscriber_id, last_cursor);
+    }
+
+    let running_status_changed = events
+        .iter()
+        .filter(|event| {
+            event["event_type"] == "status_changed"
+                && event["state"] == "running"
+                && event["runtime_state"] == "running"
+        })
+        .count();
+
+    assert_eq!(
+        running_status_changed, 1,
+        "expected exactly one running status_changed event, got events: {events:?}"
+    );
+
+    let _ = wait_for_runtime_state(&task_id, "ready_to_merge");
 }
 
 #[test]

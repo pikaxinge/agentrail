@@ -11,7 +11,10 @@ use std::collections::HashMap;
 use std::fs;
 use std::future::Future;
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{
+    Mutex, OnceLock,
+    atomic::{AtomicU64, Ordering},
+};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter};
 use tracing::{info, warn};
@@ -49,13 +52,65 @@ struct RuntimeTaskSession {
     runner_mode: RuntimeRunnerMode,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DeliveryEvent {
+    cursor: u64,
+    task_id: String,
+    event_type: String,
+    timestamp: u64,
+    state: String,
+    runtime_state: String,
+    session_id: Option<String>,
+}
+
+impl DeliveryEvent {
+    fn as_json(&self) -> Value {
+        json!({
+            "cursor": self.cursor,
+            "task_id": self.task_id,
+            "event_type": self.event_type,
+            "timestamp": self.timestamp,
+            "state": self.state,
+            "runtime_state": self.runtime_state,
+            "session_id": self.session_id
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DeliveryEventSignature {
+    event_type: String,
+    state: String,
+    runtime_state: String,
+    session_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DeliveryStatusObservation {
+    state: String,
+    runtime_state: String,
+    session_id: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct DeliverySubscription {
+    cursor: u64,
+    task_id: Option<String>,
+}
+
 #[derive(Debug)]
 struct RuntimeState {
     store: TaskStore,
     sessions: HashMap<String, RuntimeTaskSession>,
+    delivery_events: Vec<DeliveryEvent>,
+    next_delivery_cursor: u64,
+    delivery_subscriptions: HashMap<String, DeliverySubscription>,
+    last_event_signature_by_task: HashMap<String, DeliveryEventSignature>,
+    last_status_observation_by_task: HashMap<String, DeliveryStatusObservation>,
 }
 
 static RUNTIME_STATE: OnceLock<Mutex<RuntimeState>> = OnceLock::new();
+static DELIVERY_SUBSCRIBER_SEQ: AtomicU64 = AtomicU64::new(1);
 
 fn runtime_state() -> &'static Mutex<RuntimeState> {
     RUNTIME_STATE.get_or_init(|| {
@@ -66,6 +121,11 @@ fn runtime_state() -> &'static Mutex<RuntimeState> {
         Mutex::new(RuntimeState {
             store: TaskStore::connect(dsn),
             sessions: HashMap::new(),
+            delivery_events: Vec::new(),
+            next_delivery_cursor: 1,
+            delivery_subscriptions: HashMap::new(),
+            last_event_signature_by_task: HashMap::new(),
+            last_status_observation_by_task: HashMap::new(),
         })
     })
 }
@@ -86,10 +146,148 @@ fn runtime_state_label(state: TaskRuntimeState) -> &'static str {
     }
 }
 
+fn delivery_timestamp_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
+fn next_subscriber_id() -> String {
+    let seq = DELIVERY_SUBSCRIBER_SEQ.fetch_add(1, Ordering::Relaxed);
+    format!("delivery-sub-{seq}")
+}
+
+fn runtime_state_mutex() -> Result<std::sync::MutexGuard<'static, RuntimeState>> {
+    runtime_state()
+        .lock()
+        .map_err(|_| anyhow::anyhow!("runtime state lock poisoned"))
+}
+
+fn reset_delivery_tracking(runtime: &mut RuntimeState, task_id: &str) {
+    runtime.last_event_signature_by_task.remove(task_id);
+    runtime.last_status_observation_by_task.remove(task_id);
+}
+
+fn emit_delivery_event(
+    runtime: &mut RuntimeState,
+    task_id: &str,
+    event_type: &str,
+    state: &str,
+    runtime_state: &str,
+    session_id: Option<String>,
+) {
+    let signature = DeliveryEventSignature {
+        event_type: event_type.to_string(),
+        state: state.to_string(),
+        runtime_state: runtime_state.to_string(),
+        session_id: session_id.clone(),
+    };
+    if runtime
+        .last_event_signature_by_task
+        .get(task_id)
+        .is_some_and(|existing| *existing == signature)
+    {
+        return;
+    }
+
+    let cursor = runtime.next_delivery_cursor;
+    runtime.next_delivery_cursor = runtime.next_delivery_cursor.saturating_add(1);
+    runtime.delivery_events.push(DeliveryEvent {
+        cursor,
+        task_id: task_id.to_string(),
+        event_type: event_type.to_string(),
+        timestamp: delivery_timestamp_ms(),
+        state: state.to_string(),
+        runtime_state: runtime_state.to_string(),
+        session_id,
+    });
+    runtime
+        .last_event_signature_by_task
+        .insert(task_id.to_string(), signature);
+}
+
+fn emit_delivery_status_events(
+    task_id: &str,
+    state: &str,
+    runtime_state: &str,
+    session_id: Option<String>,
+) -> Result<()> {
+    let mut runtime = runtime_state_mutex()?;
+    let observation = DeliveryStatusObservation {
+        state: state.to_string(),
+        runtime_state: runtime_state.to_string(),
+        session_id: session_id.clone(),
+    };
+    let changed = runtime
+        .last_status_observation_by_task
+        .get(task_id)
+        .is_none_or(|existing| *existing != observation);
+
+    if changed {
+        emit_delivery_event(
+            &mut runtime,
+            task_id,
+            "status_changed",
+            state,
+            runtime_state,
+            session_id.clone(),
+        );
+        runtime
+            .last_status_observation_by_task
+            .insert(task_id.to_string(), observation);
+    }
+
+    if matches!(state, "completed" | "failed" | "stopped") {
+        emit_delivery_event(
+            &mut runtime,
+            task_id,
+            state,
+            state,
+            runtime_state,
+            session_id,
+        );
+    }
+
+    Ok(())
+}
+
 fn optional_string(args: &Value, field: &str) -> Option<String> {
     args.get(field)
         .and_then(Value::as_str)
         .map(ToString::to_string)
+}
+
+fn parse_optional_u64(args: &Value, field: &str) -> Result<Option<u64>> {
+    let Some(value) = args.get(field) else {
+        return Ok(None);
+    };
+
+    if let Some(raw) = value.as_u64() {
+        return Ok(Some(raw));
+    }
+    if let Some(raw) = value.as_str() {
+        let parsed = raw
+            .parse::<u64>()
+            .map_err(|_| anyhow::anyhow!("invalid {field}: must be unsigned integer"))?;
+        return Ok(Some(parsed));
+    }
+
+    anyhow::bail!("invalid {field}: must be unsigned integer")
+}
+
+fn require_u64_field(tool_name: &str, args: &Value, field: &str) -> Result<u64> {
+    parse_optional_u64(args, field)?
+        .ok_or_else(|| anyhow::anyhow!("missing {field}"))
+        .inspect(|_| {
+            info!(
+                operation = "mcp_tool_call",
+                tool = tool_name,
+                field = field,
+                outcome = "validated",
+                "validated MCP tool call arguments"
+            );
+        })
 }
 
 fn optional_u32(args: &Value, field: &str, default: u32) -> Result<u32> {
@@ -242,17 +440,13 @@ fn runtime_state_is_terminal(state: TaskRuntimeState) -> bool {
 }
 
 fn clear_runtime_session(task_id: &str) -> Result<()> {
-    let mut runtime = runtime_state()
-        .lock()
-        .map_err(|_| anyhow::anyhow!("runtime state lock poisoned"))?;
+    let mut runtime = runtime_state_mutex()?;
     runtime.sessions.remove(task_id);
     Ok(())
 }
 
 fn ensure_task_preparing(task_id: &str, worker_id: &str, retry_budget: u32) -> Result<()> {
-    let runtime = runtime_state()
-        .lock()
-        .map_err(|_| anyhow::anyhow!("runtime state lock poisoned"))?;
+    let mut runtime = runtime_state_mutex()?;
 
     match runtime.store.get_task(task_id)? {
         None => {
@@ -299,6 +493,7 @@ fn ensure_task_preparing(task_id: &str, worker_id: &str, retry_budget: u32) -> R
     runtime
         .store
         .transition(task_id, TaskRuntimeState::Preparing)?;
+    reset_delivery_tracking(&mut runtime, task_id);
     Ok(())
 }
 
@@ -396,9 +591,7 @@ async fn orchestrate_start_runtime(args: Value) -> Result<Value> {
 
 async fn task_runtime_status(task_id: &str, tail: usize) -> Result<Value> {
     let (session, record) = {
-        let runtime = runtime_state()
-            .lock()
-            .map_err(|_| anyhow::anyhow!("runtime state lock poisoned"))?;
+        let runtime = runtime_state_mutex()?;
         (
             runtime.sessions.get(task_id).cloned(),
             runtime.store.get_task(task_id)?,
@@ -451,9 +644,7 @@ async fn task_runtime_status(task_id: &str, tail: usize) -> Result<Value> {
         }
     };
     if let Some(target) = map_runner_to_runtime_state(&status.state) {
-        let runtime = runtime_state()
-            .lock()
-            .map_err(|_| anyhow::anyhow!("runtime state lock poisoned"))?;
+        let runtime = runtime_state_mutex()?;
         if let Some(current) = runtime.store.get_task(task_id)?
             && current.state != target
             && current.state != TaskRuntimeState::Merged
@@ -464,9 +655,7 @@ async fn task_runtime_status(task_id: &str, tail: usize) -> Result<Value> {
     }
 
     let latest = {
-        let runtime = runtime_state()
-            .lock()
-            .map_err(|_| anyhow::anyhow!("runtime state lock poisoned"))?;
+        let runtime = runtime_state_mutex()?;
         runtime
             .store
             .get_task(task_id)?
@@ -480,6 +669,13 @@ async fn task_runtime_status(task_id: &str, tail: usize) -> Result<Value> {
             return Err(error);
         }
     };
+    let runtime_state = runtime_state_label(latest.state).to_string();
+    emit_delivery_status_events(
+        task_id,
+        &status.state,
+        &runtime_state,
+        Some(session.session_id.clone()),
+    )?;
 
     if runner_state_is_terminal(&status.state) || runtime_state_is_terminal(latest.state) {
         let _ = clear_runtime_session(task_id);
@@ -489,7 +685,7 @@ async fn task_runtime_status(task_id: &str, tail: usize) -> Result<Value> {
         "tool": "orchestrate_status",
         "task_id": task_id,
         "state": status.state,
-        "runtime_state": runtime_state_label(latest.state),
+        "runtime_state": runtime_state,
         "session_id": session.session_id,
         "runner_mode": session.runner_mode.as_str(),
         "assigned_worker": latest.assigned_worker,
@@ -540,9 +736,7 @@ async fn orchestrate_steer_runtime(args: Value) -> Result<Value> {
 }
 
 fn runtime_report() -> Result<Value> {
-    let runtime = runtime_state()
-        .lock()
-        .map_err(|_| anyhow::anyhow!("runtime state lock poisoned"))?;
+    let runtime = runtime_state_mutex()?;
     let snapshot = runtime.store.export_snapshot()?;
 
     let mut summary = json!({
@@ -590,11 +784,109 @@ fn runtime_report() -> Result<Value> {
     }))
 }
 
+fn task_matches_filter(event_task_id: &str, filter: Option<&str>) -> bool {
+    match filter {
+        Some(task_id) => event_task_id == task_id,
+        None => true,
+    }
+}
+
+fn delivery_events_subscribe(args: Value) -> Result<Value> {
+    let subscriber_id = optional_string(&args, "subscriber_id").unwrap_or_else(next_subscriber_id);
+    let requested_cursor = parse_optional_u64(&args, "cursor")?;
+    let requested_task_id = optional_string(&args, "task_id");
+
+    let mut runtime = runtime_state_mutex()?;
+    let latest_cursor = runtime.next_delivery_cursor.saturating_sub(1);
+    let subscription = runtime
+        .delivery_subscriptions
+        .entry(subscriber_id.clone())
+        .or_insert_with(|| DeliverySubscription {
+            cursor: latest_cursor,
+            task_id: requested_task_id.clone(),
+        });
+
+    if let Some(cursor) = requested_cursor {
+        subscription.cursor = cursor;
+    }
+    if requested_task_id.is_some() {
+        subscription.task_id = requested_task_id.clone();
+    }
+
+    Ok(json!({
+        "tool": "delivery_events_subscribe",
+        "subscriber_id": subscriber_id,
+        "cursor": subscription.cursor,
+        "task_id": subscription.task_id,
+        "semantics": "at_least_once_with_ack"
+    }))
+}
+
+fn delivery_events_next(args: Value) -> Result<Value> {
+    let subscriber_id = require_string_field("delivery_events_next", &args, "subscriber_id")?;
+    let requested_cursor = parse_optional_u64(&args, "cursor")?;
+    let requested_task_id = optional_string(&args, "task_id");
+    let limit = optional_u32(&args, "limit", 50)? as usize;
+    let limit = limit.clamp(1, 500);
+
+    let runtime = runtime_state_mutex()?;
+    let subscription = runtime
+        .delivery_subscriptions
+        .get(subscriber_id)
+        .ok_or_else(|| anyhow::anyhow!("unknown subscriber_id: {subscriber_id}"))?;
+    let start_cursor = requested_cursor.unwrap_or(subscription.cursor);
+    let filter_task = requested_task_id
+        .as_deref()
+        .or(subscription.task_id.as_deref());
+
+    let mut next_cursor = start_cursor;
+    let mut events = Vec::new();
+    for event in &runtime.delivery_events {
+        if event.cursor <= start_cursor || !task_matches_filter(&event.task_id, filter_task) {
+            continue;
+        }
+        next_cursor = event.cursor;
+        events.push(event.as_json());
+        if events.len() >= limit {
+            break;
+        }
+    }
+    let has_more = runtime.delivery_events.iter().any(|event| {
+        event.cursor > next_cursor
+            && task_matches_filter(&event.task_id, filter_task)
+            && event.cursor > start_cursor
+    });
+
+    Ok(json!({
+        "tool": "delivery_events_next",
+        "subscriber_id": subscriber_id,
+        "cursor": start_cursor,
+        "next_cursor": next_cursor,
+        "has_more": has_more,
+        "events": events
+    }))
+}
+
+fn delivery_events_ack(args: Value) -> Result<Value> {
+    let subscriber_id = require_string_field("delivery_events_ack", &args, "subscriber_id")?;
+    let requested_cursor = require_u64_field("delivery_events_ack", &args, "cursor")?;
+    let mut runtime = runtime_state_mutex()?;
+    let subscription = runtime
+        .delivery_subscriptions
+        .get_mut(subscriber_id)
+        .ok_or_else(|| anyhow::anyhow!("unknown subscriber_id: {subscriber_id}"))?;
+    subscription.cursor = subscription.cursor.max(requested_cursor);
+
+    Ok(json!({
+        "tool": "delivery_events_ack",
+        "subscriber_id": subscriber_id,
+        "acked_cursor": subscription.cursor
+    }))
+}
+
 async fn poll_runtime_once() -> Result<()> {
     let task_ids = {
-        let runtime = runtime_state()
-            .lock()
-            .map_err(|_| anyhow::anyhow!("runtime state lock poisoned"))?;
+        let runtime = runtime_state_mutex()?;
         runtime.sessions.keys().cloned().collect::<Vec<_>>()
     };
 
@@ -1072,6 +1364,44 @@ fn mcp_tools_descriptor() -> Value {
             }
         },
         {
+            "name":"delivery_events_subscribe",
+            "description":"Subscribe to lifecycle events for delivery tasks",
+            "inputSchema": {
+                "type":"object",
+                "properties": {
+                    "subscriber_id": {"type":"string"},
+                    "cursor": {"type":"integer"},
+                    "task_id": {"type":"string"}
+                }
+            }
+        },
+        {
+            "name":"delivery_events_next",
+            "description":"Read the next page of lifecycle events after a cursor",
+            "inputSchema": {
+                "type":"object",
+                "properties": {
+                    "subscriber_id": {"type":"string"},
+                    "cursor": {"type":"integer"},
+                    "task_id": {"type":"string"},
+                    "limit": {"type":"integer"}
+                },
+                "required": ["subscriber_id"]
+            }
+        },
+        {
+            "name":"delivery_events_ack",
+            "description":"Acknowledge events up to a cursor for at-least-once delivery",
+            "inputSchema": {
+                "type":"object",
+                "properties": {
+                    "subscriber_id": {"type":"string"},
+                    "cursor": {"type":"integer"}
+                },
+                "required": ["subscriber_id", "cursor"]
+            }
+        },
+        {
             "name":"delivery_report",
             "description":"Return aggregated runtime report for all tracked tasks",
             "inputSchema": {
@@ -1175,6 +1505,33 @@ pub fn handle_tool_call_with_allowed_root(
         "orchestrate_steer" => block_on_result(orchestrate_steer_runtime(args)),
         "delivery_submit" => {
             let orchestration = block_on_result(orchestrate_start_runtime(args))?;
+            if let Some(task_id) = orchestration.get("task_id").and_then(Value::as_str) {
+                let runtime_state = orchestration
+                    .get("runtime_state")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown");
+                let session_id = orchestration
+                    .get("session_id")
+                    .and_then(Value::as_str)
+                    .map(ToString::to_string);
+                let mut runtime = runtime_state_mutex()?;
+                emit_delivery_event(
+                    &mut runtime,
+                    task_id,
+                    "submitted",
+                    "submitted",
+                    runtime_state,
+                    session_id.clone(),
+                );
+                emit_delivery_event(
+                    &mut runtime,
+                    task_id,
+                    "running",
+                    "running",
+                    runtime_state,
+                    session_id,
+                );
+            }
             Ok(json!({
                 "tool": "delivery_submit",
                 "task_id": orchestration["task_id"],
@@ -1203,6 +1560,9 @@ pub fn handle_tool_call_with_allowed_root(
                 "orchestration": orchestration
             }))
         }
+        "delivery_events_subscribe" => delivery_events_subscribe(args),
+        "delivery_events_next" => delivery_events_next(args),
+        "delivery_events_ack" => delivery_events_ack(args),
         "delivery_report" => runtime_report(),
         "plan_status" => {
             let plan_path = require_plan_path(tool_name, &args, allowed_root)?;
