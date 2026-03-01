@@ -1,8 +1,8 @@
 use std::{fs, path::PathBuf};
 
 use agentrail_core::{Phase, PhaseStatus, Plan, Step, StepStatus};
-use serde_json::json;
 use serde_json::Value;
+use serde_json::json;
 
 fn fixture_path(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))

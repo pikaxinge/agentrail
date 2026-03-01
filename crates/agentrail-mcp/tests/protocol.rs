@@ -1,4 +1,4 @@
-use agentrail_mcp::handle_mcp_request;
+use agentrail_mcp::{handle_http_mcp_request, handle_mcp_request};
 use serde_json::json;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -70,6 +70,13 @@ fn tools_list_contains_plan_tools() {
     assert!(tools.iter().any(|t| t["name"] == "plan_next"));
     assert!(tools.iter().any(|t| t["name"] == "plan_claim"));
     assert!(tools.iter().any(|t| t["name"] == "plan_complete"));
+    assert!(tools.iter().any(|t| t["name"] == "orchestrate_start"));
+    assert!(tools.iter().any(|t| t["name"] == "orchestrate_status"));
+    assert!(tools.iter().any(|t| t["name"] == "orchestrate_steer"));
+    assert!(tools.iter().any(|t| t["name"] == "delivery_submit"));
+    assert!(tools.iter().any(|t| t["name"] == "delivery_status"));
+    assert!(tools.iter().any(|t| t["name"] == "delivery_steer"));
+    assert!(tools.iter().any(|t| t["name"] == "delivery_report"));
 }
 
 #[test]
@@ -94,9 +101,7 @@ fn tools_call_plan_status_returns_payload_in_text_content() {
         .as_array()
         .expect("content should be array");
     assert!(!content.is_empty());
-    let text = content[0]["text"]
-        .as_str()
-        .expect("text content expected");
+    let text = content[0]["text"].as_str().expect("text content expected");
     let tool_result: serde_json::Value =
         serde_json::from_str(text).expect("text content should be valid json");
     assert_eq!(tool_result["operation"], "status");
@@ -113,6 +118,34 @@ fn initialized_notification_returns_no_response() {
 
     let res = handle_mcp_request(req).expect("notification should succeed");
     assert!(res.is_none());
+}
+
+#[test]
+fn http_notification_maps_to_204_without_body() {
+    let req = json!({
+        "jsonrpc":"2.0",
+        "method":"notifications/initialized",
+        "params":{}
+    });
+
+    let (status, body) = handle_http_mcp_request(req);
+    assert_eq!(status, 204);
+    assert!(body.is_none());
+}
+
+#[test]
+fn http_error_response_preserves_request_id_when_available() {
+    let req = json!({
+        "jsonrpc":"2.0",
+        "id":"req-7"
+    });
+
+    let (status, body) = handle_http_mcp_request(req);
+    assert_eq!(status, 200);
+
+    let body = body.expect("error response body expected");
+    assert_eq!(body["id"], "req-7");
+    assert_eq!(body["error"]["code"], -32000);
 }
 
 #[test]
