@@ -34,6 +34,67 @@ For full session orchestration (DAG decomposition, parallel workers, review loop
 - `docs/operations/SESSION_ORCHESTRATION_WORKFLOW.md`
 - `docs/operations/BOOTSTRAP_LOOP.md`
 
+## TMUX Round Protocol (Required for Self-Bootstrap)
+Use this protocol when an orchestrator controls codex/agents through tmux sessions.
+
+### Control model
+- `agentrail` MCP tools are the default control plane.
+- `tmux` is runtime transport for long tasks and steering, not a replacement for `agentrail`.
+- Any non-MCP action (`shell` hotfix/manual git surgery/direct code patching) is a break-glass event and must be logged as friction.
+
+### One round = one closed loop
+Each tmux session should run one full round and then exit.
+
+1. Input + Scope:
+- load task goal, acceptance criteria, and constraints.
+
+2. Plan:
+- decompose into DAG (parallel nodes + dependencies).
+
+3. Execute:
+- dispatch workers, run review loops, converge to passing implementation.
+
+4. Validate:
+- run CI-equivalent checks (`fmt`, `check`, `test`, locked mode when relevant).
+
+5. Integrate:
+- open PR, satisfy review/CI gates, merge.
+
+6. Reflect:
+- write retrospective for this round (what blocked smooth execution).
+
+7. Friction logging:
+- open at least one friction issue when there was any non-smooth step.
+
+8. Handoff:
+- write next-round handoff state (remaining tasks, new issues, expected MCP version).
+
+9. Exit session:
+- end this tmux round after close gate passes.
+
+### Hard gates
+Round close gate (must pass before tmux session exit):
+- PR state is `MERGED`.
+- Retrospective file exists and is non-empty.
+- Friction issue(s) created when friction occurred.
+- Next-round handoff file exists.
+
+Round open gate (must pass before next tmux round starts):
+- target binary build succeeded.
+- MCP version/probe matches expected revision.
+- required MCP tool surface is available:
+  - `plan_*`
+  - `orchestrate_*`
+  - `delivery_*`
+
+### Smoothness targets
+- `non_mcp_actions = 0` (target).
+- high CI first-pass rate.
+- low review rework loops.
+- no unresolved P0/P1 friction issues.
+
+The loop is not complete at merge. It is complete only after: merge -> retrospective -> friction issue creation -> handoff.
+
 ## Required verification before commit
 Run all of the following from repository root:
 - `cargo fmt --all`
