@@ -1,10 +1,12 @@
 use std::{
     collections::HashSet,
+    fs,
+    path::Path,
     sync::Mutex,
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use anyhow::{Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 
@@ -173,7 +175,10 @@ impl TaskStore {
 
     fn open_connection(dsn: &str) -> Result<Connection> {
         let (connection, file_backed) = match dsn.strip_prefix("sqlite://") {
-            Some(path) => (Connection::open(path)?, true),
+            Some(path) => {
+                Self::ensure_sqlite_parent_dir(path)?;
+                (Connection::open(path)?, true)
+            }
             None if dsn.starts_with("memory://") => (Connection::open_in_memory()?, false),
             None => bail!("unsupported task store dsn: {dsn}"),
         };
@@ -217,6 +222,17 @@ impl TaskStore {
         )?;
 
         Ok(connection)
+    }
+
+    fn ensure_sqlite_parent_dir(path: &str) -> Result<()> {
+        let db_path = Path::new(path);
+        if let Some(parent) = db_path.parent() {
+            if !parent.as_os_str().is_empty() {
+                fs::create_dir_all(parent)
+                    .with_context(|| format!("create sqlite parent dir: {}", parent.display()))?;
+            }
+        }
+        Ok(())
     }
 
     fn table_has_column(connection: &Connection, column_name: &str) -> Result<bool> {

@@ -142,14 +142,115 @@ struct RuntimeCleanupTarget {
 static RUNTIME_STATE: OnceLock<Mutex<RuntimeState>> = OnceLock::new();
 static DELIVERY_SUBSCRIBER_SEQ: AtomicU64 = AtomicU64::new(1);
 
+const DEFAULT_RUNTIME_STORE_DSN: &str = "sqlite://.agentrail/runtime.db";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RuntimeStoreSource {
+    Default,
+    EnvOverride,
+}
+
+impl RuntimeStoreSource {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Default => "default",
+            Self::EnvOverride => "env_override",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RuntimeStoreMode {
+    SqliteFileBacked,
+    Memory,
+    Unsupported,
+}
+
+impl RuntimeStoreMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::SqliteFileBacked => "sqlite_file_backed",
+            Self::Memory => "memory",
+            Self::Unsupported => "unsupported",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RuntimeStoreConfig {
+    dsn: String,
+    source: RuntimeStoreSource,
+    mode: RuntimeStoreMode,
+}
+
+fn runtime_store_mode(dsn: &str) -> RuntimeStoreMode {
+    if dsn.starts_with("sqlite://") {
+        RuntimeStoreMode::SqliteFileBacked
+    } else if dsn.starts_with("memory://") {
+        RuntimeStoreMode::Memory
+    } else {
+        RuntimeStoreMode::Unsupported
+    }
+}
+
+#[cfg(test)]
+fn resolve_runtime_store_config_with_default_path(
+    env_dsn: Option<String>,
+    default_sqlite_path: &Path,
+) -> RuntimeStoreConfig {
+    if let Some(override_dsn) = env_dsn
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        return RuntimeStoreConfig {
+            dsn: override_dsn.to_string(),
+            source: RuntimeStoreSource::EnvOverride,
+            mode: runtime_store_mode(override_dsn),
+        };
+    }
+
+    let default_path = default_sqlite_path.display().to_string();
+    let dsn = format!("sqlite://{default_path}");
+    RuntimeStoreConfig {
+        dsn,
+        source: RuntimeStoreSource::Default,
+        mode: RuntimeStoreMode::SqliteFileBacked,
+    }
+}
+
+fn resolve_runtime_store_config(env_dsn: Option<String>) -> RuntimeStoreConfig {
+    if let Some(override_dsn) = env_dsn
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        return RuntimeStoreConfig {
+            dsn: override_dsn.to_string(),
+            source: RuntimeStoreSource::EnvOverride,
+            mode: runtime_store_mode(override_dsn),
+        };
+    }
+
+    RuntimeStoreConfig {
+        dsn: DEFAULT_RUNTIME_STORE_DSN.to_string(),
+        source: RuntimeStoreSource::Default,
+        mode: RuntimeStoreMode::SqliteFileBacked,
+    }
+}
+
 fn runtime_state() -> &'static Mutex<RuntimeState> {
     RUNTIME_STATE.get_or_init(|| {
-        let dsn = std::env::var("AGENTRAIL_RUNTIME_DSN")
-            .ok()
-            .filter(|v| !v.trim().is_empty())
-            .unwrap_or_else(|| "memory://agentrail-runtime".to_string());
+        let config = resolve_runtime_store_config(std::env::var("AGENTRAIL_RUNTIME_DSN").ok());
+        info!(
+            operation = "runtime_store_bootstrap",
+            runtime_store_dsn = %config.dsn,
+            runtime_store_source = config.source.as_str(),
+            runtime_store_mode = config.mode.as_str(),
+            "initialized runtime task store"
+        );
         Mutex::new(RuntimeState {
-            store: TaskStore::connect(dsn),
+            store: TaskStore::connect(config.dsn),
             sessions: HashMap::new(),
             delivery_events: Vec::new(),
             next_delivery_cursor: 1,
@@ -2466,6 +2567,7 @@ mod tests {
     };
 
     use super::*;
+    use tempfile::tempdir;
     use tracing_subscriber::fmt::MakeWriter;
 
     #[derive(Clone, Default)]
@@ -2527,6 +2629,51 @@ mod tests {
             .expect("resolve command");
         assert_eq!(command, "/usr/bin/whoami");
         assert!(args.is_empty());
+    }
+
+    #[test]
+    fn runtime_store_config_defaults_to_sqlite_file_backed_dsn() {
+        let config = resolve_runtime_store_config(None);
+        assert_eq!(config.dsn, DEFAULT_RUNTIME_STORE_DSN);
+        assert_eq!(config.source, RuntimeStoreSource::Default);
+        assert_eq!(config.mode, RuntimeStoreMode::SqliteFileBacked);
+    }
+
+    #[test]
+    fn runtime_store_config_honors_env_override() {
+        let config = resolve_runtime_store_config(Some("memory://custom-runtime".to_string()));
+        assert_eq!(config.dsn, "memory://custom-runtime");
+        assert_eq!(config.source, RuntimeStoreSource::EnvOverride);
+        assert_eq!(config.mode, RuntimeStoreMode::Memory);
+    }
+
+    #[test]
+    fn default_runtime_store_path_bootstraps_and_persists_rows_across_restarts() {
+        let tmp = tempdir().expect("tempdir");
+        let default_db_path = tmp.path().join(".agentrail").join("runtime.db");
+        let config = resolve_runtime_store_config_with_default_path(None, &default_db_path);
+
+        let store = TaskStore::connect(config.dsn.clone());
+        store
+            .upsert_task(&TaskRecord::new(
+                "task-default-runtime-store",
+                "worker-a",
+                1,
+            ))
+            .expect("insert should succeed");
+        drop(store);
+
+        assert!(
+            default_db_path.exists(),
+            "default runtime sqlite file should be created on first start"
+        );
+
+        let reopened = TaskStore::connect(config.dsn);
+        let task = reopened
+            .get_task("task-default-runtime-store")
+            .expect("read should succeed")
+            .expect("task should persist across restart");
+        assert_eq!(task.assigned_worker, "worker-a");
     }
 
     #[test]

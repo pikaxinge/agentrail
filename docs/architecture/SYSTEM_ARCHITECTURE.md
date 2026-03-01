@@ -38,6 +38,7 @@ Chat App -> Orchestrator -> agentrail MCP/CLI -> Core/Storage/Runner -> Worktree
 ## 3. Storage strategy
 - Plan state: file-based YAML with hash compare-and-swap.
 - Control/runtime state: transactional store (SQLite WAL target).
+- Runtime store DSN defaults to `sqlite://.agentrail/runtime.db` and can be overridden with `AGENTRAIL_RUNTIME_DSN`.
 
 ## 4. Concurrency model
 - Code changes isolated by worktree per task.
