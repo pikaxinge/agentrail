@@ -1205,10 +1205,11 @@ async fn delivery_cleanup_runtime(args: Value) -> Result<Value> {
         }
 
         let mut runtime = runtime_state_mutex()?;
-        let deleted_task_ids =
-            runtime
-                .store
-                .prune_tasks(scope_id.as_deref(), &states, Some(updated_before_epoch_ms))?;
+        let deleted_task_ids = runtime.store.prune_tasks(
+            scope_id.as_deref(),
+            &states,
+            Some(updated_before_epoch_ms),
+        )?;
         for task_id in &deleted_task_ids {
             runtime.sessions.remove(task_id);
             reset_delivery_tracking(&mut runtime, task_id);
@@ -2014,7 +2015,7 @@ fn mcp_tools_descriptor() -> Value {
                 }
             }
         },
-        
+
     ])
 }
 
