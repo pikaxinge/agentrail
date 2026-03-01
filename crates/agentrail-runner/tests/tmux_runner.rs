@@ -32,9 +32,22 @@ fn tmux_tests_enabled() -> bool {
         .unwrap_or(false)
 }
 
+fn nested_tmux_tests_enabled() -> bool {
+    std::env::var("AGENTRAIL_RUN_TMUX_TESTS_NESTED")
+        .map(|value| value == "1")
+        .unwrap_or(false)
+}
+
 fn skip_if_no_tmux() -> bool {
     if !tmux_tests_enabled() {
         eprintln!("skipping tmux test; set AGENTRAIL_RUN_TMUX_TESTS=1 to enable");
+        return true;
+    }
+
+    if std::env::var_os("TMUX").is_some() && !nested_tmux_tests_enabled() {
+        eprintln!(
+            "skipping tmux test inside existing tmux session; set AGENTRAIL_RUN_TMUX_TESTS_NESTED=1 to force"
+        );
         return true;
     }
 

@@ -209,6 +209,15 @@ fn shell_escape(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\"'\"'"))
 }
 
+fn shell_escape_double(value: &str) -> String {
+    let escaped = value
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('$', "\\$")
+        .replace('`', "\\`");
+    format!("\"{escaped}\"")
+}
+
 fn command_as_shell_line(command: &str, args: &[String]) -> String {
     let mut parts = Vec::with_capacity(args.len() + 1);
     parts.push(shell_escape(command));
@@ -219,9 +228,9 @@ fn command_as_shell_line(command: &str, args: &[String]) -> String {
 fn build_tmux_shell_command(spec: &TaskSpec, log_path: &Path, exit_code_path: &Path) -> String {
     let command_line = command_as_shell_line(&spec.command, &spec.args);
     let script = format!(
-        "set -o pipefail\ncd {}\n{} 2>&1 | tee -a {}\nexit_code=$?\nprintf '%s\\n' \"$exit_code\" > {}\nexit \"$exit_code\"\n",
+        "cd {}\nscript -q -e -f -c {} {}\nexit_code=$?\nprintf '%s\\n' \"$exit_code\" > {}\nexit \"$exit_code\"\n",
         shell_escape(&spec.workdir),
-        command_line,
+        shell_escape_double(&command_line),
         shell_escape(&log_path.to_string_lossy()),
         shell_escape(&exit_code_path.to_string_lossy())
     );
@@ -580,7 +589,9 @@ async fn terminate_process_group(child: &mut Child) -> Result<()> {
 
 #[cfg(all(test, unix))]
 mod unix_guard_tests {
-    use super::should_signal_process_group;
+    use std::path::Path;
+
+    use super::{TaskSpec, build_tmux_shell_command, should_signal_process_group};
 
     #[test]
     fn should_signal_process_group_rejects_reserved_groups() {
@@ -597,6 +608,31 @@ mod unix_guard_tests {
     fn should_signal_process_group_allows_distinct_group() {
         assert!(should_signal_process_group(1234, Some(5678)));
         assert!(should_signal_process_group(1234, None));
+    }
+
+    #[test]
+    fn build_tmux_shell_command_uses_script_pty_logging() {
+        let spec = TaskSpec {
+            id: "task-1".to_string(),
+            command: "bash".to_string(),
+            args: vec!["-lc".to_string(), "echo hello".to_string()],
+            workdir: "/tmp".to_string(),
+        };
+
+        let shell = build_tmux_shell_command(
+            &spec,
+            Path::new("/tmp/runner.log"),
+            Path::new("/tmp/runner.exit"),
+        );
+
+        assert!(
+            shell.contains("script -q -e -f -c"),
+            "expected script-based pty logging command, got: {shell}"
+        );
+        assert!(
+            !shell.contains("tee -a"),
+            "shell command must not use tee pipeline that breaks tty semantics: {shell}"
+        );
     }
 }
 
