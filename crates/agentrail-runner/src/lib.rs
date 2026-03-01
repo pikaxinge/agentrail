@@ -218,15 +218,6 @@ fn shell_escape(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\"'\"'"))
 }
 
-fn shell_escape_double(value: &str) -> String {
-    let escaped = value
-        .replace('\\', "\\\\")
-        .replace('"', "\\\"")
-        .replace('$', "\\$")
-        .replace('`', "\\`");
-    format!("\"{escaped}\"")
-}
-
 fn command_as_shell_line(command: &str, args: &[String]) -> String {
     let mut parts = Vec::with_capacity(args.len() + 1);
     parts.push(shell_escape(command));
@@ -234,13 +225,12 @@ fn command_as_shell_line(command: &str, args: &[String]) -> String {
     parts.join(" ")
 }
 
-fn build_tmux_shell_command(spec: &TaskSpec, log_path: &Path, exit_code_path: &Path) -> String {
+fn build_tmux_shell_command(spec: &TaskSpec, exit_code_path: &Path) -> String {
     let command_line = command_as_shell_line(&spec.command, &spec.args);
     let script = format!(
-        "cd {}\nscript -q -e -f -c {} {}\nexit_code=$?\nprintf '%s\\n' \"$exit_code\" > {}\nexit \"$exit_code\"\n",
+        "cd {}\n{}\nexit_code=$?\nprintf '%s\\n' \"$exit_code\" > {}\nexit \"$exit_code\"\n",
         shell_escape(&spec.workdir),
-        shell_escape_double(&command_line),
-        shell_escape(&log_path.to_string_lossy()),
+        command_line,
         shell_escape(&exit_code_path.to_string_lossy())
     );
     format!("bash -lc {}", shell_escape(&script))
@@ -620,7 +610,7 @@ mod unix_guard_tests {
     }
 
     #[test]
-    fn build_tmux_shell_command_uses_script_pty_logging() {
+    fn build_tmux_shell_command_runs_command_directly() {
         let spec = TaskSpec {
             id: "task-1".to_string(),
             command: "bash".to_string(),
@@ -628,19 +618,15 @@ mod unix_guard_tests {
             workdir: "/tmp".to_string(),
         };
 
-        let shell = build_tmux_shell_command(
-            &spec,
-            Path::new("/tmp/runner.log"),
-            Path::new("/tmp/runner.exit"),
-        );
+        let shell = build_tmux_shell_command(&spec, Path::new("/tmp/runner.exit"));
 
         assert!(
-            shell.contains("script -q -e -f -c"),
-            "expected script-based pty logging command, got: {shell}"
+            shell.contains("echo hello"),
+            "expected direct command payload, got: {shell}"
         );
         assert!(
-            !shell.contains("tee -a"),
-            "shell command must not use tee pipeline that breaks tty semantics: {shell}"
+            !shell.contains("script -q -e -f -c"),
+            "shell command must not use script wrapper: {shell}"
         );
     }
 }
@@ -926,12 +912,25 @@ impl AgentRunner for TmuxRunner {
         std::fs::create_dir_all(&log_dir)?;
         let log_path = log_dir.join(format!("{session_id}.log"));
         let exit_code_path = log_dir.join(format!("{session_id}.exit"));
-        let tmux_command = build_tmux_shell_command(&spec, &log_path, &exit_code_path);
+        let tmux_command = build_tmux_shell_command(&spec, &exit_code_path);
 
         let output = run_tmux(&["new-session", "-d", "-s", &tmux_session, &tmux_command])?;
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
             return Err(anyhow!("tmux new-session failed: {}", stderr.trim()));
+        }
+        let target = format!("{tmux_session}:0.0");
+        let pipe_output = run_tmux(&[
+            "pipe-pane",
+            "-o",
+            "-t",
+            &target,
+            &format!("cat >> {}", shell_escape(&log_path.to_string_lossy())),
+        ])?;
+        if !pipe_output.status.success() {
+            let stderr = String::from_utf8_lossy(&pipe_output.stderr);
+            let _ = run_tmux(&["kill-session", "-t", &tmux_session]);
+            return Err(anyhow!("tmux pipe-pane failed: {}", stderr.trim()));
         }
 
         let record = Arc::new(TmuxSessionRecord {
