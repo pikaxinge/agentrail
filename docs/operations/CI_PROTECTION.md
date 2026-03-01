@@ -6,9 +6,9 @@ This repository ships a required CI workflow at:
 
 The workflow publishes three checks on every pull request:
 
-- `CI / fmt`
-- `CI / check`
-- `CI / test`
+- `CI / fmt (pull_request)`
+- `CI / check (pull_request)`
+- `CI / test (pull_request)`
 
 ## Enable Branch Protection (GitHub UI)
 
@@ -19,9 +19,9 @@ The workflow publishes three checks on every pull request:
 - `Require status checks to pass before merging`
 - `Require branches to be up to date before merging`
 4. Select required checks:
-- `CI / fmt`
-- `CI / check`
-- `CI / test`
+- `CI / fmt (pull_request)`
+- `CI / check (pull_request)`
+- `CI / test (pull_request)`
 5. Optional hardening:
 - `Require conversation resolution before merging`
 - `Restrict who can push to matching branches`
