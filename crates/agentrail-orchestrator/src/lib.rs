@@ -1,5 +1,8 @@
 use std::collections::HashMap;
 
+use agentrail_runner::{AgentRunner, TaskSpec};
+use agentrail_store::{TaskRecord, TaskRuntimeState, TaskStore};
+use anyhow::{Context, anyhow};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -45,6 +48,23 @@ pub struct TaskGraph {
 pub struct ExecutionStateMap {
     #[serde(default)]
     pub states: HashMap<String, ExecutionState>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LaunchRequest {
+    pub task_id: String,
+    pub worker_id: String,
+    pub command: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+    pub workdir: String,
+    pub retry_budget: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LaunchResult {
+    pub task_id: String,
+    pub session_id: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -102,6 +122,98 @@ pub fn select_ready_nodes_from_graph(
     max_parallel: usize,
 ) -> Vec<String> {
     select_ready_nodes(&graph.nodes, &execution.states, max_parallel)
+}
+
+pub async fn launch_ready_tasks<R: AgentRunner + ?Sized>(
+    runner: &R,
+    store: &TaskStore,
+    graph: &TaskGraph,
+    execution: &ExecutionStateMap,
+    launch_requests: &HashMap<String, LaunchRequest>,
+    max_parallel: usize,
+) -> anyhow::Result<Vec<LaunchResult>> {
+    let ready = select_ready_nodes_from_graph(graph, execution, max_parallel);
+    let mut launched: Vec<LaunchResult> = Vec::with_capacity(ready.len());
+
+    for task_id in &ready {
+        if !launch_requests.contains_key(task_id) {
+            return Err(anyhow!("missing launch request for task {task_id}"));
+        }
+    }
+
+    for task_id in ready {
+        let launch = launch_requests
+            .get(&task_id)
+            .ok_or_else(|| anyhow!("missing launch request for task {task_id}"))?;
+
+        let existing = store
+            .get_task(&task_id)
+            .with_context(|| format!("failed to read runtime record for task {task_id}"))?;
+
+        if existing.is_none() {
+            store
+                .upsert_task(&TaskRecord::new(
+                    task_id.clone(),
+                    launch.worker_id.clone(),
+                    launch.retry_budget,
+                ))
+                .with_context(|| format!("failed to insert runtime record for task {task_id}"))?;
+        } else {
+            store
+                .reassign_worker(&task_id, launch.worker_id.clone())
+                .with_context(|| format!("failed to update assigned worker for task {task_id}"))?;
+        }
+
+        store
+            .transition(&task_id, TaskRuntimeState::Preparing)
+            .with_context(|| format!("failed transition queued->preparing for task {task_id}"))?;
+
+        let start_result = runner
+            .start(TaskSpec {
+                id: task_id.clone(),
+                command: launch.command.clone(),
+                args: launch.args.clone(),
+                workdir: launch.workdir.clone(),
+            })
+            .await;
+
+        let handle = match start_result {
+            Ok(handle) => handle,
+            Err(start_err) => {
+                let launched_ids = launched
+                    .iter()
+                    .map(|entry| entry.task_id.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+
+                let context = if launched_ids.is_empty() {
+                    "launched before failure: <none>".to_string()
+                } else {
+                    format!("launched before failure: {launched_ids}")
+                };
+
+                store
+                    .transition(&task_id, TaskRuntimeState::FailedRetryable)
+                    .with_context(|| {
+                        format!("failed to mark task {task_id} as failed_retryable; {context}")
+                    })?;
+
+                return Err(start_err)
+                    .context(format!("failed to start task {task_id}; {context}"));
+            }
+        };
+
+        store
+            .transition(&task_id, TaskRuntimeState::Running)
+            .with_context(|| format!("failed transition preparing->running for task {task_id}"))?;
+
+        launched.push(LaunchResult {
+            task_id,
+            session_id: handle.session_id,
+        });
+    }
+
+    Ok(launched)
 }
 
 fn dependency_is_complete(dep: &str, states: &HashMap<String, ExecutionState>) -> bool {

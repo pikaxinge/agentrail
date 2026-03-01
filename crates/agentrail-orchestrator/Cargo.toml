@@ -9,6 +9,10 @@ rust-version.workspace = true
 [dependencies]
 serde.workspace = true
 anyhow.workspace = true
+agentrail-runner = { path = "../agentrail-runner" }
+agentrail-store = { path = "../agentrail-store" }
 
 [dev-dependencies]
 serde_json.workspace = true
+async-trait.workspace = true
+tokio.workspace = true
