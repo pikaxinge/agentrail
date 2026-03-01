@@ -1,0 +1,131 @@
+use agentrail_mcp::handle_mcp_request;
+use serde_json::json;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+fn write_plan_fixture() -> String {
+    let mut plan_path = std::env::temp_dir();
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("time")
+        .as_nanos();
+    plan_path.push(format!("agentrail-mcp-protocol-{nonce}.yaml"));
+    let yaml = r#"
+version: 1
+project: demo
+phases:
+  - id: phase-1
+    name: Phase 1
+    status: pending
+    steps:
+      - id: step-a
+        name: Step A
+        status: pending
+        depends_on: []
+        claimed_by: null
+        evidence: null
+"#;
+    std::fs::write(&plan_path, yaml).expect("write plan");
+    plan_path.display().to_string()
+}
+
+#[test]
+fn initialize_request_returns_server_capabilities() {
+    let req = json!({
+        "jsonrpc":"2.0",
+        "id":1,
+        "method":"initialize",
+        "params":{
+            "protocolVersion":"2024-11-05",
+            "capabilities":{},
+            "clientInfo":{"name":"tester","version":"1.0"}
+        }
+    });
+
+    let res = handle_mcp_request(req)
+        .expect("initialize should succeed")
+        .expect("initialize should return response");
+    assert_eq!(res["jsonrpc"], "2.0");
+    assert_eq!(res["id"], 1);
+    assert!(res["result"]["capabilities"].is_object());
+    assert_eq!(res["result"]["serverInfo"]["name"], "agentrail-mcp");
+}
+
+#[test]
+fn tools_list_contains_plan_tools() {
+    let req = json!({
+        "jsonrpc":"2.0",
+        "id":2,
+        "method":"tools/list",
+        "params":{}
+    });
+
+    let res = handle_mcp_request(req)
+        .expect("tools/list should succeed")
+        .expect("tools/list should return response");
+    let tools = res["result"]["tools"]
+        .as_array()
+        .expect("tools should be an array");
+    assert!(tools.iter().any(|t| t["name"] == "plan_status"));
+    assert!(tools.iter().any(|t| t["name"] == "plan_show"));
+    assert!(tools.iter().any(|t| t["name"] == "plan_next"));
+    assert!(tools.iter().any(|t| t["name"] == "plan_claim"));
+    assert!(tools.iter().any(|t| t["name"] == "plan_complete"));
+}
+
+#[test]
+fn tools_call_plan_status_returns_payload_in_text_content() {
+    let plan_path = write_plan_fixture();
+    let req = json!({
+        "jsonrpc":"2.0",
+        "id":3,
+        "method":"tools/call",
+        "params":{
+            "name":"plan_status",
+            "arguments":{"plan_path": plan_path}
+        }
+    });
+
+    let res = handle_mcp_request(req)
+        .expect("tools/call should succeed")
+        .expect("tools/call should return response");
+    assert_eq!(res["jsonrpc"], "2.0");
+    assert_eq!(res["id"], 3);
+    let content = res["result"]["content"]
+        .as_array()
+        .expect("content should be array");
+    assert!(!content.is_empty());
+    let text = content[0]["text"]
+        .as_str()
+        .expect("text content expected");
+    let tool_result: serde_json::Value =
+        serde_json::from_str(text).expect("text content should be valid json");
+    assert_eq!(tool_result["operation"], "status");
+    assert_eq!(tool_result["project"], "demo");
+}
+
+#[test]
+fn initialized_notification_returns_no_response() {
+    let req = json!({
+        "jsonrpc":"2.0",
+        "method":"notifications/initialized",
+        "params":{}
+    });
+
+    let res = handle_mcp_request(req).expect("notification should succeed");
+    assert!(res.is_none());
+}
+
+#[test]
+fn unknown_method_returns_jsonrpc_error() {
+    let req = json!({
+        "jsonrpc":"2.0",
+        "id":9,
+        "method":"unknown/method",
+        "params":{}
+    });
+
+    let res = handle_mcp_request(req)
+        .expect("unknown method should return error response")
+        .expect("response should exist");
+    assert_eq!(res["error"]["code"], -32601);
+}

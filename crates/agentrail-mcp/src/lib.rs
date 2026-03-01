@@ -3,6 +3,7 @@ use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter};
 use tracing::{info, warn};
 
 use agentrail_core::{Phase, PhaseStatus, Plan, Step, StepStatus};
@@ -14,6 +15,42 @@ pub async fn run_stdio() -> Result<()> {
         outcome = "ok",
         "agentrail MCP stdio server bootstrap"
     );
+
+    let stdin = tokio::io::stdin();
+    let stdout = tokio::io::stdout();
+    let mut reader = BufReader::new(stdin).lines();
+    let mut writer = BufWriter::new(stdout);
+
+    while let Some(line) = reader.next_line().await? {
+        if line.trim().is_empty() {
+            continue;
+        }
+
+        let parsed: Value = match serde_json::from_str(&line) {
+            Ok(v) => v,
+            Err(error) => {
+                let response = json!({
+                    "jsonrpc":"2.0",
+                    "id": Value::Null,
+                    "error": {
+                        "code": -32700,
+                        "message": format!("parse error: {error}")
+                    }
+                });
+                writer.write_all(serde_json::to_string(&response)?.as_bytes()).await?;
+                writer.write_all(b"\n").await?;
+                writer.flush().await?;
+                continue;
+            }
+        };
+
+        if let Some(response) = handle_mcp_request(parsed)? {
+            writer.write_all(serde_json::to_string(&response)?.as_bytes()).await?;
+            writer.write_all(b"\n").await?;
+            writer.flush().await?;
+        }
+    }
+
     Ok(())
 }
 
@@ -196,6 +233,157 @@ fn save_plan(plan: &Plan, path: &Path, expected_hash: Option<&str>) -> Result<St
 
 pub fn handle_tool_call(tool_name: &str, args: Value) -> Result<Value> {
     handle_tool_call_with_allowed_root(tool_name, args, None)
+}
+
+fn rpc_result(id: Value, result: Value) -> Value {
+    json!({
+        "jsonrpc":"2.0",
+        "id": id,
+        "result": result
+    })
+}
+
+fn rpc_error(id: Value, code: i64, message: impl Into<String>) -> Value {
+    json!({
+        "jsonrpc":"2.0",
+        "id": id,
+        "error": {
+            "code": code,
+            "message": message.into()
+        }
+    })
+}
+
+fn mcp_tools_descriptor() -> Value {
+    json!([
+        {
+            "name":"plan_status",
+            "description":"Return plan status summary",
+            "inputSchema": {
+                "type":"object",
+                "properties": {
+                    "plan_path": {"type":"string"}
+                },
+                "required": ["plan_path"]
+            }
+        },
+        {
+            "name":"plan_show",
+            "description":"Show one step details",
+            "inputSchema": {
+                "type":"object",
+                "properties": {
+                    "plan_path": {"type":"string"},
+                    "step_id": {"type":"string"}
+                },
+                "required": ["plan_path","step_id"]
+            }
+        },
+        {
+            "name":"plan_next",
+            "description":"Get next ready step",
+            "inputSchema": {
+                "type":"object",
+                "properties": {
+                    "plan_path": {"type":"string"}
+                },
+                "required": ["plan_path"]
+            }
+        },
+        {
+            "name":"plan_claim",
+            "description":"Claim a step for an agent",
+            "inputSchema": {
+                "type":"object",
+                "properties": {
+                    "plan_path": {"type":"string"},
+                    "step_id": {"type":"string"},
+                    "agent": {"type":"string"}
+                },
+                "required": ["plan_path","step_id","agent"]
+            }
+        },
+        {
+            "name":"plan_complete",
+            "description":"Complete a claimed step",
+            "inputSchema": {
+                "type":"object",
+                "properties": {
+                    "plan_path": {"type":"string"},
+                    "step_id": {"type":"string"},
+                    "agent": {"type":"string"},
+                    "evidence": {"type":"string"}
+                },
+                "required": ["plan_path","step_id","agent","evidence"]
+            }
+        }
+    ])
+}
+
+pub fn handle_mcp_request(request: Value) -> Result<Option<Value>> {
+    let method = request
+        .get("method")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("invalid request: missing method"))?;
+
+    if method == "notifications/initialized" {
+        return Ok(None);
+    }
+
+    let id = request.get("id").cloned().unwrap_or(Value::Null);
+
+    let response = match method {
+        "initialize" => rpc_result(
+            id,
+            json!({
+                "protocolVersion":"2024-11-05",
+                "capabilities": {
+                    "tools": {}
+                },
+                "serverInfo": {
+                    "name":"agentrail-mcp",
+                    "version":"0.1.0"
+                }
+            }),
+        ),
+        "tools/list" => rpc_result(
+            id,
+            json!({
+                "tools": mcp_tools_descriptor()
+            }),
+        ),
+        "tools/call" => {
+            let params = request.get("params").cloned().unwrap_or_else(|| json!({}));
+            let name = match params.get("name").and_then(Value::as_str) {
+                Some(name) => name,
+                None => {
+                    return Ok(Some(rpc_error(
+                        id,
+                        -32602,
+                        "invalid params: missing tool name",
+                    )));
+                }
+            };
+            let arguments = params.get("arguments").cloned().unwrap_or_else(|| json!({}));
+            match handle_tool_call(name, arguments) {
+                Ok(tool_result) => rpc_result(
+                    id,
+                    json!({
+                        "content":[
+                            {
+                                "type":"text",
+                                "text": serde_json::to_string(&tool_result)?
+                            }
+                        ]
+                    }),
+                ),
+                Err(error) => rpc_error(id, -32000, error.to_string()),
+            }
+        }
+        _ => rpc_error(id, -32601, format!("method not found: {method}")),
+    };
+
+    Ok(Some(response))
 }
 
 pub fn handle_tool_call_with_allowed_root(
