@@ -1866,6 +1866,229 @@ fn delivery_events_ack(args: Value) -> Result<Value> {
     }))
 }
 
+#[derive(Debug, Clone)]
+struct StartupRecoveryCandidate {
+    task_id: String,
+    session: Option<RuntimeTaskSession>,
+}
+
+fn collect_startup_recovery_candidates() -> Result<Vec<StartupRecoveryCandidate>> {
+    let runtime = runtime_state_mutex()?;
+    let snapshot = runtime.store.export_snapshot()?;
+    let mut candidates = Vec::new();
+
+    for task in snapshot.tasks {
+        if !matches!(
+            task.state,
+            TaskRuntimeState::Preparing | TaskRuntimeState::Running
+        ) {
+            continue;
+        }
+        if runtime.sessions.contains_key(&task.id) {
+            continue;
+        }
+
+        let session = runtime
+            .store
+            .list_task_sessions(&task.id)?
+            .into_iter()
+            .rev()
+            .find(|session| session.terminal_state.is_none())
+            .and_then(|session| {
+                RuntimeRunnerMode::parse(Some(session.runner_mode.as_str()))
+                    .ok()
+                    .map(|runner_mode| RuntimeTaskSession {
+                        session_id: session.session_id,
+                        runner_mode,
+                    })
+            });
+
+        candidates.push(StartupRecoveryCandidate {
+            task_id: task.id,
+            session,
+        });
+    }
+
+    Ok(candidates)
+}
+
+fn emit_recovery_event(
+    task_id: &str,
+    event_type: &str,
+    runtime_state: &str,
+    session_id: Option<String>,
+) -> Result<()> {
+    let mut runtime = runtime_state_mutex()?;
+    emit_delivery_event(
+        &mut runtime,
+        task_id,
+        event_type,
+        "recovery",
+        runtime_state,
+        session_id,
+    );
+    Ok(())
+}
+
+fn transition_recovery_missing_session(task_id: &str, session_id: Option<&str>) -> Result<String> {
+    if let Some(session_id) = session_id {
+        let _ = finalize_runtime_session(session_id, "missing_session");
+    }
+
+    let mut runtime = runtime_state_mutex()?;
+    if let Some(task) = runtime.store.get_task(task_id)?
+        && can_transition_to_failed_retryable(task.state)
+    {
+        let _ = runtime
+            .store
+            .transition(task_id, TaskRuntimeState::FailedRetryable)?;
+    }
+    runtime.sessions.remove(task_id);
+    let runtime_state = runtime
+        .store
+        .get_task(task_id)?
+        .map(|task| runtime_state_label(task.state).to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+    Ok(runtime_state)
+}
+
+async fn reconcile_runtime_startup_once() -> Result<()> {
+    let candidates = collect_startup_recovery_candidates()?;
+    let mut failures = Vec::new();
+
+    for candidate in candidates {
+        let result = match candidate.session.clone() {
+            None => {
+                let runtime_state = transition_recovery_missing_session(&candidate.task_id, None)?;
+                emit_recovery_event(
+                    &candidate.task_id,
+                    "recovery_missing_session",
+                    &runtime_state,
+                    None,
+                )?;
+                info!(
+                    operation = "runtime_recovery",
+                    outcome = "missing_session",
+                    task_id = candidate.task_id,
+                    runtime_state = runtime_state,
+                    "startup reconciliation marked task as failed_retryable due to missing session"
+                );
+                Ok(())
+            }
+            Some(session) => match runner_status(session.runner_mode, &session.session_id).await {
+                Ok(status) if status.state == "running" => {
+                    let runtime_state = {
+                        let mut runtime = runtime_state_mutex()?;
+                        if let Some(task) = runtime.store.get_task(&candidate.task_id)?
+                            && task.state == TaskRuntimeState::Preparing
+                        {
+                            let _ = runtime
+                                .store
+                                .transition(&candidate.task_id, TaskRuntimeState::Running)?;
+                        }
+                        runtime
+                            .sessions
+                            .insert(candidate.task_id.clone(), session.clone());
+                        runtime
+                            .store
+                            .get_task(&candidate.task_id)?
+                            .map(|task| runtime_state_label(task.state).to_string())
+                            .unwrap_or_else(|| "unknown".to_string())
+                    };
+                    emit_recovery_event(
+                        &candidate.task_id,
+                        "recovery_attached",
+                        &runtime_state,
+                        Some(session.session_id.clone()),
+                    )?;
+                    info!(
+                        operation = "runtime_recovery",
+                        outcome = "attached",
+                        task_id = candidate.task_id,
+                        session_id = session.session_id,
+                        runtime_state = runtime_state,
+                        "startup reconciliation attached live session"
+                    );
+                    Ok(())
+                }
+                Ok(status) => {
+                    let _ = finalize_runtime_session(&session.session_id, &status.state);
+                    let runtime_state = {
+                        let mut runtime = runtime_state_mutex()?;
+                        if let Some(task) = runtime.store.get_task(&candidate.task_id)? {
+                            if let Some(target) = map_runner_to_runtime_state(&status.state)
+                                && runtime_state_is_active(task.state)
+                                && task.state != target
+                                && task.state != TaskRuntimeState::Merged
+                                && task.state != TaskRuntimeState::FailedTerminal
+                            {
+                                let _ = runtime.store.transition(&candidate.task_id, target);
+                            }
+                        }
+                        runtime.sessions.remove(&candidate.task_id);
+                        runtime
+                            .store
+                            .get_task(&candidate.task_id)?
+                            .map(|task| runtime_state_label(task.state).to_string())
+                            .unwrap_or_else(|| "unknown".to_string())
+                    };
+                    emit_recovery_event(
+                        &candidate.task_id,
+                        "recovery_terminal_observed",
+                        &runtime_state,
+                        Some(session.session_id.clone()),
+                    )?;
+                    info!(
+                        operation = "runtime_recovery",
+                        outcome = "terminal_observed",
+                        task_id = candidate.task_id,
+                        session_id = session.session_id,
+                        state = status.state,
+                        runtime_state = runtime_state,
+                        "startup reconciliation observed terminal session state"
+                    );
+                    Ok(())
+                }
+                Err(error) if is_session_not_found_error(&error) => {
+                    let runtime_state = transition_recovery_missing_session(
+                        &candidate.task_id,
+                        Some(&session.session_id),
+                    )?;
+                    emit_recovery_event(
+                        &candidate.task_id,
+                        "recovery_missing_session",
+                        &runtime_state,
+                        Some(session.session_id.clone()),
+                    )?;
+                    info!(
+                        operation = "runtime_recovery",
+                        outcome = "missing_session",
+                        task_id = candidate.task_id,
+                        session_id = session.session_id,
+                        runtime_state = runtime_state,
+                        "startup reconciliation marked task as failed_retryable due to missing session"
+                    );
+                    Ok(())
+                }
+                Err(error) => Err(error),
+            },
+        };
+
+        if let Err(error) = result {
+            failures.push(format!("{}: {error}", candidate.task_id));
+        }
+    }
+
+    if !failures.is_empty() {
+        anyhow::bail!(
+            "runtime recovery encountered per-task failures: {}",
+            failures.join("; ")
+        );
+    }
+
+    Ok(())
+}
+
 async fn poll_runtime_once() -> Result<()> {
     let task_ids = {
         let runtime = runtime_state_mutex()?;
@@ -1896,6 +2119,15 @@ pub async fn run_stdio() -> Result<()> {
         outcome = "ok",
         "agentrail MCP stdio server bootstrap"
     );
+
+    if let Err(error) = reconcile_runtime_startup_once().await {
+        warn!(
+            operation = "runtime_recovery",
+            outcome = "error",
+            error = %error,
+            "runtime startup recovery failed"
+        );
+    }
 
     tokio::spawn(async {
         loop {
@@ -1961,6 +2193,15 @@ pub async fn run_http(bind: &str) -> Result<()> {
         outcome = "ok",
         "agentrail MCP HTTP server bootstrap"
     );
+
+    if let Err(error) = reconcile_runtime_startup_once().await {
+        warn!(
+            operation = "runtime_recovery",
+            outcome = "error",
+            error = %error,
+            "runtime startup recovery failed"
+        );
+    }
     tokio::spawn(async {
         loop {
             if let Err(error) = poll_runtime_once().await {
@@ -2933,6 +3174,7 @@ pub fn handle_tool_call_with_allowed_root(
 mod tests {
     use std::{
         io::{self, Write},
+        process::Command as StdCommand,
         sync::{Arc, Mutex},
         time::{SystemTime, UNIX_EPOCH},
     };
@@ -3269,5 +3511,184 @@ mod tests {
             !runtime.sessions.contains_key(&task_id),
             "stale missing session should be removed after poll failure"
         );
+    }
+
+    fn tmux_available() -> bool {
+        StdCommand::new("tmux")
+            .arg("-V")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false)
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn startup_recovery_attaches_live_tmux_session() {
+        if !tmux_available() {
+            return;
+        }
+
+        let task_id = unique_test_task_id("startup-attach");
+        let session_id = unique_test_task_id("tmux-recovery-session");
+        let output = StdCommand::new("tmux")
+            .args(["new-session", "-d", "-s", &session_id, "bash -lc 'sleep 5'"])
+            .output()
+            .expect("spawn tmux recovery session");
+        assert!(
+            output.status.success(),
+            "tmux new-session should succeed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        {
+            let mut runtime = runtime_state().lock().expect("runtime lock");
+            runtime
+                .store
+                .upsert_task(&TaskRecord::new(task_id.clone(), "worker-a", 1))
+                .expect("seed task");
+            runtime
+                .store
+                .transition(&task_id, TaskRuntimeState::Preparing)
+                .expect("queued -> preparing");
+            runtime
+                .store
+                .transition(&task_id, TaskRuntimeState::Running)
+                .expect("preparing -> running");
+            runtime
+                .store
+                .register_task_attempt(&task_id, &session_id, "tmux")
+                .expect("register attempt");
+            runtime.sessions.remove(&task_id);
+        }
+
+        reconcile_runtime_startup_once()
+            .await
+            .expect("startup recovery should attach live tmux session");
+
+        {
+            let runtime = runtime_state().lock().expect("runtime lock");
+            assert!(
+                runtime.sessions.contains_key(&task_id),
+                "startup recovery should re-attach active session"
+            );
+            let task = runtime
+                .store
+                .get_task(&task_id)
+                .expect("read task")
+                .expect("task should exist");
+            assert_eq!(task.state, TaskRuntimeState::Running);
+            assert!(runtime.delivery_events.iter().any(|event| {
+                event.task_id == task_id && event.event_type == "recovery_attached"
+            }));
+        }
+
+        let _ = StdCommand::new("tmux")
+            .args(["kill-session", "-t", &session_id])
+            .output();
+        {
+            let mut runtime = runtime_state().lock().expect("runtime lock");
+            runtime.sessions.remove(&task_id);
+            if let Some(task) = runtime.store.get_task(&task_id).expect("read task")
+                && can_transition_to_failed_retryable(task.state)
+            {
+                let _ = runtime
+                    .store
+                    .transition(&task_id, TaskRuntimeState::FailedRetryable);
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn startup_recovery_missing_session_transitions_to_failed_retryable() {
+        let task_id = unique_test_task_id("startup-missing");
+        let missing_session_id = unique_test_task_id("missing-session");
+        {
+            let mut runtime = runtime_state().lock().expect("runtime lock");
+            runtime
+                .store
+                .upsert_task(&TaskRecord::new(task_id.clone(), "worker-a", 1))
+                .expect("seed task");
+            runtime
+                .store
+                .transition(&task_id, TaskRuntimeState::Preparing)
+                .expect("queued -> preparing");
+            runtime
+                .store
+                .transition(&task_id, TaskRuntimeState::Running)
+                .expect("preparing -> running");
+            runtime
+                .store
+                .register_task_attempt(&task_id, &missing_session_id, "process")
+                .expect("register attempt");
+            runtime.sessions.remove(&task_id);
+        }
+
+        reconcile_runtime_startup_once()
+            .await
+            .expect("startup recovery should complete for missing session");
+
+        let runtime = runtime_state().lock().expect("runtime lock");
+        let task = runtime
+            .store
+            .get_task(&task_id)
+            .expect("read task")
+            .expect("task should exist");
+        assert_eq!(task.state, TaskRuntimeState::FailedRetryable);
+        assert!(runtime.delivery_events.iter().any(|event| {
+            event.task_id == task_id && event.event_type == "recovery_missing_session"
+        }));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn startup_recovery_is_idempotent_for_missing_session_path() {
+        let task_id = unique_test_task_id("startup-idempotent");
+        let missing_session_id = unique_test_task_id("missing-session-idempotent");
+        {
+            let mut runtime = runtime_state().lock().expect("runtime lock");
+            runtime
+                .store
+                .upsert_task(&TaskRecord::new(task_id.clone(), "worker-a", 1))
+                .expect("seed task");
+            runtime
+                .store
+                .transition(&task_id, TaskRuntimeState::Preparing)
+                .expect("queued -> preparing");
+            runtime
+                .store
+                .transition(&task_id, TaskRuntimeState::Running)
+                .expect("preparing -> running");
+            runtime
+                .store
+                .register_task_attempt(&task_id, &missing_session_id, "process")
+                .expect("register attempt");
+            runtime.sessions.remove(&task_id);
+        }
+
+        reconcile_runtime_startup_once()
+            .await
+            .expect("first recovery run should succeed");
+        reconcile_runtime_startup_once()
+            .await
+            .expect("second recovery run should stay idempotent");
+
+        let runtime = runtime_state().lock().expect("runtime lock");
+        let missing_events = runtime
+            .delivery_events
+            .iter()
+            .filter(|event| {
+                event.task_id == task_id && event.event_type == "recovery_missing_session"
+            })
+            .count();
+        assert_eq!(
+            missing_events, 1,
+            "recovery missing-session event should not duplicate across repeated runs"
+        );
+        let task = runtime
+            .store
+            .get_task(&task_id)
+            .expect("read task")
+            .expect("task should exist");
+        assert_eq!(task.state, TaskRuntimeState::FailedRetryable);
     }
 }
