@@ -244,3 +244,42 @@ async fn non_zero_exit_transitions_to_failed() {
     let final_state = wait_for_terminal_state(&tmux_runner, &handle.session_id, 40).await;
     assert_eq!(final_state, "failed");
 }
+
+#[tokio::test]
+async fn start_avoids_legacy_tmux_session_name_collision() {
+    if skip_if_no_tmux() {
+        return;
+    }
+
+    // Simulate leftover legacy session name from older runner processes.
+    let _ = StdCommand::new("tmux")
+        .args(["kill-session", "-t", "tmux-1"])
+        .status();
+    let created = StdCommand::new("tmux")
+        .args(["new-session", "-d", "-s", "tmux-1", "sleep 30"])
+        .status()
+        .expect("should run tmux new-session");
+    assert!(created.success(), "legacy tmux-1 session should be created");
+
+    let tmux_runner = runner();
+    let tmp = tempdir().expect("tempdir");
+
+    let handle = tmux_runner
+        .start(TaskSpec {
+            id: "task-legacy-collision".to_string(),
+            command: "bash".to_string(),
+            args: vec!["-lc".to_string(), "echo collision-safe".to_string()],
+            workdir: workdir_string(tmp.path()),
+        })
+        .await
+        .expect("start should avoid legacy collision");
+
+    assert_ne!(handle.session_id, "tmux-1");
+
+    let final_state = wait_for_terminal_state(&tmux_runner, &handle.session_id, 40).await;
+    assert_eq!(final_state, "completed");
+
+    let _ = StdCommand::new("tmux")
+        .args(["kill-session", "-t", "tmux-1"])
+        .status();
+}

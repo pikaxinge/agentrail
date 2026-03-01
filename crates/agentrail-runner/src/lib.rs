@@ -6,7 +6,7 @@ use std::{
         Arc, Mutex as StdMutex, OnceLock,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
-    time::Duration,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Result, anyhow};
@@ -131,6 +131,15 @@ static SESSION_COUNTER: AtomicU64 = AtomicU64::new(1);
 const MAX_LOG_LINES: usize = 2000;
 const MAX_TERMINAL_SESSIONS: usize = 256;
 const TMUX_LOG_DIR: &str = ".agentrail-tmux-logs";
+
+fn unique_tmux_session_id(sequence: u64) -> String {
+    let ts_nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    let pid = std::process::id();
+    format!("tmux-{pid}-{ts_nanos}-{sequence}")
+}
 
 fn process_sessions() -> &'static StdMutex<HashMap<String, Arc<SessionRecord>>> {
     PROCESS_SESSIONS.get_or_init(|| StdMutex::new(HashMap::new()))
@@ -839,7 +848,7 @@ impl AgentRunner for TmuxRunner {
         std::fs::create_dir_all(&spec.workdir)?;
 
         let sequence = SESSION_COUNTER.fetch_add(1, Ordering::Relaxed);
-        let session_id = format!("tmux-{sequence}");
+        let session_id = unique_tmux_session_id(sequence);
         let tmux_session = session_id.clone();
 
         let log_dir = Path::new(&spec.workdir).join(TMUX_LOG_DIR);
