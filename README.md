@@ -95,6 +95,13 @@ cargo run -p agentrail-cli -- report --plan ./plan.yaml
 cargo run -p agentrail-mcp -- --transport stdio
 cargo run -p agentrail-mcp -- --transport http --bind 127.0.0.1:8787
 
+# 3.1) Run stdio supervisor (hot-reload worker without reconnecting client)
+cargo run -p agentrail-mcp -- --transport supervisor-stdio
+# optional: custom worker command
+cargo run -p agentrail-mcp -- --transport supervisor-stdio --worker-cmd "./target/debug/agentrail-mcp --transport stdio"
+# trigger worker hot reload through the same stdio session
+echo '{"jsonrpc":"2.0","id":2,"method":"agentrail/reload","params":{}}'
+
 # 4) Serve mode (same MCP runtime via CLI)
 cargo run -p agentrail-cli -- serve --transport http --bind 127.0.0.1:8787
 ```

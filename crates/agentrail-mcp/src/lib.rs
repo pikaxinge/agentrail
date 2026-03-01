@@ -11,12 +11,15 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::process::Stdio;
 use std::sync::{
     Mutex, OnceLock,
     atomic::{AtomicU64, Ordering},
 };
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter};
+use tokio::process::{Child, ChildStdin, Command};
+use tokio::sync::mpsc;
 use tracing::{info, warn};
 
 use agentrail_core::{Phase, PhaseStatus, Plan, Step, StepStatus};
@@ -1823,6 +1826,189 @@ pub async fn run_http(bind: &str) -> Result<()> {
     Ok(())
 }
 
+struct SupervisedWorker {
+    child: Child,
+    stdin: ChildStdin,
+    stdout_rx: mpsc::UnboundedReceiver<String>,
+}
+
+async fn spawn_supervised_worker(worker_cmd: Option<&str>) -> Result<SupervisedWorker> {
+    let mut command = if let Some(raw) = worker_cmd {
+        let mut cmd = Command::new("bash");
+        cmd.args(["-lc", raw]);
+        info!(
+            operation = "mcp_supervisor_spawn",
+            mode = "shell",
+            command = raw,
+            outcome = "launching",
+            "spawning supervised MCP worker command"
+        );
+        cmd
+    } else {
+        let current_exe = std::env::current_exe()?;
+        let mut cmd = Command::new(&current_exe);
+        cmd.args(["--transport", "stdio"]);
+        info!(
+            operation = "mcp_supervisor_spawn",
+            mode = "self",
+            command = %format!("{} --transport stdio", current_exe.display()),
+            outcome = "launching",
+            "spawning supervised MCP worker from current executable"
+        );
+        cmd
+    };
+
+    command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit());
+
+    let mut child = command.spawn()?;
+    let stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("worker stdin not available"))?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("worker stdout not available"))?;
+
+    let (stdout_tx, stdout_rx) = mpsc::unbounded_channel::<String>();
+    tokio::spawn(async move {
+        let mut lines = BufReader::new(stdout).lines();
+        loop {
+            match lines.next_line().await {
+                Ok(Some(line)) => {
+                    if stdout_tx.send(line).is_err() {
+                        break;
+                    }
+                }
+                Ok(None) | Err(_) => break,
+            }
+        }
+    });
+
+    Ok(SupervisedWorker {
+        child,
+        stdin,
+        stdout_rx,
+    })
+}
+
+async fn restart_supervised_worker(
+    worker: &mut SupervisedWorker,
+    worker_cmd: Option<&str>,
+) -> Result<()> {
+    let _ = worker.child.start_kill();
+    let _ = worker.child.wait().await;
+    *worker = spawn_supervised_worker(worker_cmd).await?;
+    Ok(())
+}
+
+fn extract_reload_request_id(raw_line: &str, reload_method: &str) -> Option<Option<Value>> {
+    let parsed: Value = serde_json::from_str(raw_line).ok()?;
+    let method = parsed.get("method")?.as_str()?;
+    if method != reload_method {
+        return None;
+    }
+
+    let id = parsed.get("id").filter(|value| !value.is_null()).cloned();
+    Some(id)
+}
+
+pub async fn run_supervisor_stdio(worker_cmd: Option<&str>, reload_method: &str) -> Result<()> {
+    info!(
+        operation = "mcp_server_bootstrap",
+        transport = "supervisor-stdio",
+        reload_method = reload_method,
+        outcome = "ok",
+        "agentrail MCP stdio supervisor bootstrap"
+    );
+
+    let stdin = tokio::io::stdin();
+    let stdout = tokio::io::stdout();
+    let mut client_reader = BufReader::new(stdin).lines();
+    let mut client_writer = BufWriter::new(stdout);
+    let mut worker = spawn_supervised_worker(worker_cmd).await?;
+
+    loop {
+        loop {
+            match worker.stdout_rx.try_recv() {
+                Ok(line) => {
+                    client_writer.write_all(line.as_bytes()).await?;
+                    client_writer.write_all(b"\n").await?;
+                    client_writer.flush().await?;
+                }
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
+                Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                    warn!(
+                        operation = "mcp_supervisor_worker_stdout",
+                        outcome = "disconnected",
+                        "worker stdout channel disconnected; restarting worker"
+                    );
+                    restart_supervised_worker(&mut worker, worker_cmd).await?;
+                    break;
+                }
+            }
+        }
+
+        let next_client_line =
+            tokio::time::timeout(Duration::from_millis(100), client_reader.next_line()).await;
+        let maybe_line = match next_client_line {
+            Ok(line_result) => line_result?,
+            Err(_) => continue,
+        };
+
+        let Some(line) = maybe_line else {
+            let _ = worker.child.start_kill();
+            let _ = worker.child.wait().await;
+            return Ok(());
+        };
+
+        if line.trim().is_empty() {
+            continue;
+        }
+
+        if let Some(response_id) = extract_reload_request_id(&line, reload_method) {
+            info!(
+                operation = "mcp_supervisor_reload",
+                outcome = "requested",
+                "supervisor received reload request"
+            );
+            restart_supervised_worker(&mut worker, worker_cmd).await?;
+            if let Some(id) = response_id {
+                let response = json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "result": {
+                        "ok": true,
+                        "reloaded": true
+                    }
+                });
+                client_writer
+                    .write_all(serde_json::to_string(&response)?.as_bytes())
+                    .await?;
+                client_writer.write_all(b"\n").await?;
+                client_writer.flush().await?;
+            }
+            continue;
+        }
+
+        if let Err(error) = worker.stdin.write_all(line.as_bytes()).await {
+            warn!(
+                operation = "mcp_supervisor_forward",
+                outcome = "worker_stdin_write_failed",
+                error = %error,
+                "worker stdin write failed; restarting worker and retrying"
+            );
+            restart_supervised_worker(&mut worker, worker_cmd).await?;
+            worker.stdin.write_all(line.as_bytes()).await?;
+        }
+        worker.stdin.write_all(b"\n").await?;
+        worker.stdin.flush().await?;
+    }
+}
+
 fn require_string_field<'a>(tool_name: &str, args: &'a Value, field: &str) -> Result<&'a str> {
     let Some(value) = args.get(field).and_then(Value::as_str) else {
         warn!(
@@ -2621,6 +2807,25 @@ mod tests {
         let (command, args) = resolve_start_command_and_args(&json!({})).expect("resolve command");
         assert_eq!(command, "bash");
         assert_eq!(args, vec!["-lc".to_string(), "true".to_string()]);
+    }
+
+    #[test]
+    fn extract_reload_request_id_returns_id_for_matching_method() {
+        let id = extract_reload_request_id(
+            r#"{"jsonrpc":"2.0","id":"abc","method":"agentrail/reload","params":{}}"#,
+            "agentrail/reload",
+        )
+        .expect("reload request should match");
+        assert_eq!(id, Some(json!("abc")));
+    }
+
+    #[test]
+    fn extract_reload_request_id_ignores_other_methods() {
+        let id = extract_reload_request_id(
+            r#"{"jsonrpc":"2.0","id":"abc","method":"tools/list","params":{}}"#,
+            "agentrail/reload",
+        );
+        assert!(id.is_none());
     }
 
     #[test]
