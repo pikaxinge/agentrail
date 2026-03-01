@@ -118,7 +118,8 @@ cargo run -p agentrail-cli -- serve --transport http --bind 127.0.0.1:8787
 - Operational runbook:
   - `docs/operations/AUTO_DELIVERY_RUNBOOK.md`
 - Rolling release on every `main` push:
-  - GitHub Release tag `main-latest` (pre-release, auto-updated by CD)
+  - Immutable pre-release tag `main-YYYYMMDD-HHMMSS-<sha7>`
+  - Rolling pointer tag `main-latest` (pre-release, auto-updated by CD)
 
 ## Documentation
 
