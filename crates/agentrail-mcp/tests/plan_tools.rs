@@ -104,7 +104,7 @@ fn plan_next_tool_returns_next_ready_step() {
 
 #[test]
 fn plan_next_recomputes_stale_locked_phase_before_selecting_step() {
-    let (_tmp, plan) = write_plan_yaml(
+    let (tmp, plan) = write_plan_yaml(
         r#"
 version: 1
 project: demo
@@ -132,11 +132,12 @@ phases:
         evidence: null
 "#,
     );
-    let result = handle_tool_call(
+    let result = handle_tool_call_with_allowed_root(
         "plan_next",
         json!({
             "plan_path": plan.display().to_string()
         }),
+        Some(tmp.path()),
     )
     .expect("tool should succeed");
 
@@ -168,7 +169,7 @@ fn plan_claim_tool_updates_step_owner() {
 
 #[test]
 fn plan_claim_recomputes_stale_locked_phase_before_dependency_checks() {
-    let (_tmp, plan) = write_plan_yaml(
+    let (tmp, plan) = write_plan_yaml(
         r#"
 version: 1
 project: demo
@@ -196,13 +197,14 @@ phases:
         evidence: null
 "#,
     );
-    let result = handle_tool_call(
+    let result = handle_tool_call_with_allowed_root(
         "plan_claim",
         json!({
             "plan_path": plan.display().to_string(),
             "step_id": "step-b",
             "agent": "worker-1"
         }),
+        Some(tmp.path()),
     )
     .expect("tool should succeed");
 
@@ -250,7 +252,7 @@ fn plan_complete_tool_updates_step_evidence() {
 
 #[test]
 fn plan_complete_recomputes_stale_locked_phase_before_dependency_checks() {
-    let (_tmp, plan) = write_plan_yaml(
+    let (tmp, plan) = write_plan_yaml(
         r#"
 version: 1
 project: demo
@@ -278,7 +280,7 @@ phases:
         evidence: null
 "#,
     );
-    let result = handle_tool_call(
+    let result = handle_tool_call_with_allowed_root(
         "plan_complete",
         json!({
             "plan_path": plan.display().to_string(),
@@ -286,6 +288,7 @@ phases:
             "agent": "worker-1",
             "evidence": "tests:ok"
         }),
+        Some(tmp.path()),
     )
     .expect("tool should succeed");
 

@@ -38,6 +38,12 @@ The M6 MCP plan tool slice is now implemented:
 - `plan_claim`
 - `plan_complete`
 
+The M7 ProcessRunner slice is now implemented:
+
+- real child process start/stop/status/logs lifecycle
+- process-group and descendant cleanup on stop (unix path)
+- bounded in-memory logs and bounded terminal-session retention
+
 ## Quick start
 
 ```bash
