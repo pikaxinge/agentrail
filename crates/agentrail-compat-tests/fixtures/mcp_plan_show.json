@@ -1,0 +1,8 @@
+{
+  "tool": "plan_show",
+  "operation": "show",
+  "step": {
+    "id": "step-a",
+    "status": "pending"
+  }
+}

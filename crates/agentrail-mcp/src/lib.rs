@@ -1,6 +1,11 @@
 use anyhow::Result;
 use serde_json::{Value, json};
+use std::collections::HashMap;
+use std::fs;
+use std::path::{Path, PathBuf};
 use tracing::{info, warn};
+
+use agentrail_core::{Phase, PhaseStatus, Plan, Step, StepStatus};
 
 pub async fn run_stdio() -> Result<()> {
     info!(
@@ -23,29 +28,181 @@ pub async fn run_http(bind: &str) -> Result<()> {
     Ok(())
 }
 
-fn require_task_id<'a>(tool_name: &str, args: &'a Value) -> Result<&'a str> {
-    let Some(task_id) = args.get("task_id").and_then(Value::as_str) else {
+fn require_string_field<'a>(tool_name: &str, args: &'a Value, field: &str) -> Result<&'a str> {
+    let Some(value) = args.get(field).and_then(Value::as_str) else {
         warn!(
             operation = "mcp_tool_call",
             tool = tool_name,
-            outcome = "missing_task_id",
-            "MCP tool call missing task_id"
+            missing_field = field,
+            outcome = "missing_required_field",
+            "MCP tool call missing required field"
         );
-        anyhow::bail!("missing task_id");
+        anyhow::bail!("missing {field}");
     };
 
     info!(
         operation = "mcp_tool_call",
         tool = tool_name,
-        task_id = task_id,
+        field = field,
         outcome = "validated",
         "validated MCP tool call arguments"
     );
 
-    Ok(task_id)
+    Ok(value)
+}
+
+fn require_task_id<'a>(tool_name: &str, args: &'a Value) -> Result<&'a str> {
+    require_string_field(tool_name, args, "task_id")
+}
+
+fn require_plan_path(
+    tool_name: &str,
+    args: &Value,
+    allowed_root: Option<&Path>,
+) -> Result<PathBuf> {
+    let raw_plan_path = require_string_field(tool_name, args, "plan_path")?;
+    let canonical_plan_path = fs::canonicalize(raw_plan_path)
+        .map_err(|e| anyhow::anyhow!("invalid plan_path: {raw_plan_path} ({e})"))?;
+
+    if let Some(root) = allowed_root {
+        let canonical_root = fs::canonicalize(root)
+            .map_err(|e| anyhow::anyhow!("invalid allowed root: {} ({e})", root.display()))?;
+        if !canonical_plan_path.starts_with(&canonical_root) {
+            anyhow::bail!(
+                "plan_path outside allowed root: {}",
+                canonical_plan_path.display()
+            );
+        }
+    } else if let Ok(root) = std::env::var("AGENTRAIL_ALLOWED_PLAN_ROOT") {
+        if !root.trim().is_empty() {
+            let canonical_root = fs::canonicalize(&root).map_err(|e| {
+                anyhow::anyhow!("invalid AGENTRAIL_ALLOWED_PLAN_ROOT: {root} ({e})")
+            })?;
+            if !canonical_plan_path.starts_with(&canonical_root) {
+                anyhow::bail!(
+                    "plan_path outside allowed root: {}",
+                    canonical_plan_path.display()
+                );
+            }
+        }
+    }
+
+    Ok(canonical_plan_path)
+}
+
+fn find_step<'a>(plan: &'a Plan, step_id: &str) -> Option<&'a Step> {
+    plan.phases
+        .iter()
+        .flat_map(|phase| phase.steps.iter())
+        .find(|step| step.id == step_id)
+}
+
+fn find_step_with_phase<'a>(plan: &'a Plan, step_id: &str) -> Option<(&'a Phase, &'a Step)> {
+    plan.phases.iter().find_map(|phase| {
+        phase
+            .steps
+            .iter()
+            .find(|step| step.id == step_id)
+            .map(|step| (phase, step))
+    })
+}
+
+fn find_step_mut<'a>(plan: &'a mut Plan, step_id: &str) -> Option<&'a mut Step> {
+    for phase in &mut plan.phases {
+        if let Some(step) = phase.steps.iter_mut().find(|step| step.id == step_id) {
+            return Some(step);
+        }
+    }
+    None
+}
+
+fn step_counts(plan: &Plan) -> (usize, usize, usize) {
+    let mut pending = 0;
+    let mut claimed = 0;
+    let mut done = 0;
+
+    for step in plan.phases.iter().flat_map(|phase| phase.steps.iter()) {
+        match step.status {
+            StepStatus::Pending => pending += 1,
+            StepStatus::Claimed => claimed += 1,
+            StepStatus::Done => done += 1,
+            StepStatus::Skipped | StepStatus::Rejected => {}
+        }
+    }
+
+    (pending, claimed, done)
+}
+
+fn step_status_map(plan: &Plan) -> HashMap<String, StepStatus> {
+    plan.phases
+        .iter()
+        .flat_map(|phase| phase.steps.iter())
+        .map(|step| (step.id.clone(), step.status.clone()))
+        .collect()
+}
+
+fn phase_status_map(plan: &Plan) -> HashMap<String, PhaseStatus> {
+    plan.phases
+        .iter()
+        .map(|phase| (phase.id.clone(), phase.status.clone()))
+        .collect()
+}
+
+fn step_dependencies_ready(step: &Step, step_status_by_id: &HashMap<String, StepStatus>) -> bool {
+    step.depends_on.iter().all(|dep| {
+        matches!(
+            step_status_by_id.get(dep),
+            Some(StepStatus::Done) | Some(StepStatus::Skipped)
+        )
+    })
+}
+
+fn phase_ready_for_work(phase: &Phase, phase_status_by_id: &HashMap<String, PhaseStatus>) -> bool {
+    if phase.status == PhaseStatus::Locked {
+        return false;
+    }
+
+    phase
+        .depends_on
+        .iter()
+        .all(|dep| matches!(phase_status_by_id.get(dep), Some(PhaseStatus::Done)))
+}
+
+fn next_ready_step(plan: &Plan) -> Option<&Step> {
+    let step_status_by_id = step_status_map(plan);
+    let phase_status_by_id = phase_status_map(plan);
+
+    for phase in &plan.phases {
+        if !phase_ready_for_work(phase, &phase_status_by_id) {
+            continue;
+        }
+        if let Some(step) = phase.steps.iter().find(|step| {
+            step.status == StepStatus::Pending && step_dependencies_ready(step, &step_status_by_id)
+        }) {
+            return Some(step);
+        }
+    }
+
+    None
+}
+
+fn load_plan(path: &Path) -> Result<(Plan, String)> {
+    agentrail_plan_io::load_plan(path)
+}
+
+fn save_plan(plan: &Plan, path: &Path, expected_hash: Option<&str>) -> Result<String> {
+    agentrail_plan_io::save_plan(plan, path, expected_hash)
 }
 
 pub fn handle_tool_call(tool_name: &str, args: Value) -> Result<Value> {
+    handle_tool_call_with_allowed_root(tool_name, args, None)
+}
+
+pub fn handle_tool_call_with_allowed_root(
+    tool_name: &str,
+    args: Value,
+    allowed_root: Option<&Path>,
+) -> Result<Value> {
     match tool_name {
         "orchestrate_start" => {
             let task_id = require_task_id(tool_name, &args)?;
@@ -90,6 +247,131 @@ pub fn handle_tool_call(tool_name: &str, args: Value) -> Result<Value> {
                 "tool": tool_name,
                 "task_id": task_id,
                 "status": "sent"
+            }))
+        }
+        "plan_status" => {
+            let plan_path = require_plan_path(tool_name, &args, allowed_root)?;
+            let (plan, _) = load_plan(&plan_path)?;
+            let (pending, claimed, done) = step_counts(&plan);
+            Ok(json!({
+                "tool": tool_name,
+                "operation": "status",
+                "project": plan.project,
+                "phase_count": plan.phases.len(),
+                "step_counts": {
+                    "pending": pending,
+                    "claimed": claimed,
+                    "done": done
+                }
+            }))
+        }
+        "plan_show" => {
+            let plan_path = require_plan_path(tool_name, &args, allowed_root)?;
+            let step_id = require_string_field(tool_name, &args, "step_id")?;
+            let (plan, _) = load_plan(&plan_path)?;
+            let step = find_step(&plan, step_id)
+                .ok_or_else(|| anyhow::anyhow!("step not found: {step_id}"))?;
+            Ok(json!({
+                "tool": tool_name,
+                "operation": "show",
+                "step": step
+            }))
+        }
+        "plan_next" => {
+            let plan_path = require_plan_path(tool_name, &args, allowed_root)?;
+            let (mut plan, _) = load_plan(&plan_path)?;
+            agentrail_core::recalc_lock_status(&mut plan);
+            let step = next_ready_step(&plan);
+            Ok(json!({
+                "tool": tool_name,
+                "operation": "next",
+                "step": step
+            }))
+        }
+        "plan_claim" => {
+            let plan_path = require_plan_path(tool_name, &args, allowed_root)?;
+            let step_id = require_string_field(tool_name, &args, "step_id")?;
+            let agent = require_string_field(tool_name, &args, "agent")?;
+            let (mut plan, hash) = load_plan(&plan_path)?;
+            agentrail_core::recalc_lock_status(&mut plan);
+            {
+                let (phase, step) = find_step_with_phase(&plan, step_id)
+                    .ok_or_else(|| anyhow::anyhow!("step not found: {step_id}"))?;
+                if step.status != StepStatus::Pending {
+                    anyhow::bail!(
+                        "invalid state transition: claim requires pending -> claimed, current={:?}",
+                        step.status
+                    );
+                }
+                let step_status_by_id = step_status_map(&plan);
+                let phase_status_by_id = phase_status_map(&plan);
+                if !phase_ready_for_work(phase, &phase_status_by_id)
+                    || !step_dependencies_ready(step, &step_status_by_id)
+                {
+                    anyhow::bail!("dependencies not ready: {step_id}");
+                }
+            }
+            {
+                let step = find_step_mut(&mut plan, step_id)
+                    .ok_or_else(|| anyhow::anyhow!("step not found: {step_id}"))?;
+                step.status = StepStatus::Claimed;
+                step.claimed_by = Some(agent.to_string());
+                step.evidence = None;
+            }
+            agentrail_core::recalc_lock_status(&mut plan);
+            save_plan(&plan, &plan_path, Some(&hash))?;
+            let step = find_step(&plan, step_id)
+                .ok_or_else(|| anyhow::anyhow!("step not found: {step_id}"))?;
+            Ok(json!({
+                "tool": tool_name,
+                "operation": "claim",
+                "step": step
+            }))
+        }
+        "plan_complete" => {
+            let plan_path = require_plan_path(tool_name, &args, allowed_root)?;
+            let step_id = require_string_field(tool_name, &args, "step_id")?;
+            let agent = require_string_field(tool_name, &args, "agent")?;
+            let evidence = require_string_field(tool_name, &args, "evidence")?;
+            let (mut plan, hash) = load_plan(&plan_path)?;
+            agentrail_core::recalc_lock_status(&mut plan);
+            {
+                let (phase, step) = find_step_with_phase(&plan, step_id)
+                    .ok_or_else(|| anyhow::anyhow!("step not found: {step_id}"))?;
+                if step.status != StepStatus::Claimed {
+                    anyhow::bail!(
+                        "invalid state transition: complete requires claimed -> done, current={:?}",
+                        step.status
+                    );
+                }
+                if step.claimed_by.as_deref() != Some(agent) {
+                    anyhow::bail!(
+                        "claimed_by mismatch: expected={agent} actual={:?}",
+                        step.claimed_by
+                    );
+                }
+                let step_status_by_id = step_status_map(&plan);
+                let phase_status_by_id = phase_status_map(&plan);
+                if !phase_ready_for_work(phase, &phase_status_by_id)
+                    || !step_dependencies_ready(step, &step_status_by_id)
+                {
+                    anyhow::bail!("dependencies not ready: {step_id}");
+                }
+            }
+            {
+                let step = find_step_mut(&mut plan, step_id)
+                    .ok_or_else(|| anyhow::anyhow!("step not found: {step_id}"))?;
+                step.status = StepStatus::Done;
+                step.evidence = Some(evidence.to_string());
+            }
+            agentrail_core::recalc_lock_status(&mut plan);
+            save_plan(&plan, &plan_path, Some(&hash))?;
+            let step = find_step(&plan, step_id)
+                .ok_or_else(|| anyhow::anyhow!("step not found: {step_id}"))?;
+            Ok(json!({
+                "tool": tool_name,
+                "operation": "complete",
+                "step": step
             }))
         }
         _ => {

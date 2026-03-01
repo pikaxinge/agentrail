@@ -30,6 +30,14 @@ The M6 CLI plan command slice is now implemented:
 - `claim --plan <path> --step-id <id> --agent <name>`
 - `complete --plan <path> --step-id <id> --evidence <text>`
 
+The M6 MCP plan tool slice is now implemented:
+
+- `plan_status`
+- `plan_show`
+- `plan_next`
+- `plan_claim`
+- `plan_complete`
+
 ## Quick start
 
 ```bash

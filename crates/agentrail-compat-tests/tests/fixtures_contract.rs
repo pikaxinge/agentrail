@@ -60,6 +60,31 @@ fn orchestrator_contract_fixtures_exist_and_parse() {
     assert_eq!(cli_complete["operation"], "complete");
     assert_eq!(cli_complete["step"]["status"], "done");
     assert!(cli_complete["step"]["evidence"].is_string());
+
+    let mcp_plan_status = load_fixture("mcp_plan_status.json");
+    assert_eq!(mcp_plan_status["tool"], "plan_status");
+    assert_eq!(mcp_plan_status["operation"], "status");
+    assert!(mcp_plan_status["phase_count"].is_number());
+
+    let mcp_plan_show = load_fixture("mcp_plan_show.json");
+    assert_eq!(mcp_plan_show["tool"], "plan_show");
+    assert_eq!(mcp_plan_show["operation"], "show");
+    assert!(mcp_plan_show["step"]["id"].is_string());
+
+    let mcp_plan_next = load_fixture("mcp_plan_next.json");
+    assert_eq!(mcp_plan_next["tool"], "plan_next");
+    assert_eq!(mcp_plan_next["operation"], "next");
+    assert!(mcp_plan_next["step"]["id"].is_string());
+
+    let mcp_plan_claim = load_fixture("mcp_plan_claim.json");
+    assert_eq!(mcp_plan_claim["tool"], "plan_claim");
+    assert_eq!(mcp_plan_claim["operation"], "claim");
+    assert_eq!(mcp_plan_claim["step"]["status"], "claimed");
+
+    let mcp_plan_complete = load_fixture("mcp_plan_complete.json");
+    assert_eq!(mcp_plan_complete["tool"], "plan_complete");
+    assert_eq!(mcp_plan_complete["operation"], "complete");
+    assert_eq!(mcp_plan_complete["step"]["status"], "done");
 }
 
 fn load_fixture(name: &str) -> Value {

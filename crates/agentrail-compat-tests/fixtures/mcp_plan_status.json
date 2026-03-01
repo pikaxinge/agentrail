@@ -1,0 +1,11 @@
+{
+  "tool": "plan_status",
+  "operation": "status",
+  "project": "demo",
+  "phase_count": 1,
+  "step_counts": {
+    "pending": 2,
+    "claimed": 0,
+    "done": 0
+  }
+}

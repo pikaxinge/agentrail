@@ -1,0 +1,9 @@
+{
+  "tool": "plan_claim",
+  "operation": "claim",
+  "step": {
+    "id": "step-a",
+    "status": "claimed",
+    "claimed_by": "worker-1"
+  }
+}
