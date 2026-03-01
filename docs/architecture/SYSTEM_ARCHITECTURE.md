@@ -26,6 +26,7 @@ Chat App -> Orchestrator -> agentrail MCP/CLI -> Core/Storage/Runner -> Worktree
 - Task store: transactional state for sessions, retries, and events.
 - Runner adapters: process and tmux implementations.
 - Dashboard renderer: static HTML generation.
+- Orchestration runtime: DAG scheduler + gate evaluator + retry/reassignment.
 
 ## 3. Storage strategy
 - Plan state: file-based YAML with hash compare-and-swap.
@@ -35,13 +36,23 @@ Chat App -> Orchestrator -> agentrail MCP/CLI -> Core/Storage/Runner -> Worktree
 - Code changes isolated by worktree per task.
 - Shared state guarded by transaction/CAS semantics.
 - Reader-heavy paths optimized for low overhead parsing and indexing.
+- Scheduler selects dependency-ready tasks and dispatches within concurrency budget.
 
 ## 5. Runner model
 - `ProcessRunner`: short-lived deterministic execution.
 - `TmuxRunner`: long-lived steerable sessions with attach/replay.
 - Unified control actions at trait level for adapter portability.
+- On review failures, main orchestrator resumes the original task agent first, then reassigns when retry budget is exceeded.
 
-## 6. Evolution path
+## 6. Auto-delivery control loop
+1. Ingest requirement and build task DAG.
+2. Allocate worktree and branch per runnable node.
+3. Dispatch worker subagents.
+4. Collect review and gate evidence.
+5. If failed, wake agent for targeted repair and re-validate.
+6. Merge and cleanup automatically on success.
+
+## 7. Evolution path
 1. Contract freeze and differential harness.
 2. Read-path compatibility.
 3. Write-path compatibility with CAS guarantees.
