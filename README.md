@@ -117,6 +117,8 @@ cargo run -p agentrail-cli -- serve --transport http --bind 127.0.0.1:8787
   - `cargo bench -p agentrail-orchestrator --bench scheduler_throughput`
 - Operational runbook:
   - `docs/operations/AUTO_DELIVERY_RUNBOOK.md`
+- Rolling release on every `main` push:
+  - GitHub Release tag `main-latest` (pre-release, auto-updated by CD)
 
 ## Documentation
 

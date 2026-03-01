@@ -1,0 +1,84 @@
+name: CD Main
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: cd-main-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: build-${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - macos-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build release binaries
+        run: cargo build --release -p agentrail-cli -p agentrail-mcp
+
+      - name: Package release bundle
+        run: |
+          set -euxo pipefail
+          os="$(uname -s | tr '[:upper:]' '[:lower:]')"
+          arch="$(uname -m)"
+          bundle="agentrail-${os}-${arch}"
+          mkdir -p dist/bin
+          cp target/release/agentrail dist/bin/agentrail
+          cp target/release/agentrail-mcp dist/bin/agentrail-mcp
+          tar -czf "dist/${bundle}.tar.gz" -C dist/bin agentrail agentrail-mcp
+          shasum -a 256 "dist/${bundle}.tar.gz" > "dist/${bundle}.tar.gz.sha256"
+
+      - name: Upload bundle artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: bundle-${{ runner.os }}-${{ runner.arch }}
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    name: publish-main-latest
+    runs-on: ubuntu-latest
+    needs:
+      - build
+    steps:
+      - name: Download bundle artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: bundle-*
+          path: dist
+          merge-multiple: true
+
+      - name: Publish rolling prerelease
+        uses: ncipollo/release-action@v1
+        with:
+          tag: main-latest
+          commit: ${{ github.sha }}
+          name: main-latest
+          prerelease: true
+          allowUpdates: true
+          removeArtifacts: true
+          artifacts: dist/*.tar.gz,dist/*.sha256
+          body: |
+            Automated rolling release from main.
+
+            Commit: ${{ github.sha }}
