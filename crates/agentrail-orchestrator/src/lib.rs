@@ -4,6 +4,7 @@ use agentrail_runner::{AgentRunner, TaskSpec};
 use agentrail_store::{TaskRecord, TaskRuntimeState, TaskStore};
 use anyhow::{Context, anyhow};
 use serde::{Deserialize, Serialize};
+use tracing::{error, info};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -135,8 +136,22 @@ pub async fn launch_ready_tasks<R: AgentRunner + ?Sized>(
     let ready = select_ready_nodes_from_graph(graph, execution, max_parallel);
     let mut launched: Vec<LaunchResult> = Vec::with_capacity(ready.len());
 
+    info!(
+        operation = "launch_ready_tasks",
+        outcome = "ready_selected",
+        ready_count = ready.len(),
+        max_parallel,
+        "selected ready tasks for launch"
+    );
+
     for task_id in &ready {
         if !launch_requests.contains_key(task_id) {
+            error!(
+                operation = "launch_task_prevalidate",
+                task_id = %task_id,
+                outcome = "missing_launch_request",
+                "launch request missing for ready task"
+            );
             return Err(anyhow!("missing launch request for task {task_id}"));
         }
     }
@@ -145,6 +160,14 @@ pub async fn launch_ready_tasks<R: AgentRunner + ?Sized>(
         let launch = launch_requests
             .get(&task_id)
             .ok_or_else(|| anyhow!("missing launch request for task {task_id}"))?;
+
+        info!(
+            operation = "launch_task",
+            task_id = %task_id,
+            outcome = "preparing",
+            worker_id = %launch.worker_id,
+            "preparing task launch"
+        );
 
         let existing = store
             .get_task(&task_id)
@@ -192,6 +215,15 @@ pub async fn launch_ready_tasks<R: AgentRunner + ?Sized>(
                     format!("launched before failure: {launched_ids}")
                 };
 
+                error!(
+                    operation = "launch_task",
+                    task_id = %task_id,
+                    outcome = "start_failed",
+                    error = %start_err,
+                    launched_before_failure = %context,
+                    "task launch failed"
+                );
+
                 store
                     .transition(&task_id, TaskRuntimeState::FailedRetryable)
                     .with_context(|| {
@@ -206,6 +238,14 @@ pub async fn launch_ready_tasks<R: AgentRunner + ?Sized>(
         store
             .transition(&task_id, TaskRuntimeState::Running)
             .with_context(|| format!("failed transition preparing->running for task {task_id}"))?;
+
+        info!(
+            operation = "launch_task",
+            task_id = %task_id,
+            outcome = "running",
+            session_id = %handle.session_id,
+            "task launch moved to running state"
+        );
 
         launched.push(LaunchResult {
             task_id,

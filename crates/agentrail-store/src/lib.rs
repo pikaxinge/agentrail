@@ -1,4 +1,7 @@
-use std::{collections::HashMap, sync::Mutex};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Mutex,
+};
 
 use anyhow::{Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
@@ -88,6 +91,11 @@ impl TaskRecord {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct TaskStoreSnapshot {
+    pub tasks: Vec<TaskRecord>,
+}
+
 #[derive(Debug, Default)]
 struct InMemoryRuntimeStore {
     tasks: HashMap<String, TaskRecord>,
@@ -132,6 +140,33 @@ impl TaskStore {
 
     pub fn get_task(&self, id: &str) -> Result<Option<TaskRecord>> {
         self.with_transaction(|runtime| Ok(runtime.tasks.get(id).cloned()))
+    }
+
+    pub fn export_snapshot(&self) -> Result<TaskStoreSnapshot> {
+        self.with_transaction(|runtime| {
+            let mut tasks: Vec<TaskRecord> = runtime.tasks.values().cloned().collect();
+            tasks.sort_by(|a, b| a.id.cmp(&b.id));
+            Ok(TaskStoreSnapshot { tasks })
+        })
+    }
+
+    pub fn import_snapshot(&self, snapshot: TaskStoreSnapshot) -> Result<()> {
+        self.with_transaction(move |runtime| {
+            let mut seen_ids = HashSet::with_capacity(snapshot.tasks.len());
+            for task in &snapshot.tasks {
+                if !seen_ids.insert(task.id.as_str()) {
+                    bail!("duplicate task id in snapshot: {}", task.id);
+                }
+            }
+
+            let mut imported_tasks = HashMap::with_capacity(snapshot.tasks.len());
+            for task in snapshot.tasks {
+                imported_tasks.insert(task.id.clone(), task);
+            }
+
+            runtime.tasks = imported_tasks;
+            Ok(())
+        })
     }
 
     pub fn transition(&self, id: &str, next_state: TaskRuntimeState) -> Result<TaskRecord> {

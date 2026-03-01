@@ -1,5 +1,6 @@
 use std::{
     collections::HashMap,
+    io::{self, Write},
     sync::{Arc, Mutex},
 };
 
@@ -11,6 +12,45 @@ use agentrail_runner::{AgentRunner, TaskHandle, TaskSpec, TaskStatus};
 use agentrail_store::{TaskRecord, TaskRuntimeState, TaskStore};
 use anyhow::Result;
 use async_trait::async_trait;
+use tracing_subscriber::fmt::MakeWriter;
+
+#[derive(Clone, Default)]
+struct SharedBuffer(Arc<Mutex<Vec<u8>>>);
+
+impl SharedBuffer {
+    fn into_string(&self) -> String {
+        String::from_utf8(self.0.lock().expect("lock tracing buffer").clone())
+            .expect("tracing output should be utf8")
+    }
+}
+
+struct SharedWriter(Arc<Mutex<Vec<u8>>>);
+
+impl<'a> MakeWriter<'a> for SharedBuffer {
+    type Writer = SharedWriter;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        SharedWriter(self.0.clone())
+    }
+}
+
+impl Write for SharedWriter {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.0
+            .lock()
+            .expect("lock tracing buffer")
+            .extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+fn has_field_value(logs: &str, field: &str, value: &str) -> bool {
+    logs.contains(&format!("{field}={value}")) || logs.contains(&format!("{field}=\"{value}\""))
+}
 
 struct MockRunner {
     started: Arc<Mutex<Vec<TaskSpec>>>,
@@ -374,5 +414,56 @@ async fn launch_ready_tasks_preserves_prior_launches_in_error_context_on_runner_
         started.len(),
         2,
         "runner should attempt both tasks in order"
+    );
+}
+
+#[tokio::test]
+async fn launch_ready_tasks_emits_structured_launch_trace_fields() {
+    let graph = TaskGraph {
+        nodes: vec![task("a", vec![], 5)],
+    };
+    let execution = ExecutionStateMap {
+        states: HashMap::from([("a".to_string(), ExecutionState::Queued)]),
+    };
+    let launches = HashMap::from([(
+        "a".to_string(),
+        LaunchRequest {
+            task_id: "a".to_string(),
+            worker_id: "worker-a".to_string(),
+            command: "echo".to_string(),
+            args: vec!["a".to_string()],
+            workdir: "/tmp/a".to_string(),
+            retry_budget: 3,
+        },
+    )]);
+
+    let buffer = SharedBuffer::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(buffer.clone())
+        .with_ansi(false)
+        .with_target(false)
+        .without_time()
+        .finish();
+    let _guard = tracing::subscriber::set_default(subscriber);
+
+    let runner = MockRunner::new();
+    let store = TaskStore::connect("memory://launch-tracing");
+    let launched = launch_ready_tasks(&runner, &store, &graph, &execution, &launches, 1)
+        .await
+        .expect("launch should succeed");
+    assert_eq!(launched.len(), 1);
+
+    let logs = buffer.into_string();
+    assert!(
+        has_field_value(&logs, "operation", "launch_task"),
+        "expected launch operation field in tracing output, got: {logs}"
+    );
+    assert!(
+        has_field_value(&logs, "task_id", "a"),
+        "expected task_id field in tracing output, got: {logs}"
+    );
+    assert!(
+        has_field_value(&logs, "outcome", "running"),
+        "expected outcome field in tracing output, got: {logs}"
     );
 }
