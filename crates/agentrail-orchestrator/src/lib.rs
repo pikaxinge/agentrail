@@ -61,6 +61,14 @@ pub struct GateReport {
     pub failed_optional: Vec<String>,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RepairAction {
+    WakeOriginalAgent,
+    ReassignFreshWorker,
+    EscalateNeedsAttention,
+}
+
 pub fn select_ready_nodes(
     nodes: &[TaskNode],
     states: &HashMap<String, ExecutionState>,
@@ -73,7 +81,11 @@ pub fn select_ready_nodes(
     let mut ready: Vec<&TaskNode> = nodes
         .iter()
         .filter(|node| states.get(&node.id) == Some(&ExecutionState::Queued))
-        .filter(|node| node.deps.iter().all(|dep| dependency_is_complete(dep, states)))
+        .filter(|node| {
+            node.deps
+                .iter()
+                .all(|dep| dependency_is_complete(dep, states))
+        })
         .collect();
 
     ready.sort_by(|a, b| b.priority.cmp(&a.priority).then_with(|| a.id.cmp(&b.id)));
@@ -122,6 +134,22 @@ pub fn evaluate_gate(checks: &[GateCheck]) -> GateReport {
     }
 }
 
+pub fn decide_review_failure_action(
+    retry_count: u8,
+    retry_budget: u8,
+    reassigned_once: bool,
+) -> RepairAction {
+    if retry_budget == 0 {
+        RepairAction::EscalateNeedsAttention
+    } else if retry_count < retry_budget {
+        RepairAction::WakeOriginalAgent
+    } else if reassigned_once {
+        RepairAction::EscalateNeedsAttention
+    } else {
+        RepairAction::ReassignFreshWorker
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
@@ -129,8 +157,8 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        evaluate_gate, select_ready_nodes, select_ready_nodes_from_graph, ExecutionState,
-        ExecutionStateMap, GateCheck, RunnerMode, TaskGraph, TaskNode,
+        ExecutionState, ExecutionStateMap, GateCheck, RunnerMode, TaskGraph, TaskNode,
+        evaluate_gate, select_ready_nodes, select_ready_nodes_from_graph,
     };
 
     fn task(id: &str, deps: Vec<&str>, priority: u8) -> TaskNode {
@@ -360,7 +388,10 @@ mod tests {
 
     #[test]
     fn serde_enum_wire_format_uses_snake_case() {
-        assert_eq!(serde_json::to_value(RunnerMode::Process).unwrap(), json!("process"));
+        assert_eq!(
+            serde_json::to_value(RunnerMode::Process).unwrap(),
+            json!("process")
+        );
         assert_eq!(
             serde_json::to_value(ExecutionState::ReadyToMerge).unwrap(),
             json!("ready_to_merge")
