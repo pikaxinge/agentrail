@@ -50,6 +50,12 @@ The M8 runtime store slice is now implemented:
 - WAL journal mode enforcement for file-backed stores
 - transactional write paths and atomic snapshot import
 
+The M9 dashboard/report CLI slice is now implemented:
+
+- `dashboard --plan <path> --out <path>` (writes static HTML + JSON summary)
+- `dag --plan <path>` (prints Mermaid DAG text)
+- `report --plan <path>` (prints markdown report text)
+
 ## Quick start
 
 ```bash
@@ -70,6 +76,11 @@ cargo run -p agentrail-cli -- show --plan ./plan.yaml --step-id step-a
 cargo run -p agentrail-cli -- next --plan ./plan.yaml
 cargo run -p agentrail-cli -- claim --plan ./plan.yaml --step-id step-a --agent worker-1
 cargo run -p agentrail-cli -- complete --plan ./plan.yaml --step-id step-a --evidence "tests:ok"
+
+# 2.2) Dashboard/report outputs (M9 slice)
+cargo run -p agentrail-cli -- dashboard --plan ./plan.yaml --out ./dashboard.html
+cargo run -p agentrail-cli -- dag --plan ./plan.yaml
+cargo run -p agentrail-cli -- report --plan ./plan.yaml
 
 # 3) Run MCP server
 cargo run -p agentrail-mcp -- --transport stdio

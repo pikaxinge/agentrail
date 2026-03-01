@@ -2,6 +2,7 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use serde_json::json;
 use std::collections::HashMap;
+use std::fs;
 use std::path::PathBuf;
 
 use agentrail_core::{Phase, PhaseStatus, Plan, Step, StepStatus};
@@ -47,7 +48,20 @@ enum Commands {
         #[arg(long)]
         evidence: String,
     },
-    Dashboard,
+    Dashboard {
+        #[arg(long)]
+        plan: PathBuf,
+        #[arg(long)]
+        out: PathBuf,
+    },
+    Dag {
+        #[arg(long)]
+        plan: PathBuf,
+    },
+    Report {
+        #[arg(long)]
+        plan: PathBuf,
+    },
     Orchestrate {
         #[command(subcommand)]
         command: OrchestrateCommands,
@@ -213,8 +227,36 @@ async fn main() -> Result<()> {
                 })
             );
         }
-        Commands::Dashboard => {
-            println!("dashboard: TODO (static HTML generation)");
+        Commands::Dashboard { plan, out } => {
+            let (loaded_plan, _) = agentrail_plan_io::load_plan(&plan)?;
+            let html = agentrail_dashboard::generate_dashboard(&loaded_plan);
+            fs::write(&out, html)?;
+            let summary = agentrail_dashboard::summarize(&loaded_plan);
+            println!(
+                "{}",
+                json!({
+                    "operation": "dashboard",
+                    "project": agentrail_dashboard::ascii_safe(&loaded_plan.project),
+                    "summary": {
+                        "total": summary.total,
+                        "running": summary.running,
+                        "completed": summary.completed,
+                        "failed": summary.failed,
+                        "needs_attention": summary.needs_attention
+                    }
+                })
+            );
+        }
+        Commands::Dag { plan } => {
+            let (loaded_plan, _) = agentrail_plan_io::load_plan(&plan)?;
+            println!("{}", agentrail_dashboard::render_mermaid_dag(&loaded_plan));
+        }
+        Commands::Report { plan } => {
+            let (loaded_plan, _) = agentrail_plan_io::load_plan(&plan)?;
+            println!(
+                "{}",
+                agentrail_dashboard::render_markdown_report(&loaded_plan)
+            );
         }
         Commands::Orchestrate { command } => match command {
             OrchestrateCommands::Plan { max_parallel } => {

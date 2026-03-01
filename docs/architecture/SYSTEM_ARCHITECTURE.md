@@ -10,6 +10,8 @@ Chat App -> Orchestrator -> agentrail MCP/CLI -> Core/Storage/Runner -> Worktree
 ## 2. Layers
 ### Interface layer
 - `agentrail-cli`: local and CI entrypoints.
+  - Plan control: `status/show/next/claim/complete`.
+  - Human-facing outputs: `dashboard --plan --out`, `dag --plan`, `report --plan`.
 - `agentrail-mcp`: tool-facing server endpoint.
 
 ### Application layer
@@ -25,7 +27,7 @@ Chat App -> Orchestrator -> agentrail MCP/CLI -> Core/Storage/Runner -> Worktree
 - Plan repository: YAML + CAS + atomic write.
 - Task store: transactional state for sessions, retries, and events.
 - Runner adapters: process and tmux implementations.
-- Dashboard renderer: static HTML generation.
+- Dashboard/report renderer: static HTML, Mermaid DAG text, markdown report text.
 - Orchestration runtime: DAG scheduler + gate evaluator + retry/reassignment.
 
 ## 3. Storage strategy

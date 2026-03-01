@@ -1,0 +1,11 @@
+{
+  "operation": "dashboard",
+  "project": "demo",
+  "summary": {
+    "total": 2,
+    "running": 1,
+    "completed": 0,
+    "failed": 0,
+    "needs_attention": 0
+  }
+}

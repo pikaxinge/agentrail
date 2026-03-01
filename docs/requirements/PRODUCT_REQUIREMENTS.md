@@ -31,6 +31,11 @@ Build a Rust-native orchestration control plane that enables chat-driven multi-a
 - Markdown summary output for chat channels.
 - Mermaid DAG output for dependency visibility.
 - Static HTML dashboard for deep review.
+- CLI commands for these outputs:
+  - `dashboard --plan <path> --out <path>` writes HTML and prints machine-readable JSON summary.
+  - `dag --plan <path>` prints Mermaid graph text.
+  - `report --plan <path>` prints markdown report text with `# Agentrail Report` heading.
+- Output format must remain deterministic and ASCII-safe for contract fixtures.
 
 ### FR-5 Collaboration and handoff
 - Clipboard-style short handoff notes.

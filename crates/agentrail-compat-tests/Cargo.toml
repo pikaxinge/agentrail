@@ -9,5 +9,6 @@ rust-version.workspace = true
 agentrail-core = { path = "../agentrail-core" }
 
 [dev-dependencies]
+agentrail-dashboard = { path = "../agentrail-dashboard" }
 anyhow.workspace = true
 serde_json.workspace = true
