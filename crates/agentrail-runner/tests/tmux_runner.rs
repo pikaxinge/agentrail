@@ -331,6 +331,47 @@ async fn unknown_tmux_session_returns_error() {
 }
 
 #[tokio::test]
+async fn status_can_recover_live_tmux_session_not_in_registry() {
+    if skip_if_no_tmux() {
+        return;
+    }
+
+    let session_name = format!(
+        "tmux-recover-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    );
+    let output = StdCommand::new("tmux")
+        .args([
+            "new-session",
+            "-d",
+            "-s",
+            &session_name,
+            "bash -lc 'sleep 5'",
+        ])
+        .output()
+        .expect("spawn external tmux session");
+    assert!(
+        output.status.success(),
+        "tmux new-session should succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let tmux_runner = runner();
+    let status = tmux_runner
+        .status(&session_name)
+        .await
+        .expect("status should recover externally live tmux session");
+    assert_eq!(status.state, "running");
+
+    let _ = StdCommand::new("tmux")
+        .args(["kill-session", "-t", &session_name])
+        .output();
+}
+
+#[tokio::test]
 async fn terminal_tmux_sessions_are_bounded() {
     if skip_if_no_tmux() {
         return;

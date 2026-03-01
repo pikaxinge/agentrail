@@ -170,14 +170,20 @@ fn tmux_sessions() -> &'static StdMutex<HashMap<String, Arc<TmuxSessionRecord>>>
 }
 
 fn get_tmux_session(session_id: &str) -> Result<Arc<TmuxSessionRecord>> {
-    let sessions = tmux_sessions()
-        .lock()
-        .map_err(|_| anyhow!("tmux session registry lock poisoned"))?;
+    {
+        let sessions = tmux_sessions()
+            .lock()
+            .map_err(|_| anyhow!("tmux session registry lock poisoned"))?;
+        if let Some(existing) = sessions.get(session_id).cloned() {
+            return Ok(existing);
+        }
+    }
 
-    sessions
-        .get(session_id)
-        .cloned()
-        .ok_or_else(|| anyhow!("session not found: {session_id}"))
+    if let Some(recovered) = recover_tmux_session_record(session_id)? {
+        return Ok(recovered);
+    }
+
+    Err(anyhow!("session not found: {session_id}"))
 }
 
 fn tmux_available() -> bool {
@@ -358,6 +364,68 @@ fn tmux_pane_pid(session_name: &str) -> Result<Option<u32>> {
         .trim()
         .parse::<u32>()
         .ok())
+}
+
+fn tmux_pane_current_path(session_name: &str) -> Result<Option<PathBuf>> {
+    let target = format!("{session_name}:0.0");
+    let output = run_tmux(&[
+        "display-message",
+        "-p",
+        "-t",
+        &target,
+        "#{pane_current_path}",
+    ])?;
+    if output.status.success() {
+        let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if path.is_empty() {
+            return Ok(None);
+        }
+        return Ok(Some(PathBuf::from(path)));
+    }
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if tmux_target_missing(&stderr) {
+        return Ok(None);
+    }
+
+    Err(anyhow!(
+        "tmux display-message failed for {session_name}: {}",
+        stderr.trim()
+    ))
+}
+
+fn recover_tmux_session_record(session_id: &str) -> Result<Option<Arc<TmuxSessionRecord>>> {
+    if !tmux_has_session(session_id)? {
+        return Ok(None);
+    }
+
+    let workdir = tmux_pane_current_path(session_id)?
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+    let log_dir = workdir.join(TMUX_LOG_DIR);
+    std::fs::create_dir_all(&log_dir)?;
+    let log_path = log_dir.join(format!("{session_id}.log"));
+    let exit_code_path = log_dir.join(format!("{session_id}.exit"));
+
+    let record = Arc::new(TmuxSessionRecord {
+        task_id: session_id.to_string(),
+        tmux_session: session_id.to_string(),
+        log_path,
+        exit_code_path,
+        inner: Mutex::new(TmuxSessionInner {
+            state: TmuxState::Running,
+        }),
+        sequence: SESSION_COUNTER.fetch_add(1, Ordering::Relaxed),
+        terminal: AtomicBool::new(false),
+    });
+
+    let mut sessions = tmux_sessions()
+        .lock()
+        .map_err(|_| anyhow!("tmux session registry lock poisoned"))?;
+    if let Some(existing) = sessions.get(session_id).cloned() {
+        return Ok(Some(existing));
+    }
+    sessions.insert(session_id.to_string(), Arc::clone(&record));
+    Ok(Some(record))
 }
 
 async fn append_log_line(logs: &Arc<Mutex<VecDeque<String>>>, line: String) {
