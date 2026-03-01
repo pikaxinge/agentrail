@@ -1,10 +1,14 @@
-use std::{collections::HashSet, sync::Mutex};
+use std::{
+    collections::HashSet,
+    sync::Mutex,
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 use anyhow::{Result, anyhow, bail};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
 pub enum TaskRuntimeState {
     Queued,
@@ -97,13 +101,28 @@ impl TaskRuntimeState {
     }
 }
 
+fn current_epoch_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock should be after unix epoch")
+        .as_millis() as i64
+}
+
+fn default_updated_epoch_ms() -> i64 {
+    current_epoch_ms()
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TaskRecord {
     pub id: String,
     pub assigned_worker: String,
+    #[serde(default)]
+    pub scope_id: Option<String>,
     pub state: TaskRuntimeState,
     pub retry_count: u32,
     pub retry_budget: u32,
+    #[serde(default = "default_updated_epoch_ms")]
+    pub updated_epoch_ms: i64,
 }
 
 impl TaskRecord {
@@ -115,9 +134,11 @@ impl TaskRecord {
         Self {
             id: id.into(),
             assigned_worker: assigned_worker.into(),
+            scope_id: None,
             state: TaskRuntimeState::Queued,
             retry_count: 0,
             retry_budget,
+            updated_epoch_ms: current_epoch_ms(),
         }
     }
 }
@@ -171,13 +192,43 @@ impl TaskStore {
             "CREATE TABLE IF NOT EXISTS tasks (
                 id TEXT PRIMARY KEY,
                 assigned_worker TEXT NOT NULL,
+                scope_id TEXT,
                 state TEXT NOT NULL,
                 retry_count INTEGER NOT NULL,
-                retry_budget INTEGER NOT NULL
+                retry_budget INTEGER NOT NULL,
+                updated_epoch_ms INTEGER NOT NULL DEFAULT 0
             );",
         )?;
 
+        if !Self::table_has_column(&connection, "scope_id")? {
+            connection.execute("ALTER TABLE tasks ADD COLUMN scope_id TEXT", [])?;
+        }
+        if !Self::table_has_column(&connection, "updated_epoch_ms")? {
+            connection.execute(
+                "ALTER TABLE tasks ADD COLUMN updated_epoch_ms INTEGER NOT NULL DEFAULT 0",
+                [],
+            )?;
+        }
+        connection.execute(
+            "UPDATE tasks
+             SET updated_epoch_ms = ?1
+             WHERE updated_epoch_ms <= 0",
+            params![current_epoch_ms()],
+        )?;
+
         Ok(connection)
+    }
+
+    fn table_has_column(connection: &Connection, column_name: &str) -> Result<bool> {
+        let mut statement = connection.prepare("PRAGMA table_info(tasks)")?;
+        let mut rows = statement.query([])?;
+        while let Some(row) = rows.next()? {
+            let existing: String = row.get(1)?;
+            if existing == column_name {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     fn with_connection<T>(&self, operation: impl FnOnce(&Connection) -> Result<T>) -> Result<T> {
@@ -214,9 +265,11 @@ impl TaskStore {
     fn read_task_row(row: &rusqlite::Row<'_>) -> Result<TaskRecord> {
         let id: String = row.get(0)?;
         let assigned_worker: String = row.get(1)?;
-        let state_text: String = row.get(2)?;
-        let retry_count: i64 = row.get(3)?;
-        let retry_budget: i64 = row.get(4)?;
+        let scope_id: Option<String> = row.get(2)?;
+        let state_text: String = row.get(3)?;
+        let retry_count: i64 = row.get(4)?;
+        let retry_budget: i64 = row.get(5)?;
+        let updated_epoch_ms: i64 = row.get(6)?;
 
         let state = TaskRuntimeState::from_db_str(state_text.as_str())?;
         let retry_count = u32::try_from(retry_count)
@@ -227,9 +280,11 @@ impl TaskStore {
         Ok(TaskRecord {
             id,
             assigned_worker,
+            scope_id,
             state,
             retry_count,
             retry_budget,
+            updated_epoch_ms,
         })
     }
 
@@ -248,14 +303,16 @@ impl TaskStore {
             }
 
             tx.execute(
-                "INSERT INTO tasks (id, assigned_worker, state, retry_count, retry_budget)
-                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                "INSERT INTO tasks (id, assigned_worker, scope_id, state, retry_count, retry_budget, updated_epoch_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
                 params![
                     task.id,
                     task.assigned_worker,
+                    task.scope_id,
                     task.state.as_db_str(),
                     task.retry_count,
-                    task.retry_budget
+                    task.retry_budget,
+                    task.updated_epoch_ms
                 ],
             )?;
             Ok(())
@@ -265,7 +322,7 @@ impl TaskStore {
     pub fn get_task(&self, id: &str) -> Result<Option<TaskRecord>> {
         self.with_connection(|connection| {
             let mut statement = connection.prepare(
-                "SELECT id, assigned_worker, state, retry_count, retry_budget
+                "SELECT id, assigned_worker, scope_id, state, retry_count, retry_budget, updated_epoch_ms
                  FROM tasks
                  WHERE id = ?1",
             )?;
@@ -281,7 +338,7 @@ impl TaskStore {
     pub fn export_snapshot(&self) -> Result<TaskStoreSnapshot> {
         self.with_connection(|connection| {
             let mut statement = connection.prepare(
-                "SELECT id, assigned_worker, state, retry_count, retry_budget
+                "SELECT id, assigned_worker, scope_id, state, retry_count, retry_budget, updated_epoch_ms
                  FROM tasks
                  ORDER BY id ASC",
             )?;
@@ -307,14 +364,16 @@ impl TaskStore {
 
             for task in snapshot.tasks {
                 tx.execute(
-                    "INSERT INTO tasks (id, assigned_worker, state, retry_count, retry_budget)
-                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                    "INSERT INTO tasks (id, assigned_worker, scope_id, state, retry_count, retry_budget, updated_epoch_ms)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
                     params![
                         task.id,
                         task.assigned_worker,
+                        task.scope_id,
                         task.state.as_db_str(),
                         task.retry_count,
-                        task.retry_budget
+                        task.retry_budget,
+                        task.updated_epoch_ms
                     ],
                 )?;
             }
@@ -325,7 +384,7 @@ impl TaskStore {
     pub fn transition(&self, id: &str, next_state: TaskRuntimeState) -> Result<TaskRecord> {
         self.with_transaction(|tx| {
             let mut statement = tx.prepare(
-                "SELECT id, assigned_worker, state, retry_count, retry_budget
+                "SELECT id, assigned_worker, scope_id, state, retry_count, retry_budget, updated_epoch_ms
                  FROM tasks
                  WHERE id = ?1",
             )?;
@@ -343,11 +402,13 @@ impl TaskStore {
             }
 
             task.state = next_state;
+            task.updated_epoch_ms = current_epoch_ms();
             tx.execute(
                 "UPDATE tasks
-                 SET state = ?1
-                 WHERE id = ?2",
-                params![task.state.as_db_str(), id],
+                 SET state = ?1,
+                     updated_epoch_ms = ?2
+                 WHERE id = ?3",
+                params![task.state.as_db_str(), task.updated_epoch_ms, id],
             )?;
             Ok(task.clone())
         })
@@ -356,7 +417,7 @@ impl TaskStore {
     pub fn increment_retry(&self, id: &str) -> Result<TaskRecord> {
         self.with_transaction(|tx| {
             let mut statement = tx.prepare(
-                "SELECT id, assigned_worker, state, retry_count, retry_budget
+                "SELECT id, assigned_worker, scope_id, state, retry_count, retry_budget, updated_epoch_ms
                  FROM tasks
                  WHERE id = ?1",
             )?;
@@ -378,11 +439,13 @@ impl TaskStore {
             }
 
             task.retry_count += 1;
+            task.updated_epoch_ms = current_epoch_ms();
             tx.execute(
                 "UPDATE tasks
-                 SET retry_count = ?1
-                 WHERE id = ?2",
-                params![task.retry_count, id],
+                 SET retry_count = ?1,
+                     updated_epoch_ms = ?2
+                 WHERE id = ?3",
+                params![task.retry_count, task.updated_epoch_ms, id],
             )?;
             Ok(task.clone())
         })
@@ -395,7 +458,7 @@ impl TaskStore {
     ) -> Result<TaskRecord> {
         self.with_transaction(|tx| {
             let mut statement = tx.prepare(
-                "SELECT id, assigned_worker, state, retry_count, retry_budget
+                "SELECT id, assigned_worker, scope_id, state, retry_count, retry_budget, updated_epoch_ms
                  FROM tasks
                  WHERE id = ?1",
             )?;
@@ -409,13 +472,87 @@ impl TaskStore {
             }
 
             task.assigned_worker = assigned_worker.into();
+            task.updated_epoch_ms = current_epoch_ms();
             tx.execute(
                 "UPDATE tasks
-                 SET assigned_worker = ?1
-                 WHERE id = ?2",
-                params![task.assigned_worker, id],
+                 SET assigned_worker = ?1,
+                     updated_epoch_ms = ?2
+                 WHERE id = ?3",
+                params![task.assigned_worker, task.updated_epoch_ms, id],
             )?;
             Ok(task.clone())
+        })
+    }
+
+    pub fn set_scope(&self, id: &str, scope_id: Option<String>) -> Result<TaskRecord> {
+        self.with_transaction(|tx| {
+            let mut statement = tx.prepare(
+                "SELECT id, assigned_worker, scope_id, state, retry_count, retry_budget, updated_epoch_ms
+                 FROM tasks
+                 WHERE id = ?1",
+            )?;
+            let mut rows = statement.query(params![id])?;
+            let Some(row) = rows.next()? else {
+                return Err(anyhow!("task not found: {id}"));
+            };
+            let mut task = Self::read_task_row(row)?;
+            if task.state.is_terminal() {
+                bail!("cannot update scope in terminal state: {:?}", task.state);
+            }
+
+            task.scope_id = scope_id;
+            task.updated_epoch_ms = current_epoch_ms();
+            tx.execute(
+                "UPDATE tasks
+                 SET scope_id = ?1,
+                     updated_epoch_ms = ?2
+                 WHERE id = ?3",
+                params![task.scope_id, task.updated_epoch_ms, id],
+            )?;
+            Ok(task.clone())
+        })
+    }
+
+    pub fn prune_tasks(
+        &self,
+        scope_id: Option<&str>,
+        states: &[TaskRuntimeState],
+        updated_before_epoch_ms: Option<i64>,
+    ) -> Result<Vec<String>> {
+        let state_filter = states.iter().copied().collect::<HashSet<_>>();
+        self.with_transaction(|tx| {
+            let mut statement = tx.prepare(
+                "SELECT id, assigned_worker, scope_id, state, retry_count, retry_budget, updated_epoch_ms
+                 FROM tasks
+                 ORDER BY updated_epoch_ms ASC, id ASC",
+            )?;
+            let mut rows = statement.query([])?;
+            let mut to_delete = Vec::new();
+            while let Some(row) = rows.next()? {
+                let task = Self::read_task_row(row)?;
+
+                if let Some(scope) = scope_id
+                    && task.scope_id.as_deref() != Some(scope)
+                {
+                    continue;
+                }
+                if !state_filter.is_empty() && !state_filter.contains(&task.state) {
+                    continue;
+                }
+                if let Some(cutoff) = updated_before_epoch_ms
+                    && task.updated_epoch_ms >= cutoff
+                {
+                    continue;
+                }
+
+                to_delete.push(task.id);
+            }
+
+            for task_id in &to_delete {
+                tx.execute("DELETE FROM tasks WHERE id = ?1", params![task_id])?;
+            }
+
+            Ok(to_delete)
         })
     }
 }

@@ -155,6 +155,43 @@ fn tools_list_includes_delivery_stop_and_cleanup_schemas() {
         cleanup["inputSchema"]["properties"]["retention_mode"]["enum"],
         json!(["purge", "retain"])
     );
+    assert_eq!(
+        cleanup["inputSchema"]["properties"]["scope_id"]["type"],
+        json!("string")
+    );
+    assert_eq!(
+        cleanup["inputSchema"]["properties"]["states"]["type"],
+        json!("array")
+    );
+    assert_eq!(
+        cleanup["inputSchema"]["properties"]["updated_before_epoch_ms"]["type"],
+        json!("integer")
+    );
+
+    let report = tools
+        .iter()
+        .find(|t| t["name"] == "delivery_report")
+        .expect("delivery_report descriptor should exist");
+    assert_eq!(
+        report["inputSchema"]["properties"]["scope_id"]["type"],
+        json!("string")
+    );
+    assert_eq!(
+        report["inputSchema"]["properties"]["states"]["type"],
+        json!("array")
+    );
+    assert_eq!(
+        report["inputSchema"]["properties"]["updated_since_epoch_ms"]["type"],
+        json!("integer")
+    );
+    assert_eq!(
+        report["inputSchema"]["properties"]["limit"]["type"],
+        json!("integer")
+    );
+    assert_eq!(
+        report["inputSchema"]["properties"]["cursor"]["type"],
+        json!("string")
+    );
 }
 
 #[test]

@@ -153,3 +153,73 @@ fn reassign_rejects_terminal_state() {
         "expected terminal-state error, got: {err}"
     );
 }
+
+#[test]
+fn prune_tasks_respects_scope_state_and_cutoff() {
+    let store = TaskStore::connect("memory://runtime-prune");
+
+    let mut old_ready = TaskRecord::new("task-prune-old-ready", "worker-a", 2);
+    old_ready.scope_id = Some("scope-a".to_string());
+    old_ready.state = TaskRuntimeState::ReadyToMerge;
+    old_ready.updated_epoch_ms = 100;
+
+    let mut new_ready = TaskRecord::new("task-prune-new-ready", "worker-a", 2);
+    new_ready.scope_id = Some("scope-a".to_string());
+    new_ready.state = TaskRuntimeState::ReadyToMerge;
+    new_ready.updated_epoch_ms = 300;
+
+    let mut old_running = TaskRecord::new("task-prune-old-running", "worker-a", 2);
+    old_running.scope_id = Some("scope-a".to_string());
+    old_running.state = TaskRuntimeState::Running;
+    old_running.updated_epoch_ms = 50;
+
+    let mut old_other_scope = TaskRecord::new("task-prune-old-other-scope", "worker-a", 2);
+    old_other_scope.scope_id = Some("scope-b".to_string());
+    old_other_scope.state = TaskRuntimeState::ReadyToMerge;
+    old_other_scope.updated_epoch_ms = 25;
+
+    store.upsert_task(&old_ready).expect("seed old_ready");
+    store.upsert_task(&new_ready).expect("seed new_ready");
+    store.upsert_task(&old_running).expect("seed old_running");
+    store
+        .upsert_task(&old_other_scope)
+        .expect("seed old_other_scope");
+
+    let deleted = store
+        .prune_tasks(
+            Some("scope-a"),
+            &[TaskRuntimeState::ReadyToMerge],
+            Some(250),
+        )
+        .expect("prune should succeed");
+
+    assert_eq!(deleted, vec!["task-prune-old-ready".to_string()]);
+    assert!(
+        store
+            .get_task("task-prune-old-ready")
+            .expect("get old_ready")
+            .is_none(),
+        "old ready task should be pruned"
+    );
+    assert!(
+        store
+            .get_task("task-prune-new-ready")
+            .expect("get new_ready")
+            .is_some(),
+        "new ready task should be retained"
+    );
+    assert!(
+        store
+            .get_task("task-prune-old-running")
+            .expect("get old_running")
+            .is_some(),
+        "running task should be retained by state filter"
+    );
+    assert!(
+        store
+            .get_task("task-prune-old-other-scope")
+            .expect("get old_other_scope")
+            .is_some(),
+        "other scope task should be retained by scope filter"
+    );
+}

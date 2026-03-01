@@ -282,6 +282,23 @@ fn emit_delivery_status_events(
     Ok(())
 }
 
+fn runtime_state_from_label(label: &str) -> Result<TaskRuntimeState> {
+    match label {
+        "queued" => Ok(TaskRuntimeState::Queued),
+        "preparing" => Ok(TaskRuntimeState::Preparing),
+        "running" => Ok(TaskRuntimeState::Running),
+        "review_failed" => Ok(TaskRuntimeState::ReviewFailed),
+        "fixing" => Ok(TaskRuntimeState::Fixing),
+        "validating" => Ok(TaskRuntimeState::Validating),
+        "ready_to_merge" => Ok(TaskRuntimeState::ReadyToMerge),
+        "merged" => Ok(TaskRuntimeState::Merged),
+        "failed_retryable" => Ok(TaskRuntimeState::FailedRetryable),
+        "failed_terminal" => Ok(TaskRuntimeState::FailedTerminal),
+        "needs_attention" => Ok(TaskRuntimeState::NeedsAttention),
+        _ => anyhow::bail!("invalid runtime state label: {label}"),
+    }
+}
+
 fn optional_string(args: &Value, field: &str) -> Option<String> {
     args.get(field)
         .and_then(Value::as_str)
@@ -340,6 +357,31 @@ fn optional_bool(args: &Value, field: &str, default: bool) -> Result<bool> {
             .as_bool()
             .ok_or_else(|| anyhow::anyhow!("invalid {field}: must be boolean")),
     }
+}
+
+fn optional_u64(args: &Value, field: &str) -> Result<Option<u64>> {
+    let Some(value) = args.get(field) else {
+        return Ok(None);
+    };
+    let raw = value
+        .as_u64()
+        .ok_or_else(|| anyhow::anyhow!("invalid {field}: must be unsigned integer"))?;
+    Ok(Some(raw))
+}
+
+fn optional_i64(args: &Value, field: &str) -> Result<Option<i64>> {
+    let Some(value) = args.get(field) else {
+        return Ok(None);
+    };
+    if let Some(raw) = value.as_i64() {
+        return Ok(Some(raw));
+    }
+    if let Some(raw) = value.as_u64() {
+        return Ok(Some(i64::try_from(raw).map_err(|_| {
+            anyhow::anyhow!("invalid {field}: out of range for i64")
+        })?));
+    }
+    anyhow::bail!("invalid {field}: must be integer");
 }
 
 fn optional_string_array(args: &Value, field: &str) -> Result<Vec<String>> {
@@ -403,6 +445,38 @@ fn delivery_status_normalized_v1(orchestration: &Value, tail: u32) -> Value {
             "tail": tail,
             "truncated": delivery_logs_truncated(orchestration, tail)
         }
+    })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ReportCursor {
+    updated_epoch_ms: i64,
+    task_id: String,
+}
+
+fn encode_report_cursor(cursor: &ReportCursor) -> String {
+    json!({
+        "updated_epoch_ms": cursor.updated_epoch_ms,
+        "task_id": cursor.task_id
+    })
+    .to_string()
+}
+
+fn decode_report_cursor(raw: &str) -> Result<ReportCursor> {
+    let parsed: Value = serde_json::from_str(raw)
+        .map_err(|error| anyhow::anyhow!("invalid cursor: expected JSON object ({error})"))?;
+    let updated_epoch_ms = parsed
+        .get("updated_epoch_ms")
+        .and_then(Value::as_i64)
+        .ok_or_else(|| anyhow::anyhow!("invalid cursor: missing updated_epoch_ms"))?;
+    let task_id = parsed
+        .get("task_id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("invalid cursor: missing task_id"))?
+        .to_string();
+    Ok(ReportCursor {
+        updated_epoch_ms,
+        task_id,
     })
 }
 
@@ -540,14 +614,19 @@ fn clear_runtime_session(task_id: &str) -> Result<()> {
     Ok(())
 }
 
-fn ensure_task_preparing(task_id: &str, worker_id: &str, retry_budget: u32) -> Result<()> {
+fn ensure_task_preparing(
+    task_id: &str,
+    worker_id: &str,
+    retry_budget: u32,
+    scope_id: Option<&str>,
+) -> Result<()> {
     let mut runtime = runtime_state_mutex()?;
 
     match runtime.store.get_task(task_id)? {
         None => {
-            runtime
-                .store
-                .upsert_task(&TaskRecord::new(task_id, worker_id, retry_budget))?;
+            let mut task = TaskRecord::new(task_id, worker_id, retry_budget);
+            task.scope_id = scope_id.map(ToString::to_string);
+            runtime.store.upsert_task(&task)?;
         }
         Some(existing) => match existing.state {
             TaskRuntimeState::Preparing | TaskRuntimeState::Running => {
@@ -557,11 +636,21 @@ fn ensure_task_preparing(task_id: &str, worker_id: &str, retry_budget: u32) -> R
                 runtime
                     .store
                     .reassign_worker(task_id, worker_id.to_string())?;
+                if let Some(scope_id) = scope_id {
+                    runtime
+                        .store
+                        .set_scope(task_id, Some(scope_id.to_string()))?;
+                }
             }
             TaskRuntimeState::FailedRetryable | TaskRuntimeState::NeedsAttention => {
                 runtime
                     .store
                     .reassign_worker(task_id, worker_id.to_string())?;
+                if let Some(scope_id) = scope_id {
+                    runtime
+                        .store
+                        .set_scope(task_id, Some(scope_id.to_string()))?;
+                }
                 runtime
                     .store
                     .transition(task_id, TaskRuntimeState::Queued)?;
@@ -640,12 +729,13 @@ fn register_running_session(
 async fn orchestrate_start_runtime(args: Value) -> Result<Value> {
     let task_id = require_task_id("orchestrate_start", &args)?.to_string();
     let worker_id = optional_string(&args, "worker_id").unwrap_or_else(|| "worker-default".into());
+    let scope_id = optional_string(&args, "scope_id");
     let retry_budget = optional_u32(&args, "retry_budget", 3)?;
     let runner_mode = RuntimeRunnerMode::parse(args.get("runner_mode").and_then(Value::as_str))?;
     let (command, command_args) = resolve_start_command_and_args(&args)?;
     let workdir = optional_string(&args, "workdir").unwrap_or_else(|| ".".to_string());
 
-    ensure_task_preparing(&task_id, &worker_id, retry_budget)?;
+    ensure_task_preparing(&task_id, &worker_id, retry_budget, scope_id.as_deref())?;
 
     let spec = TaskSpec {
         id: task_id.clone(),
@@ -831,9 +921,7 @@ async fn orchestrate_steer_runtime(args: Value) -> Result<Value> {
 }
 
 fn runtime_cleanup_targets(task_id_filter: Option<&str>) -> Result<Vec<RuntimeCleanupTarget>> {
-    let runtime = runtime_state()
-        .lock()
-        .map_err(|_| anyhow::anyhow!("runtime state lock poisoned"))?;
+    let runtime = runtime_state_mutex()?;
 
     if let Some(task_id) = task_id_filter {
         return Ok(vec![RuntimeCleanupTarget {
@@ -873,9 +961,7 @@ fn purge_runtime_tasks(task_ids: &HashSet<String>) -> Result<usize> {
         return Ok(0);
     }
 
-    let mut runtime = runtime_state()
-        .lock()
-        .map_err(|_| anyhow::anyhow!("runtime state lock poisoned"))?;
+    let mut runtime = runtime_state_mutex()?;
     let snapshot = runtime.store.export_snapshot()?;
     let before = snapshot.tasks.len();
     let retained = snapshot
@@ -889,6 +975,7 @@ fn purge_runtime_tasks(task_ids: &HashSet<String>) -> Result<usize> {
         .import_snapshot(TaskStoreSnapshot { tasks: retained })?;
     for task_id in task_ids {
         runtime.sessions.remove(task_id);
+        reset_delivery_tracking(&mut runtime, task_id);
     }
     Ok(removed)
 }
@@ -898,9 +985,7 @@ async fn delivery_stop_runtime(args: Value) -> Result<Value> {
     let reason = optional_string(&args, "reason");
 
     let (session, record_before) = {
-        let runtime = runtime_state()
-            .lock()
-            .map_err(|_| anyhow::anyhow!("runtime state lock poisoned"))?;
+        let runtime = runtime_state_mutex()?;
         (
             runtime.sessions.get(&task_id).cloned(),
             runtime.store.get_task(&task_id)?,
@@ -926,9 +1011,7 @@ async fn delivery_stop_runtime(args: Value) -> Result<Value> {
     }
 
     let runtime_state = {
-        let runtime = runtime_state()
-            .lock()
-            .map_err(|_| anyhow::anyhow!("runtime state lock poisoned"))?;
+        let runtime = runtime_state_mutex()?;
         if let Some(task) = runtime.store.get_task(&task_id)? {
             if active_or_session
                 && task.state != TaskRuntimeState::FailedRetryable
@@ -957,7 +1040,196 @@ async fn delivery_stop_runtime(args: Value) -> Result<Value> {
     }))
 }
 
+fn runtime_summary_template(total: usize) -> Value {
+    json!({
+        "total": total,
+        "queued": 0,
+        "preparing": 0,
+        "running": 0,
+        "review_failed": 0,
+        "fixing": 0,
+        "validating": 0,
+        "ready_to_merge": 0,
+        "merged": 0,
+        "failed_retryable": 0,
+        "failed_terminal": 0,
+        "needs_attention": 0
+    })
+}
+
+fn build_runtime_summary(tasks: &[TaskRecord]) -> Value {
+    let mut summary = runtime_summary_template(tasks.len());
+    for task in tasks {
+        let key = runtime_state_label(task.state);
+        if let Some(slot) = summary.get_mut(key)
+            && let Some(raw) = slot.as_u64()
+        {
+            *slot = json!(raw + 1);
+        }
+    }
+    summary
+}
+
+fn task_is_after_cursor(task: &TaskRecord, cursor: &ReportCursor) -> bool {
+    task.updated_epoch_ms < cursor.updated_epoch_ms
+        || (task.updated_epoch_ms == cursor.updated_epoch_ms && task.id > cursor.task_id)
+}
+
+fn runtime_report(args: &Value) -> Result<Value> {
+    let scope_id = optional_string(args, "scope_id");
+    let state_labels = optional_string_array(args, "states")?;
+    let mut state_filter = HashSet::new();
+    for label in &state_labels {
+        runtime_state_from_label(label)?;
+        state_filter.insert(label.clone());
+    }
+
+    let updated_since_epoch_ms = optional_i64(args, "updated_since_epoch_ms")?;
+    if let Some(updated_since_epoch_ms) = updated_since_epoch_ms
+        && updated_since_epoch_ms < 0
+    {
+        anyhow::bail!("invalid updated_since_epoch_ms: must be non-negative");
+    }
+
+    let limit = optional_u64(args, "limit")?
+        .map(|raw| usize::try_from(raw).map_err(|_| anyhow::anyhow!("invalid limit: out of range")))
+        .transpose()?;
+    if let Some(limit) = limit
+        && limit == 0
+    {
+        anyhow::bail!("invalid limit: must be >= 1");
+    }
+
+    let cursor = optional_string(args, "cursor")
+        .map(|raw| decode_report_cursor(raw.as_str()))
+        .transpose()?;
+
+    let runtime = runtime_state_mutex()?;
+    let snapshot = runtime.store.export_snapshot()?;
+
+    let uses_report_query = scope_id.is_some()
+        || !state_filter.is_empty()
+        || updated_since_epoch_ms.is_some()
+        || limit.is_some()
+        || cursor.is_some();
+
+    let mut filtered = snapshot
+        .tasks
+        .into_iter()
+        .filter(|task| {
+            if let Some(scope_id) = scope_id.as_deref()
+                && task.scope_id.as_deref() != Some(scope_id)
+            {
+                return false;
+            }
+            if !state_filter.is_empty() && !state_filter.contains(runtime_state_label(task.state)) {
+                return false;
+            }
+            if let Some(updated_since_epoch_ms) = updated_since_epoch_ms
+                && task.updated_epoch_ms < updated_since_epoch_ms
+            {
+                return false;
+            }
+            true
+        })
+        .collect::<Vec<_>>();
+
+    if uses_report_query {
+        filtered.sort_by(|left, right| {
+            right
+                .updated_epoch_ms
+                .cmp(&left.updated_epoch_ms)
+                .then_with(|| left.id.cmp(&right.id))
+        });
+    }
+
+    let summary = build_runtime_summary(&filtered);
+
+    if let Some(cursor) = cursor {
+        filtered.retain(|task| task_is_after_cursor(task, &cursor));
+    }
+
+    let mut next_cursor = None;
+    if let Some(limit) = limit
+        && filtered.len() > limit
+    {
+        let last_task = &filtered[limit - 1];
+        next_cursor = Some(encode_report_cursor(&ReportCursor {
+            updated_epoch_ms: last_task.updated_epoch_ms,
+            task_id: last_task.id.clone(),
+        }));
+        filtered.truncate(limit);
+    }
+
+    let tasks = filtered
+        .iter()
+        .map(|task| {
+            json!({
+                "task_id": task.id,
+                "scope_id": task.scope_id,
+                "state": runtime_state_label(task.state),
+                "updated_epoch_ms": task.updated_epoch_ms,
+                "assigned_worker": task.assigned_worker,
+                "retry_count": task.retry_count,
+                "retry_budget": task.retry_budget
+            })
+        })
+        .collect::<Vec<_>>();
+
+    Ok(json!({
+        "tool": "delivery_report",
+        "scope_id": scope_id,
+        "summary": summary,
+        "tasks": tasks,
+        "next_cursor": next_cursor
+    }))
+}
+
 async fn delivery_cleanup_runtime(args: Value) -> Result<Value> {
+    let has_prune_filters = args.get("scope_id").is_some()
+        || args.get("states").is_some()
+        || args.get("updated_before_epoch_ms").is_some();
+
+    if has_prune_filters {
+        let scope_id = optional_string(&args, "scope_id");
+        let state_labels = optional_string_array(&args, "states")?;
+        let mut states = Vec::new();
+        for label in &state_labels {
+            states.push(runtime_state_from_label(label)?);
+        }
+
+        let updated_before_epoch_ms = optional_i64(&args, "updated_before_epoch_ms")?
+            .ok_or_else(|| anyhow::anyhow!("missing updated_before_epoch_ms"))?;
+        if updated_before_epoch_ms < 0 {
+            anyhow::bail!("invalid updated_before_epoch_ms: must be non-negative");
+        }
+
+        let mut runtime = runtime_state_mutex()?;
+        let deleted_task_ids =
+            runtime
+                .store
+                .prune_tasks(scope_id.as_deref(), &states, Some(updated_before_epoch_ms))?;
+        for task_id in &deleted_task_ids {
+            runtime.sessions.remove(task_id);
+            reset_delivery_tracking(&mut runtime, task_id);
+        }
+
+        let deleted_count = deleted_task_ids.len();
+        return Ok(json!({
+            "tool": "delivery_cleanup",
+            "status": "ok",
+            "mode": "retention_prune",
+            "scope_id": scope_id,
+            "states": state_labels,
+            "updated_before_epoch_ms": updated_before_epoch_ms,
+            "deleted_count": deleted_count,
+            "deleted_task_ids": deleted_task_ids,
+            "cleaned_count": deleted_count,
+            "retained_count": 0,
+            "skipped_count": 0
+        }));
+    }
+
     let task_id_filter = optional_string(&args, "task_id");
     let force = optional_bool(&args, "force", false)?;
     let retention_mode =
@@ -1037,9 +1309,7 @@ async fn delivery_cleanup_runtime(args: Value) -> Result<Value> {
             CleanupRetentionMode::Retain => {
                 if force && let Some(current) = record_state {
                     if can_transition_to_failed_terminal(current) {
-                        let runtime = runtime_state()
-                            .lock()
-                            .map_err(|_| anyhow::anyhow!("runtime state lock poisoned"))?;
+                        let runtime = runtime_state_mutex()?;
                         let _ = runtime
                             .store
                             .transition(&target.task_id, TaskRuntimeState::FailedTerminal)?;
@@ -1059,65 +1329,22 @@ async fn delivery_cleanup_runtime(args: Value) -> Result<Value> {
     if !purged_task_ids.is_empty() {
         cleaned_count = purge_runtime_tasks(&purged_task_ids)?;
     }
+    let mut deleted_task_ids = purged_task_ids.into_iter().collect::<Vec<_>>();
+    deleted_task_ids.sort_unstable();
+    let deleted_count = deleted_task_ids.len();
 
     Ok(json!({
         "tool": "delivery_cleanup",
         "status": "ok",
+        "mode": "lifecycle",
         "force": force,
         "retention_mode": retention_mode.as_str(),
         "cleaned_count": cleaned_count,
         "retained_count": retained_count,
         "skipped_count": skipped_count,
-        "tasks": task_results
-    }))
-}
-
-fn runtime_report() -> Result<Value> {
-    let runtime = runtime_state_mutex()?;
-    let snapshot = runtime.store.export_snapshot()?;
-
-    let mut summary = json!({
-        "total": snapshot.tasks.len(),
-        "queued": 0,
-        "preparing": 0,
-        "running": 0,
-        "review_failed": 0,
-        "fixing": 0,
-        "validating": 0,
-        "ready_to_merge": 0,
-        "merged": 0,
-        "failed_retryable": 0,
-        "failed_terminal": 0,
-        "needs_attention": 0
-    });
-
-    for task in &snapshot.tasks {
-        let key = runtime_state_label(task.state);
-        if let Some(slot) = summary.get_mut(key)
-            && let Some(raw) = slot.as_u64()
-        {
-            *slot = json!(raw + 1);
-        }
-    }
-
-    let tasks = snapshot
-        .tasks
-        .iter()
-        .map(|task| {
-            json!({
-                "task_id": task.id,
-                "state": runtime_state_label(task.state),
-                "assigned_worker": task.assigned_worker,
-                "retry_count": task.retry_count,
-                "retry_budget": task.retry_budget
-            })
-        })
-        .collect::<Vec<_>>();
-
-    Ok(json!({
-        "tool": "delivery_report",
-        "summary": summary,
-        "tasks": tasks
+        "tasks": task_results,
+        "deleted_count": deleted_count,
+        "deleted_task_ids": deleted_task_ids
     }))
 }
 
@@ -1619,6 +1846,7 @@ fn mcp_tools_descriptor() -> Value {
                 "type":"object",
                 "properties": {
                     "task_id": {"type":"string"},
+                    "scope_id": {"type":"string"},
                     "worker_id": {"type":"string"},
                     "runner_mode": {"type":"string", "enum": ["process", "tmux"]},
                     "command": {"type":"string"},
@@ -1663,6 +1891,7 @@ fn mcp_tools_descriptor() -> Value {
                 "type":"object",
                 "properties": {
                     "task_id": {"type":"string"},
+                    "scope_id": {"type":"string"},
                     "worker_id": {"type":"string"},
                     "runner_mode": {"type":"string", "enum": ["process", "tmux"]},
                     "command": {"type":"string"},
@@ -1714,13 +1943,19 @@ fn mcp_tools_descriptor() -> Value {
         },
         {
             "name":"delivery_cleanup",
-            "description":"Cleanup finished or abandoned runtime tasks with optional retention",
+            "description":"Lifecycle cleanup with stop/retain controls, plus optional scoped retention pruning filters",
             "inputSchema": {
                 "type":"object",
                 "properties": {
                     "task_id": {"type":"string"},
                     "force": {"type":"boolean"},
-                    "retention_mode": {"type":"string", "enum": ["purge", "retain"]}
+                    "retention_mode": {"type":"string", "enum": ["purge", "retain"]},
+                    "scope_id": {"type":"string"},
+                    "states": {
+                        "type":"array",
+                        "items": {"type":"string"}
+                    },
+                    "updated_before_epoch_ms": {"type":"integer"}
                 }
             }
         },
@@ -1767,9 +2002,19 @@ fn mcp_tools_descriptor() -> Value {
             "description":"Return aggregated runtime report for all tracked tasks",
             "inputSchema": {
                 "type":"object",
-                "properties": {}
+                "properties": {
+                    "scope_id": {"type":"string"},
+                    "states": {
+                        "type":"array",
+                        "items": {"type":"string"}
+                    },
+                    "updated_since_epoch_ms": {"type":"integer"},
+                    "limit": {"type":"integer"},
+                    "cursor": {"type":"string"}
+                }
             }
-        }
+        },
+        
     ])
 }
 
@@ -1926,7 +2171,7 @@ pub fn handle_tool_call_with_allowed_root(
         "delivery_events_ack" => delivery_events_ack(args),
         "delivery_stop" => block_on_result(delivery_stop_runtime(args)),
         "delivery_cleanup" => block_on_result(delivery_cleanup_runtime(args)),
-        "delivery_report" => runtime_report(),
+        "delivery_report" => runtime_report(&args),
         "plan_status" => {
             let plan_path = require_plan_path(tool_name, &args, allowed_root)?;
             let (plan, _) = load_plan(&plan_path)?;
