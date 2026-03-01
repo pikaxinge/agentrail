@@ -397,6 +397,60 @@ fn delivery_submit_status_and_report_are_available() {
 }
 
 #[test]
+fn delivery_submit_rejects_steer_required_with_process_runner() {
+    let tmp = tempdir().expect("tempdir");
+    let task_id = unique_task_id("task-delivery-steer-required-process");
+
+    let err = handle_tool_call(
+        "delivery_submit",
+        json!({
+            "task_id": task_id,
+            "worker_id": "worker-a",
+            "runner_mode": "process",
+            "steer_required": true,
+            "interactive_command": true,
+            "command": "bash",
+            "args": ["-lc", "echo should-not-run"],
+            "workdir": tmp.path().display().to_string()
+        }),
+    )
+    .expect_err("delivery_submit should reject steer_required with process runner");
+
+    assert!(
+        err.to_string()
+            .contains("steer_required=true requires runner_mode=tmux"),
+        "expected runner_mode validation error, got: {err}"
+    );
+}
+
+#[test]
+fn delivery_submit_rejects_steer_required_without_interactive_command() {
+    let tmp = tempdir().expect("tempdir");
+    let task_id = unique_task_id("task-delivery-steer-required-noninteractive");
+
+    let err = handle_tool_call(
+        "delivery_submit",
+        json!({
+            "task_id": task_id,
+            "worker_id": "worker-a",
+            "runner_mode": "tmux",
+            "steer_required": true,
+            "interactive_command": false,
+            "command": "bash",
+            "args": ["-lc", "echo should-not-run"],
+            "workdir": tmp.path().display().to_string()
+        }),
+    )
+    .expect_err("delivery_submit should reject steer_required without interactive_command");
+
+    assert!(
+        err.to_string()
+            .contains("steer_required=true requires interactive_command=true"),
+        "expected interactive_command validation error, got: {err}"
+    );
+}
+
+#[test]
 fn delivery_status_normalized_envelope_uses_deterministic_nulls_when_runtime_data_missing() {
     let task_id = unique_task_id("task-delivery-missing");
 
