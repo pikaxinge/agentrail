@@ -831,6 +831,14 @@ fn clear_runtime_session(task_id: &str) -> Result<()> {
     Ok(())
 }
 
+fn finalize_runtime_session(session_id: &str, terminal_state: &str) -> Result<()> {
+    let runtime = runtime_state_mutex()?;
+    runtime
+        .store
+        .finalize_task_session(session_id, terminal_state)?;
+    Ok(())
+}
+
 fn ensure_task_preparing(
     task_id: &str,
     worker_id: &str,
@@ -936,6 +944,9 @@ fn register_running_session(
             runner_mode,
         },
     );
+    runtime
+        .store
+        .register_task_attempt(task_id, &session_id, runner_mode.as_str())?;
     let task = runtime
         .store
         .get_task(task_id)?
@@ -1018,6 +1029,10 @@ async fn task_runtime_status(task_id: &str, tail: usize) -> Result<Value> {
 
     if runtime_state_is_terminal(record.state) {
         if session.is_some() {
+            if let Some(active) = session.as_ref() {
+                let _ =
+                    finalize_runtime_session(&active.session_id, runtime_state_label(record.state));
+            }
             let _ = clear_runtime_session(task_id);
         }
         return Ok(json!({
@@ -1100,6 +1115,7 @@ async fn task_runtime_status(task_id: &str, tail: usize) -> Result<Value> {
     };
 
     if runner_state_is_terminal(&status.state) || runtime_state_is_terminal(latest.state) {
+        let _ = finalize_runtime_session(&session.session_id, &status.state);
         let _ = clear_runtime_session(task_id);
     }
 
@@ -1268,6 +1284,7 @@ async fn delivery_stop_runtime(args: Value) -> Result<Value> {
             Err(error) if is_session_not_found_error(&error) => {}
             Err(error) => return Err(error),
         }
+        let _ = finalize_runtime_session(&active_session.session_id, "stopped");
         let _ = clear_runtime_session(&task_id);
     }
 
@@ -3039,6 +3056,7 @@ mod tests {
 
     #[test]
     fn handle_tool_call_emits_structured_trace_fields_for_success() {
+        let task_id = unique_test_task_id("task-trace-success");
         let buffer = SharedBuffer::default();
         let subscriber = tracing_subscriber::fmt()
             .with_writer(buffer.clone())
@@ -3048,7 +3066,7 @@ mod tests {
             .finish();
         let _guard = tracing::subscriber::set_default(subscriber);
 
-        let response = handle_tool_call("orchestrate_start", json!({ "task_id": "task-123" }))
+        let response = handle_tool_call("orchestrate_start", json!({ "task_id": task_id }))
             .expect("tool call should succeed");
         assert_eq!(response["status"], "accepted");
 
@@ -3062,7 +3080,7 @@ mod tests {
             "expected tool field in tracing output, got: {logs}"
         );
         assert!(
-            has_field_value(&logs, "task_id", "task-123"),
+            has_field_value(&logs, "task_id", &task_id),
             "expected task_id field in tracing output, got: {logs}"
         );
         assert!(

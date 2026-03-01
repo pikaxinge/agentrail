@@ -125,3 +125,37 @@ fn unsupported_dsn_surfaces_runtime_error_instead_of_silent_memory_fallback() {
         .expect_err("unsupported dsn should not silently fallback");
     assert!(err.to_string().contains("unsupported task store dsn"));
 }
+
+#[test]
+fn sqlite_store_persists_attempts_and_sessions_across_reconnect() {
+    let tmp = tempdir().expect("tempdir");
+    let db_path = tmp.path().join("runtime.db");
+    let dsn = sqlite_dsn(&db_path);
+
+    let store = TaskStore::connect(dsn.clone());
+    let attempt = store
+        .register_task_attempt("task-with-attempts", "session-1", "process")
+        .expect("attempt insert should succeed");
+    assert_eq!(attempt.attempt_number, 1);
+    store
+        .finalize_task_session("session-1", "completed")
+        .expect("session finalize should succeed");
+    drop(store);
+
+    let reopened = TaskStore::connect(dsn);
+    let attempts = reopened
+        .list_task_attempts("task-with-attempts")
+        .expect("attempt query should succeed");
+    assert_eq!(attempts.len(), 1);
+    assert_eq!(attempts[0].session_id, "session-1");
+    assert_eq!(attempts[0].terminal_state.as_deref(), Some("completed"));
+    assert!(attempts[0].ended_epoch_ms.is_some());
+
+    let sessions = reopened
+        .list_task_sessions("task-with-attempts")
+        .expect("session query should succeed");
+    assert_eq!(sessions.len(), 1);
+    assert_eq!(sessions[0].session_id, "session-1");
+    assert_eq!(sessions[0].terminal_state.as_deref(), Some("completed"));
+    assert!(sessions[0].ended_epoch_ms.is_some());
+}
