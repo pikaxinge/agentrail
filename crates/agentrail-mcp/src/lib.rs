@@ -7,7 +7,7 @@ use axum::{
     routing::{get, post},
 };
 use serde_json::{Value, json};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::future::Future;
 use std::path::{Path, PathBuf};
@@ -21,7 +21,7 @@ use tracing::{info, warn};
 
 use agentrail_core::{Phase, PhaseStatus, Plan, Step, StepStatus};
 use agentrail_runner::{AgentRunner, ProcessRunner, TaskHandle, TaskSpec, TaskStatus, TmuxRunner};
-use agentrail_store::{TaskRecord, TaskRuntimeState, TaskStore};
+use agentrail_store::{TaskRecord, TaskRuntimeState, TaskStore, TaskStoreSnapshot};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RuntimeRunnerMode {
@@ -42,6 +42,29 @@ impl RuntimeRunnerMode {
         match self {
             Self::Process => "process",
             Self::Tmux => "tmux",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CleanupRetentionMode {
+    Purge,
+    Retain,
+}
+
+impl CleanupRetentionMode {
+    fn parse(raw: Option<&str>) -> Result<Self> {
+        match raw.unwrap_or("purge") {
+            "purge" => Ok(Self::Purge),
+            "retain" => Ok(Self::Retain),
+            other => anyhow::bail!("unsupported retention_mode: {other}"),
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Purge => "purge",
+            Self::Retain => "retain",
         }
     }
 }
@@ -107,6 +130,13 @@ struct RuntimeState {
     delivery_subscriptions: HashMap<String, DeliverySubscription>,
     last_event_signature_by_task: HashMap<String, DeliveryEventSignature>,
     last_status_observation_by_task: HashMap<String, DeliveryStatusObservation>,
+}
+
+#[derive(Debug, Clone)]
+struct RuntimeCleanupTarget {
+    task_id: String,
+    record: Option<TaskRecord>,
+    session: Option<RuntimeTaskSession>,
 }
 
 static RUNTIME_STATE: OnceLock<Mutex<RuntimeState>> = OnceLock::new();
@@ -303,6 +333,15 @@ fn optional_u32(args: &Value, field: &str, default: u32) -> Result<u32> {
     }
 }
 
+fn optional_bool(args: &Value, field: &str, default: bool) -> Result<bool> {
+    match args.get(field) {
+        None => Ok(default),
+        Some(value) => value
+            .as_bool()
+            .ok_or_else(|| anyhow::anyhow!("invalid {field}: must be boolean")),
+    }
+}
+
 fn optional_string_array(args: &Value, field: &str) -> Result<Vec<String>> {
     let Some(value) = args.get(field) else {
         return Ok(Vec::new());
@@ -419,6 +458,13 @@ async fn runner_logs(mode: RuntimeRunnerMode, session_id: &str, tail: usize) -> 
     }
 }
 
+async fn runner_stop(mode: RuntimeRunnerMode, session_id: &str) -> Result<()> {
+    match mode {
+        RuntimeRunnerMode::Process => ProcessRunner.stop(session_id).await,
+        RuntimeRunnerMode::Tmux => TmuxRunner.stop(session_id).await,
+    }
+}
+
 fn map_runner_to_runtime_state(state: &str) -> Option<TaskRuntimeState> {
     match state {
         "running" => Some(TaskRuntimeState::Running),
@@ -437,6 +483,55 @@ fn runtime_state_is_terminal(state: TaskRuntimeState) -> bool {
         state,
         TaskRuntimeState::Merged | TaskRuntimeState::FailedTerminal
     )
+}
+
+fn runtime_state_is_active(state: TaskRuntimeState) -> bool {
+    matches!(
+        state,
+        TaskRuntimeState::Preparing | TaskRuntimeState::Running
+    )
+}
+
+fn runtime_state_is_finished_or_abandoned(state: TaskRuntimeState) -> bool {
+    matches!(
+        state,
+        TaskRuntimeState::ReadyToMerge
+            | TaskRuntimeState::Merged
+            | TaskRuntimeState::FailedRetryable
+            | TaskRuntimeState::FailedTerminal
+            | TaskRuntimeState::NeedsAttention
+    )
+}
+
+fn can_transition_to_failed_retryable(state: TaskRuntimeState) -> bool {
+    matches!(
+        state,
+        TaskRuntimeState::Preparing
+            | TaskRuntimeState::Running
+            | TaskRuntimeState::ReviewFailed
+            | TaskRuntimeState::Fixing
+            | TaskRuntimeState::Validating
+            | TaskRuntimeState::ReadyToMerge
+    )
+}
+
+fn can_transition_to_failed_terminal(state: TaskRuntimeState) -> bool {
+    matches!(
+        state,
+        TaskRuntimeState::Queued
+            | TaskRuntimeState::Preparing
+            | TaskRuntimeState::Running
+            | TaskRuntimeState::ReviewFailed
+            | TaskRuntimeState::Fixing
+            | TaskRuntimeState::Validating
+            | TaskRuntimeState::ReadyToMerge
+            | TaskRuntimeState::FailedRetryable
+            | TaskRuntimeState::NeedsAttention
+    )
+}
+
+fn is_session_not_found_error(error: &anyhow::Error) -> bool {
+    error.to_string().contains("session not found")
 }
 
 fn clear_runtime_session(task_id: &str) -> Result<()> {
@@ -732,6 +827,248 @@ async fn orchestrate_steer_runtime(args: Value) -> Result<Value> {
         "task_id": task_id,
         "status": "sent",
         "session_id": session.session_id
+    }))
+}
+
+fn runtime_cleanup_targets(task_id_filter: Option<&str>) -> Result<Vec<RuntimeCleanupTarget>> {
+    let runtime = runtime_state()
+        .lock()
+        .map_err(|_| anyhow::anyhow!("runtime state lock poisoned"))?;
+
+    if let Some(task_id) = task_id_filter {
+        return Ok(vec![RuntimeCleanupTarget {
+            task_id: task_id.to_string(),
+            record: runtime.store.get_task(task_id)?,
+            session: runtime.sessions.get(task_id).cloned(),
+        }]);
+    }
+
+    let snapshot = runtime.store.export_snapshot()?;
+    let mut known_task_ids = HashSet::new();
+    let mut targets = Vec::new();
+    for record in snapshot.tasks {
+        known_task_ids.insert(record.id.clone());
+        targets.push(RuntimeCleanupTarget {
+            task_id: record.id.clone(),
+            record: Some(record.clone()),
+            session: runtime.sessions.get(&record.id).cloned(),
+        });
+    }
+
+    for (task_id, session) in &runtime.sessions {
+        if !known_task_ids.contains(task_id) {
+            targets.push(RuntimeCleanupTarget {
+                task_id: task_id.clone(),
+                record: None,
+                session: Some(session.clone()),
+            });
+        }
+    }
+
+    Ok(targets)
+}
+
+fn purge_runtime_tasks(task_ids: &HashSet<String>) -> Result<usize> {
+    if task_ids.is_empty() {
+        return Ok(0);
+    }
+
+    let mut runtime = runtime_state()
+        .lock()
+        .map_err(|_| anyhow::anyhow!("runtime state lock poisoned"))?;
+    let snapshot = runtime.store.export_snapshot()?;
+    let before = snapshot.tasks.len();
+    let retained = snapshot
+        .tasks
+        .into_iter()
+        .filter(|task| !task_ids.contains(&task.id))
+        .collect::<Vec<_>>();
+    let removed = before.saturating_sub(retained.len());
+    runtime
+        .store
+        .import_snapshot(TaskStoreSnapshot { tasks: retained })?;
+    for task_id in task_ids {
+        runtime.sessions.remove(task_id);
+    }
+    Ok(removed)
+}
+
+async fn delivery_stop_runtime(args: Value) -> Result<Value> {
+    let task_id = require_task_id("delivery_stop", &args)?.to_string();
+    let reason = optional_string(&args, "reason");
+
+    let (session, record_before) = {
+        let runtime = runtime_state()
+            .lock()
+            .map_err(|_| anyhow::anyhow!("runtime state lock poisoned"))?;
+        (
+            runtime.sessions.get(&task_id).cloned(),
+            runtime.store.get_task(&task_id)?,
+        )
+    };
+
+    let active_or_session = session.is_some()
+        || record_before
+            .as_ref()
+            .map(|task| runtime_state_is_active(task.state))
+            .unwrap_or(false);
+
+    let mut stop_propagated = false;
+    if let Some(active_session) = session.as_ref() {
+        match runner_stop(active_session.runner_mode, &active_session.session_id).await {
+            Ok(()) => {
+                stop_propagated = true;
+            }
+            Err(error) if is_session_not_found_error(&error) => {}
+            Err(error) => return Err(error),
+        }
+        let _ = clear_runtime_session(&task_id);
+    }
+
+    let runtime_state = {
+        let runtime = runtime_state()
+            .lock()
+            .map_err(|_| anyhow::anyhow!("runtime state lock poisoned"))?;
+        if let Some(task) = runtime.store.get_task(&task_id)? {
+            if active_or_session
+                && task.state != TaskRuntimeState::FailedRetryable
+                && can_transition_to_failed_retryable(task.state)
+            {
+                let _ = runtime
+                    .store
+                    .transition(&task_id, TaskRuntimeState::FailedRetryable)?;
+            }
+            let latest = runtime.store.get_task(&task_id)?.ok_or_else(|| {
+                anyhow::anyhow!("task not found after stop transition: {task_id}")
+            })?;
+            runtime_state_label(latest.state).to_string()
+        } else {
+            "unknown".to_string()
+        }
+    };
+
+    Ok(json!({
+        "tool": "delivery_stop",
+        "task_id": task_id,
+        "status": if active_or_session { "stopped" } else { "already_stopped" },
+        "runtime_state": runtime_state,
+        "stop_propagated": stop_propagated,
+        "reason": reason
+    }))
+}
+
+async fn delivery_cleanup_runtime(args: Value) -> Result<Value> {
+    let task_id_filter = optional_string(&args, "task_id");
+    let force = optional_bool(&args, "force", false)?;
+    let retention_mode =
+        CleanupRetentionMode::parse(args.get("retention_mode").and_then(Value::as_str))?;
+
+    let targets = runtime_cleanup_targets(task_id_filter.as_deref())?;
+
+    let mut purged_task_ids = HashSet::new();
+    let mut retained_count = 0usize;
+    let mut cleaned_count = 0usize;
+    let mut skipped_count = 0usize;
+    let mut task_results = Vec::new();
+
+    for target in targets {
+        let mut record_state = target.record.as_ref().map(|task| task.state);
+        let mut active = record_state.map(runtime_state_is_active).unwrap_or(false);
+
+        if let Some(session) = target.session.as_ref() {
+            match runner_status(session.runner_mode, &session.session_id).await {
+                Ok(status) => {
+                    active = !runner_state_is_terminal(&status.state);
+                }
+                Err(error) if is_session_not_found_error(&error) => {
+                    active = false;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+
+        if active && !force {
+            anyhow::bail!(
+                "cleanup refused for active task {}: retry with force=true",
+                target.task_id
+            );
+        }
+
+        if let Some(session) = target.session.as_ref() {
+            if force {
+                match runner_stop(session.runner_mode, &session.session_id).await {
+                    Ok(()) => {}
+                    Err(error) if is_session_not_found_error(&error) => {}
+                    Err(error) => return Err(error),
+                }
+            }
+            let _ = clear_runtime_session(&target.task_id);
+        }
+
+        let eligible = force
+            || record_state
+                .map(runtime_state_is_finished_or_abandoned)
+                .unwrap_or(true);
+
+        if !eligible {
+            skipped_count += 1;
+            task_results.push(json!({
+                "task_id": target.task_id,
+                "action": "skipped_not_finished",
+                "runtime_state": record_state.map(runtime_state_label).unwrap_or("unknown")
+            }));
+            continue;
+        }
+
+        match retention_mode {
+            CleanupRetentionMode::Purge => {
+                if target.record.is_some() {
+                    purged_task_ids.insert(target.task_id.clone());
+                    cleaned_count += 1;
+                } else {
+                    skipped_count += 1;
+                }
+                task_results.push(json!({
+                    "task_id": target.task_id,
+                    "action": "purged",
+                    "runtime_state": "removed"
+                }));
+            }
+            CleanupRetentionMode::Retain => {
+                if force && let Some(current) = record_state {
+                    if can_transition_to_failed_terminal(current) {
+                        let runtime = runtime_state()
+                            .lock()
+                            .map_err(|_| anyhow::anyhow!("runtime state lock poisoned"))?;
+                        let _ = runtime
+                            .store
+                            .transition(&target.task_id, TaskRuntimeState::FailedTerminal)?;
+                        record_state = Some(TaskRuntimeState::FailedTerminal);
+                    }
+                }
+                retained_count += usize::from(target.record.is_some());
+                task_results.push(json!({
+                    "task_id": target.task_id,
+                    "action": "retained",
+                    "runtime_state": record_state.map(runtime_state_label).unwrap_or("unknown")
+                }));
+            }
+        }
+    }
+
+    if !purged_task_ids.is_empty() {
+        cleaned_count = purge_runtime_tasks(&purged_task_ids)?;
+    }
+
+    Ok(json!({
+        "tool": "delivery_cleanup",
+        "status": "ok",
+        "force": force,
+        "retention_mode": retention_mode.as_str(),
+        "cleaned_count": cleaned_count,
+        "retained_count": retained_count,
+        "skipped_count": skipped_count,
+        "tasks": task_results
     }))
 }
 
@@ -1364,6 +1701,30 @@ fn mcp_tools_descriptor() -> Value {
             }
         },
         {
+            "name":"delivery_stop",
+            "description":"High-level stop API for chat orchestrators",
+            "inputSchema": {
+                "type":"object",
+                "properties": {
+                    "task_id": {"type":"string"},
+                    "reason": {"type":"string"}
+                },
+                "required": ["task_id"]
+            }
+        },
+        {
+            "name":"delivery_cleanup",
+            "description":"Cleanup finished or abandoned runtime tasks with optional retention",
+            "inputSchema": {
+                "type":"object",
+                "properties": {
+                    "task_id": {"type":"string"},
+                    "force": {"type":"boolean"},
+                    "retention_mode": {"type":"string", "enum": ["purge", "retain"]}
+                }
+            }
+        },
+        {
             "name":"delivery_events_subscribe",
             "description":"Subscribe to lifecycle events for delivery tasks",
             "inputSchema": {
@@ -1563,6 +1924,8 @@ pub fn handle_tool_call_with_allowed_root(
         "delivery_events_subscribe" => delivery_events_subscribe(args),
         "delivery_events_next" => delivery_events_next(args),
         "delivery_events_ack" => delivery_events_ack(args),
+        "delivery_stop" => block_on_result(delivery_stop_runtime(args)),
+        "delivery_cleanup" => block_on_result(delivery_cleanup_runtime(args)),
         "delivery_report" => runtime_report(),
         "plan_status" => {
             let plan_path = require_plan_path(tool_name, &args, allowed_root)?;
