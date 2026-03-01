@@ -44,6 +44,12 @@ The M7 ProcessRunner slice is now implemented:
 - process-group and descendant cleanup on stop (unix path)
 - bounded in-memory logs and bounded terminal-session retention
 
+The M8 runtime store slice is now implemented:
+
+- SQLite-backed `TaskStore` with file-persistence across reconnect
+- WAL journal mode enforcement for file-backed stores
+- transactional write paths and atomic snapshot import
+
 ## Quick start
 
 ```bash
