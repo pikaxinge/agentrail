@@ -1,6 +1,10 @@
-use std::{path::Path, process::Command as StdCommand, time::Duration};
+use std::{
+    collections::VecDeque, path::Path, process::Command as StdCommand, sync::Mutex, time::Duration,
+};
 
-use agentrail_runner::{AgentRunner, TaskSpec, TmuxRunner};
+use agentrail_runner::{AgentRunner, TaskHandle, TaskSpec, TaskStatus, TmuxRunner};
+use anyhow::{Result, anyhow};
+use async_trait::async_trait;
 use tempfile::tempdir;
 use tokio::time::sleep;
 
@@ -31,24 +35,111 @@ fn skip_if_no_tmux() -> bool {
     true
 }
 
-async fn wait_for_terminal_state(
-    runner: &TmuxRunner,
+fn is_transient_tmux_status_error(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    lower.contains("server exited unexpectedly")
+}
+
+async fn wait_for_terminal_state<R: AgentRunner + ?Sized>(
+    runner: &R,
     session_id: &str,
     max_attempts: usize,
 ) -> String {
     let mut state = "running".to_string();
+    let mut last_transient_error = None;
+
     for _ in 0..max_attempts {
-        let status = runner
-            .status(session_id)
-            .await
-            .expect("status should succeed");
-        state = status.state;
-        if state != "running" {
-            break;
+        match runner.status(session_id).await {
+            Ok(status) => {
+                state = status.state;
+                last_transient_error = None;
+                if state != "running" {
+                    break;
+                }
+            }
+            Err(error) => {
+                let message = error.to_string();
+                if !is_transient_tmux_status_error(&message) {
+                    panic!("status should succeed: {error}");
+                }
+                last_transient_error = Some(message);
+            }
         }
         sleep(Duration::from_millis(50)).await;
     }
+
+    if let Some(message) = last_transient_error {
+        panic!("status should recover after transient tmux error: {message}");
+    }
+
     state
+}
+
+struct StatusSequenceRunner {
+    responses: Mutex<VecDeque<Result<TaskStatus>>>,
+}
+
+impl StatusSequenceRunner {
+    fn new(responses: Vec<Result<TaskStatus>>) -> Self {
+        Self {
+            responses: Mutex::new(responses.into()),
+        }
+    }
+}
+
+#[async_trait]
+impl AgentRunner for StatusSequenceRunner {
+    async fn start(&self, _spec: TaskSpec) -> Result<TaskHandle> {
+        Err(anyhow!("unused in test"))
+    }
+
+    async fn steer(&self, _session_id: &str, _instruction: &str) -> Result<()> {
+        Err(anyhow!("unused in test"))
+    }
+
+    async fn pause(&self, _session_id: &str) -> Result<()> {
+        Err(anyhow!("unused in test"))
+    }
+
+    async fn resume(&self, _session_id: &str) -> Result<()> {
+        Err(anyhow!("unused in test"))
+    }
+
+    async fn stop(&self, _session_id: &str) -> Result<()> {
+        Err(anyhow!("unused in test"))
+    }
+
+    async fn status(&self, _session_id: &str) -> Result<TaskStatus> {
+        self.responses
+            .lock()
+            .expect("response queue lock")
+            .pop_front()
+            .expect("response should exist")
+    }
+
+    async fn logs(&self, _session_id: &str, _tail: usize) -> Result<String> {
+        Err(anyhow!("unused in test"))
+    }
+}
+
+#[tokio::test]
+async fn wait_for_terminal_state_retries_transient_tmux_server_errors() {
+    let runner = StatusSequenceRunner::new(vec![
+        Err(anyhow!(
+            "tmux has-session failed for tmux-test: server exited unexpectedly"
+        )),
+        Ok(TaskStatus {
+            id: "task-1".to_string(),
+            state: "running".to_string(),
+        }),
+        Ok(TaskStatus {
+            id: "task-1".to_string(),
+            state: "completed".to_string(),
+        }),
+    ]);
+
+    let final_state = wait_for_terminal_state(&runner, "tmux-test", 5).await;
+    assert_eq!(final_state, "completed");
 }
 
 #[tokio::test]

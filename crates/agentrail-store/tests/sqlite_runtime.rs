@@ -93,6 +93,31 @@ fn sqlite_file_backed_store_sets_wal_journal_mode() {
 }
 
 #[test]
+fn sqlite_store_creates_missing_parent_directories() {
+    let tmp = tempdir().expect("tempdir");
+    let db_path = tmp.path().join("nested").join("runtime").join("runtime.db");
+    let dsn = sqlite_dsn(&db_path);
+
+    let store = TaskStore::connect(dsn.clone());
+    store
+        .upsert_task(&TaskRecord::new("task-sqlite-parent-create", "worker-a", 1))
+        .expect("insert should succeed");
+    drop(store);
+
+    assert!(
+        db_path.exists(),
+        "sqlite file should exist after connecting with nested DSN"
+    );
+
+    let reopened = TaskStore::connect(dsn);
+    let task = reopened
+        .get_task("task-sqlite-parent-create")
+        .expect("read should succeed")
+        .expect("task should persist");
+    assert_eq!(task.assigned_worker, "worker-a");
+}
+
+#[test]
 fn unsupported_dsn_surfaces_runtime_error_instead_of_silent_memory_fallback() {
     let store = TaskStore::connect("bad://runtime-db");
     let err = store
