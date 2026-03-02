@@ -30,16 +30,23 @@
   - `docs/architecture/SYSTEM_ARCHITECTURE.md`
 
 ## Project testing strategy
+- In restricted/sandboxed sessions, always set `CARGO_TARGET_DIR=/tmp/agentrail-target` for Cargo commands to avoid permission failures from host-level target-dir overrides.
 - Unit/integration:
-  - `cargo test --workspace --all-targets` (full)
+  - `CARGO_TARGET_DIR=/tmp/agentrail-target cargo test --workspace --all-targets` (full)
   - targeted crate tests when scope is narrow
 - MCP/protocol:
-  - `cargo check -p agentrail-mcp`
-  - `cargo test -p agentrail-mcp --test protocol --test tools`
+  - `CARGO_TARGET_DIR=/tmp/agentrail-target cargo check -p agentrail-mcp`
+  - `CARGO_TARGET_DIR=/tmp/agentrail-target cargo test -p agentrail-mcp --test protocol --test tools`
 - Build/run:
   - `cargo fmt --all --check`
-  - `cargo check --workspace --all-targets`
-  - `cargo build -p agentrail-mcp`
+  - `CARGO_TARGET_DIR=/tmp/agentrail-target cargo check --workspace --all-targets`
+  - `CARGO_TARGET_DIR=/tmp/agentrail-target cargo build -p agentrail-mcp`
+- Compile hygiene and recovery:
+  - Avoid running multiple concurrent `cargo check/test` jobs for this repo from different sessions.
+  - If repeated manual interrupts leave orphan `sccache ... rustc` processes and compilation appears stuck, clean up before retry:
+    - terminate orphan wrappers (`sccache ... rustc` with parent `PID 1`)
+    - restart `sccache` daemon
+    - re-run with `CARGO_TARGET_DIR=/tmp/agentrail-target`
 - MCP tools in scope:
   - `plan_*`
   - `orchestrate_*`
