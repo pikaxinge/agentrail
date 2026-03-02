@@ -103,6 +103,54 @@ Round open gate (must pass before next tmux round starts):
 
 The loop is not complete at merge. It is complete only after: merge -> retrospective -> friction issue creation -> handoff.
 
+## Owner+Orchestrator Self-Bootstrap Contract (Hard Rules)
+These rules are mandatory for self-bootstrap rounds and must be treated as a fixed execution contract.
+
+1. Single-goal round:
+- One round handles exactly one issue.
+- Do not start another issue before current round reaches Close Gate.
+
+2. Open Gate (required):
+- Sync `main`, define round issue, DoD, and non-goals.
+- Ensure MCP binary matches current target commit.
+- If mismatch: run `cargo build -p agentrail-mcp`, then call `agentrail/reload`.
+- Verify tool surface is available: `plan_*`, `orchestrate_*`, `delivery_*`.
+- For steerable coding rounds, verify `tmux` is available.
+
+3. Execute Gate (MCP-only):
+- Primary owner+orchestrator session must control execution via MCP tools only.
+- Submit coding task through `delivery_submit` with `runner_mode=tmux`.
+- For steer-required rounds, enforce `steer_required=true` and `interactive_command=true`.
+- Observe with `delivery_events_subscribe` + `delivery_events_next` + `delivery_events_ack`.
+- Reconcile with `delivery_status`.
+- Correct drift only through `delivery_steer`.
+- On stuck/dead session, use `delivery_stop` then re-submit with narrowed instruction.
+
+4. Merge Gate:
+- Do not end round at "PR opened"; track until PR is merged.
+- Keep branch strict-up-to-date with `main`.
+- Resolve CI/check failures through MCP-driven fix cycles.
+
+5. Close Gate (required):
+- Submit retro task via MCP: postmortem + friction issue(s) + handoff summary.
+- Collect runtime snapshot with `delivery_report`.
+- Run `delivery_cleanup` for stale finished/failed runtime records.
+- Round ends only when DoD met, PR merged, and retro artifacts exist.
+
+6. Bootstrap stall recovery:
+- If bounded retries cannot progress the round, terminate early as stalled.
+- Immediately create a dedicated friction issue with repro, expected behavior, and impact.
+- Current owner agent must fix and merge that friction issue before returning to backlog work.
+
+7. Next-round priority:
+- Always process bootstrap-generated friction issues first.
+- Keep looping on friction issues until the friction queue is empty.
+- Process normal backlog issues only after no open bootstrap-generated friction issues remain.
+
+8. Session behavior constraints:
+- Primary owner+orchestrator session must not use superpower-style command/instruction paths.
+- Superpower-style instructions are allowed only inside subordinate runner sessions launched by MCP.
+
 ## Required verification before commit
 Run all of the following from repository root:
 - `scripts/revive-sccache.sh`
