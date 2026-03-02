@@ -11,7 +11,7 @@
 - MCP-first execution: submit, observe, steer, stop, cleanup through MCP tools.
 - Primary orchestrator session does not perform manual code edits during MCP-only rounds.
 - Do not close a round at "PR opened"; close only after merge + retro + handoff.
-- Prefer `runner_mode=tmux` for coding tasks that may need live correction.
+- Prefer `runner_mode=app_server` for coding tasks that may need live correction.
 - Use `runner_mode=process` only for deterministic one-shot tasks that do not require steering.
 - No destructive git/history operations unless explicitly requested.
 - No completion claims without command evidence.
@@ -98,15 +98,14 @@ Step 2: final agent self-review (before round close)
   - why this improves next-round smoothness
 
 ## Stall detection & observability (required)
-- For tmux-backed coding rounds, prioritize stall judgment from background logs + tmux pane state before declaring a task stuck.
+- For app_server-backed coding rounds, prioritize stall judgment from adapter/runtime logs + `delivery_status` state before declaring a task stuck.
 - Required checks:
-  - tmux target exists (session/window/pane reachable)
-  - pane liveness (`pane_dead`)
-  - current command (`pane_current_command`)
-  - output freshness (pane output changes over time)
-  - tmux runner log artifacts (for example `.agentrail-tmux-logs` when configured)
+  - app_server target exists (task/session reachable)
+  - runner liveness (`delivery_status` state remains `running` while task is active)
+  - output freshness (log output changes over time)
+  - app_server adapter log artifacts from runtime status tail
   - latest `delivery_status` snapshot (state/tail reconciliation)
-- Stuck decision should be based on combined evidence from tmux + runner logs + `delivery_status`, not a single signal.
+- Stuck decision should be based on combined evidence from adapter logs + runner logs + `delivery_status`, not a single signal.
 - If stall is confirmed:
   - `delivery_stop`
   - re-submit with narrowed instruction

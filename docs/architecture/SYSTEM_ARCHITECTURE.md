@@ -15,7 +15,7 @@ Chat App -> Orchestrator -> agentrail MCP/CLI -> Core/Storage/Runner -> Worktree
   - Service mode: `serve --transport stdio|http --bind`.
 - `agentrail-mcp`: tool-facing server endpoint.
   - Low-level tools: `plan_*`, `orchestrate_*`.
-  - High-level tools: `delivery_submit/status/steer/report`.
+  - High-level tools: `delivery_submit/status/steer/stop/report/cleanup/events_*`.
   - Transports: stdio and HTTP (`/mcp`, `/healthz`).
 
 ### Application layer
@@ -30,7 +30,7 @@ Chat App -> Orchestrator -> agentrail MCP/CLI -> Core/Storage/Runner -> Worktree
 ### Infrastructure layer
 - Plan repository: YAML + CAS + atomic write.
 - Task store: transactional state for sessions, retries, and events.
-- Runner adapters: process and tmux implementations.
+- Runner adapters: process and app_server implementations.
 - Dashboard/report renderer: static HTML, Mermaid DAG text, markdown report text.
 - Orchestration runtime: DAG scheduler + gate evaluator + retry/reassignment.
  - Runtime service loop: periodic runner-state polling and runtime-state reconciliation.
@@ -48,7 +48,7 @@ Chat App -> Orchestrator -> agentrail MCP/CLI -> Core/Storage/Runner -> Worktree
 
 ## 5. Runner model
 - `ProcessRunner`: short-lived deterministic execution.
-- `TmuxRunner`: long-lived steerable sessions with attach/replay.
+- `AppServer` runner: long-lived steerable sessions over stdio JSON-RPC.
 - Unified control actions at trait level for adapter portability.
 - On review failures, main orchestrator resumes the original task agent first, then reassigns when retry budget is exceeded.
 

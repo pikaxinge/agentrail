@@ -24,13 +24,12 @@ use tokio::sync::{Mutex as AsyncMutex, mpsc, oneshot};
 use tracing::{info, warn};
 
 use agentrail_core::{Phase, PhaseStatus, Plan, Step, StepStatus};
-use agentrail_runner::{AgentRunner, ProcessRunner, TaskHandle, TaskSpec, TaskStatus, TmuxRunner};
+use agentrail_runner::{AgentRunner, ProcessRunner, TaskHandle, TaskSpec, TaskStatus};
 use agentrail_store::{TaskEventDraft, TaskRecord, TaskRuntimeState, TaskStore, TaskStoreSnapshot};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RuntimeRunnerMode {
     Process,
-    Tmux,
     AppServer,
 }
 
@@ -38,7 +37,9 @@ impl RuntimeRunnerMode {
     fn parse(raw: Option<&str>) -> Result<Self> {
         match raw.unwrap_or("process") {
             "process" => Ok(Self::Process),
-            "tmux" => Ok(Self::Tmux),
+            "tmux" => anyhow::bail!(
+                "unsupported runner_mode: tmux (removed; use runner_mode=app_server for steerable sessions or runner_mode=process for one-shot tasks)"
+            ),
             "app_server" => Ok(Self::AppServer),
             other => anyhow::bail!("unsupported runner_mode: {other}"),
         }
@@ -47,7 +48,6 @@ impl RuntimeRunnerMode {
     fn as_str(self) -> &'static str {
         match self {
             Self::Process => "process",
-            Self::Tmux => "tmux",
             Self::AppServer => "app_server",
         }
     }
@@ -1334,34 +1334,9 @@ fn validate_delivery_submit_preflight(args: &Value) -> Result<()> {
         return Ok(());
     }
 
-    if !matches!(
-        runner_mode,
-        RuntimeRunnerMode::Tmux | RuntimeRunnerMode::AppServer
-    ) {
+    if runner_mode != RuntimeRunnerMode::AppServer {
         anyhow::bail!(
-            "invalid delivery_submit: steer_required=true requires runner_mode=tmux or runner_mode=app_server"
-        );
-    }
-
-    if runner_mode == RuntimeRunnerMode::AppServer {
-        return Ok(());
-    }
-
-    let interactive_command = optional_bool(args, "interactive_command", false)?;
-    if !interactive_command {
-        anyhow::bail!(
-            "invalid delivery_submit: steer_required=true requires interactive_command=true"
-        );
-    }
-
-    let command = command.ok_or_else(|| {
-        anyhow::anyhow!(
-            "invalid delivery_submit: steer_required=true requires explicit interactive command"
-        )
-    })?;
-    if is_non_steerable_codex_exec_shape(&command, &command_args) {
-        anyhow::bail!(
-            "invalid delivery_submit: steer_required=true rejects non-steerable codex exec command shape; use interactive codex session (no exec) or set steer_required=false"
+            "invalid delivery_submit: steer_required=true requires runner_mode=app_server"
         );
     }
 
@@ -2265,7 +2240,6 @@ async fn app_server_stop(session_id: &str) -> Result<()> {
 async fn runner_start(mode: RuntimeRunnerMode, spec: TaskSpec) -> Result<TaskHandle> {
     match mode {
         RuntimeRunnerMode::Process => ProcessRunner.start(spec).await,
-        RuntimeRunnerMode::Tmux => TmuxRunner.start(spec).await,
         RuntimeRunnerMode::AppServer => app_server_start(spec).await,
     }
 }
@@ -2273,7 +2247,6 @@ async fn runner_start(mode: RuntimeRunnerMode, spec: TaskSpec) -> Result<TaskHan
 async fn runner_status(mode: RuntimeRunnerMode, session_id: &str) -> Result<TaskStatus> {
     match mode {
         RuntimeRunnerMode::Process => ProcessRunner.status(session_id).await,
-        RuntimeRunnerMode::Tmux => TmuxRunner.status(session_id).await,
         RuntimeRunnerMode::AppServer => app_server_status(session_id).await,
     }
 }
@@ -2281,7 +2254,6 @@ async fn runner_status(mode: RuntimeRunnerMode, session_id: &str) -> Result<Task
 async fn runner_steer(mode: RuntimeRunnerMode, session_id: &str, instruction: &str) -> Result<()> {
     match mode {
         RuntimeRunnerMode::Process => ProcessRunner.steer(session_id, instruction).await,
-        RuntimeRunnerMode::Tmux => TmuxRunner.steer(session_id, instruction).await,
         RuntimeRunnerMode::AppServer => app_server_steer(session_id, instruction).await,
     }
 }
@@ -2289,7 +2261,6 @@ async fn runner_steer(mode: RuntimeRunnerMode, session_id: &str, instruction: &s
 async fn runner_logs(mode: RuntimeRunnerMode, session_id: &str, tail: usize) -> Result<String> {
     match mode {
         RuntimeRunnerMode::Process => ProcessRunner.logs(session_id, tail).await,
-        RuntimeRunnerMode::Tmux => TmuxRunner.logs(session_id, tail).await,
         RuntimeRunnerMode::AppServer => app_server_logs(session_id, tail).await,
     }
 }
@@ -2297,7 +2268,6 @@ async fn runner_logs(mode: RuntimeRunnerMode, session_id: &str, tail: usize) -> 
 async fn runner_stop(mode: RuntimeRunnerMode, session_id: &str) -> Result<()> {
     match mode {
         RuntimeRunnerMode::Process => ProcessRunner.stop(session_id).await,
-        RuntimeRunnerMode::Tmux => TmuxRunner.stop(session_id).await,
         RuntimeRunnerMode::AppServer => app_server_stop(session_id).await,
     }
 }
@@ -3703,6 +3673,14 @@ fn delivery_events_ack(args: Value) -> Result<Value> {
 struct StartupRecoveryCandidate {
     task_id: String,
     session: Option<RuntimeTaskSession>,
+    unsupported_session: Option<UnsupportedStartupSession>,
+}
+
+#[derive(Debug, Clone)]
+struct UnsupportedStartupSession {
+    session_id: String,
+    runner_mode: String,
+    attempt_number: u32,
 }
 
 fn collect_startup_recovery_candidates() -> Result<Vec<StartupRecoveryCandidate>> {
@@ -3721,28 +3699,42 @@ fn collect_startup_recovery_candidates() -> Result<Vec<StartupRecoveryCandidate>
             continue;
         }
 
-        let session = runtime
+        let latest_session = runtime
             .store
             .list_task_sessions(&task.id)?
             .into_iter()
             .rev()
-            .find(|session| session.terminal_state.is_none())
-            .and_then(|session| {
-                RuntimeRunnerMode::parse(Some(session.runner_mode.as_str()))
-                    .ok()
-                    .map(|runner_mode| RuntimeTaskSession {
+            .find(|session| session.terminal_state.is_none());
+
+        let (session, unsupported_session) = match latest_session {
+            Some(session) => match RuntimeRunnerMode::parse(Some(session.runner_mode.as_str())) {
+                Ok(runner_mode) => (
+                    Some(RuntimeTaskSession {
                         session_id: session.session_id,
                         runner_mode,
                         attempt_number: session.attempt_number,
                         trace_id: session.trace_id,
                         span_id: session.span_id,
                         parent_span_id: session.parent_span_id,
-                    })
-            });
+                    }),
+                    None,
+                ),
+                Err(_) => (
+                    None,
+                    Some(UnsupportedStartupSession {
+                        session_id: session.session_id,
+                        runner_mode: session.runner_mode,
+                        attempt_number: session.attempt_number,
+                    }),
+                ),
+            },
+            None => (None, None),
+        };
 
         candidates.push(StartupRecoveryCandidate {
             task_id: task.id,
             session,
+            unsupported_session,
         });
     }
 
@@ -3792,13 +3784,58 @@ fn transition_recovery_missing_session(task_id: &str, session_id: Option<&str>) 
     Ok(runtime_state)
 }
 
+fn transition_recovery_unsupported_runner_mode(task_id: &str, session_id: &str) -> Result<String> {
+    let _ = finalize_runtime_session(session_id, "unsupported_runner_mode");
+
+    let mut runtime = runtime_state_mutex()?;
+    if let Some(task) = runtime.store.get_task(task_id)?
+        && can_transition_to_failed_retryable(task.state)
+    {
+        let _ = runtime
+            .store
+            .transition(task_id, TaskRuntimeState::FailedRetryable)?;
+    }
+    runtime.sessions.remove(task_id);
+    let runtime_state = runtime
+        .store
+        .get_task(task_id)?
+        .map(|task| runtime_state_label(task.state).to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+    Ok(runtime_state)
+}
+
 async fn reconcile_runtime_startup_once() -> Result<()> {
     let candidates = collect_startup_recovery_candidates()?;
     let mut failures = Vec::new();
 
     for candidate in candidates {
-        let result = match candidate.session.clone() {
-            None => {
+        let result = match (
+            candidate.session.clone(),
+            candidate.unsupported_session.clone(),
+        ) {
+            (None, Some(unsupported)) => {
+                let runtime_state = transition_recovery_unsupported_runner_mode(
+                    &candidate.task_id,
+                    &unsupported.session_id,
+                )?;
+                emit_recovery_event(
+                    &candidate.task_id,
+                    "recovery_unsupported_runner_mode",
+                    &runtime_state,
+                    Some(unsupported.session_id.clone()),
+                    Some(unsupported.attempt_number),
+                )?;
+                warn!(
+                    operation = "runtime_recovery",
+                    outcome = "unsupported_runner_mode",
+                    task_id = candidate.task_id,
+                    runner_mode = unsupported.runner_mode,
+                    runtime_state = runtime_state,
+                    "startup reconciliation transitioned task due to unsupported persisted runner mode"
+                );
+                Ok(())
+            }
+            (None, None) => {
                 let runtime_state = transition_recovery_missing_session(&candidate.task_id, None)?;
                 emit_recovery_event(
                     &candidate.task_id,
@@ -3816,106 +3853,108 @@ async fn reconcile_runtime_startup_once() -> Result<()> {
                 );
                 Ok(())
             }
-            Some(session) => match runner_status(session.runner_mode, &session.session_id).await {
-                Ok(status) if status.state == "running" => {
-                    let runtime_state = {
-                        let mut runtime = runtime_state_mutex()?;
-                        if let Some(task) = runtime.store.get_task(&candidate.task_id)?
-                            && task.state == TaskRuntimeState::Preparing
-                        {
-                            let _ = runtime
-                                .store
-                                .transition(&candidate.task_id, TaskRuntimeState::Running)?;
-                        }
-                        runtime
-                            .sessions
-                            .insert(candidate.task_id.clone(), session.clone());
-                        runtime
-                            .store
-                            .get_task(&candidate.task_id)?
-                            .map(|task| runtime_state_label(task.state).to_string())
-                            .unwrap_or_else(|| "unknown".to_string())
-                    };
-                    emit_recovery_event(
-                        &candidate.task_id,
-                        "recovery_attached",
-                        &runtime_state,
-                        Some(session.session_id.clone()),
-                        Some(session.attempt_number),
-                    )?;
-                    info!(
-                        operation = "runtime_recovery",
-                        outcome = "attached",
-                        task_id = candidate.task_id,
-                        session_id = session.session_id,
-                        runtime_state = runtime_state,
-                        "startup reconciliation attached live session"
-                    );
-                    Ok(())
-                }
-                Ok(status) => {
-                    let _ = finalize_runtime_session(&session.session_id, &status.state);
-                    let runtime_state = {
-                        let mut runtime = runtime_state_mutex()?;
-                        if let Some(task) = runtime.store.get_task(&candidate.task_id)? {
-                            if let Some(target) = map_runner_to_runtime_state(&status.state)
-                                && runtime_state_is_active(task.state)
-                                && task.state != target
-                                && task.state != TaskRuntimeState::Merged
-                                && task.state != TaskRuntimeState::FailedTerminal
+            (Some(session), _) => {
+                match runner_status(session.runner_mode, &session.session_id).await {
+                    Ok(status) if status.state == "running" => {
+                        let runtime_state = {
+                            let mut runtime = runtime_state_mutex()?;
+                            if let Some(task) = runtime.store.get_task(&candidate.task_id)?
+                                && task.state == TaskRuntimeState::Preparing
                             {
-                                let _ = runtime.store.transition(&candidate.task_id, target);
+                                let _ = runtime
+                                    .store
+                                    .transition(&candidate.task_id, TaskRuntimeState::Running)?;
                             }
-                        }
-                        runtime.sessions.remove(&candidate.task_id);
-                        runtime
-                            .store
-                            .get_task(&candidate.task_id)?
-                            .map(|task| runtime_state_label(task.state).to_string())
-                            .unwrap_or_else(|| "unknown".to_string())
-                    };
-                    emit_recovery_event(
-                        &candidate.task_id,
-                        "recovery_terminal_observed",
-                        &runtime_state,
-                        Some(session.session_id.clone()),
-                        Some(session.attempt_number),
-                    )?;
-                    info!(
-                        operation = "runtime_recovery",
-                        outcome = "terminal_observed",
-                        task_id = candidate.task_id,
-                        session_id = session.session_id,
-                        state = status.state,
-                        runtime_state = runtime_state,
-                        "startup reconciliation observed terminal session state"
-                    );
-                    Ok(())
+                            runtime
+                                .sessions
+                                .insert(candidate.task_id.clone(), session.clone());
+                            runtime
+                                .store
+                                .get_task(&candidate.task_id)?
+                                .map(|task| runtime_state_label(task.state).to_string())
+                                .unwrap_or_else(|| "unknown".to_string())
+                        };
+                        emit_recovery_event(
+                            &candidate.task_id,
+                            "recovery_attached",
+                            &runtime_state,
+                            Some(session.session_id.clone()),
+                            Some(session.attempt_number),
+                        )?;
+                        info!(
+                            operation = "runtime_recovery",
+                            outcome = "attached",
+                            task_id = candidate.task_id,
+                            session_id = session.session_id,
+                            runtime_state = runtime_state,
+                            "startup reconciliation attached live session"
+                        );
+                        Ok(())
+                    }
+                    Ok(status) => {
+                        let _ = finalize_runtime_session(&session.session_id, &status.state);
+                        let runtime_state = {
+                            let mut runtime = runtime_state_mutex()?;
+                            if let Some(task) = runtime.store.get_task(&candidate.task_id)? {
+                                if let Some(target) = map_runner_to_runtime_state(&status.state)
+                                    && runtime_state_is_active(task.state)
+                                    && task.state != target
+                                    && task.state != TaskRuntimeState::Merged
+                                    && task.state != TaskRuntimeState::FailedTerminal
+                                {
+                                    let _ = runtime.store.transition(&candidate.task_id, target);
+                                }
+                            }
+                            runtime.sessions.remove(&candidate.task_id);
+                            runtime
+                                .store
+                                .get_task(&candidate.task_id)?
+                                .map(|task| runtime_state_label(task.state).to_string())
+                                .unwrap_or_else(|| "unknown".to_string())
+                        };
+                        emit_recovery_event(
+                            &candidate.task_id,
+                            "recovery_terminal_observed",
+                            &runtime_state,
+                            Some(session.session_id.clone()),
+                            Some(session.attempt_number),
+                        )?;
+                        info!(
+                            operation = "runtime_recovery",
+                            outcome = "terminal_observed",
+                            task_id = candidate.task_id,
+                            session_id = session.session_id,
+                            state = status.state,
+                            runtime_state = runtime_state,
+                            "startup reconciliation observed terminal session state"
+                        );
+                        Ok(())
+                    }
+                    Err(error) if is_session_not_found_error(&error) => {
+                        let runtime_state = transition_recovery_missing_session(
+                            &candidate.task_id,
+                            Some(&session.session_id),
+                        )?;
+                        emit_recovery_event(
+                            &candidate.task_id,
+                            "recovery_missing_session",
+                            &runtime_state,
+                            Some(session.session_id.clone()),
+                            Some(session.attempt_number),
+                        )?;
+                        info!(
+                            operation = "runtime_recovery",
+                            outcome = "missing_session",
+                            task_id = candidate.task_id,
+                            session_id = session.session_id,
+                            runtime_state = runtime_state,
+                            "startup reconciliation marked task as failed_retryable due to missing session"
+                        );
+                        Ok(())
+                    }
+                    Err(error) => Err(error),
                 }
-                Err(error) if is_session_not_found_error(&error) => {
-                    let runtime_state = transition_recovery_missing_session(
-                        &candidate.task_id,
-                        Some(&session.session_id),
-                    )?;
-                    emit_recovery_event(
-                        &candidate.task_id,
-                        "recovery_missing_session",
-                        &runtime_state,
-                        Some(session.session_id.clone()),
-                        Some(session.attempt_number),
-                    )?;
-                    info!(
-                        operation = "runtime_recovery",
-                        outcome = "missing_session",
-                        task_id = candidate.task_id,
-                        session_id = session.session_id,
-                        runtime_state = runtime_state,
-                        "startup reconciliation marked task as failed_retryable due to missing session"
-                    );
-                    Ok(())
-                }
-                Err(error) => Err(error),
-            },
+            }
         };
 
         if let Err(error) = result {
@@ -4527,14 +4566,14 @@ fn mcp_tools_descriptor() -> Value {
         },
         {
             "name":"orchestrate_start",
-            "description":"Start a runtime task on process/tmux runner",
+            "description":"Start a runtime task on process/app_server runner",
             "inputSchema": {
                 "type":"object",
                 "properties": {
                     "task_id": {"type":"string"},
                     "scope_id": {"type":"string"},
                     "worker_id": {"type":"string"},
-                    "runner_mode": {"type":"string", "enum": ["process", "tmux", "app_server"]},
+                    "runner_mode": {"type":"string", "enum": ["process", "app_server"]},
                     "app_server_request_policy": {"type":"string", "enum": ["deny_all", "allow_safe_subset", "delegate_fail_open"]},
                     "command": {"type":"string"},
                     "args": {
@@ -4583,7 +4622,7 @@ fn mcp_tools_descriptor() -> Value {
                     "task_id": {"type":"string"},
                     "scope_id": {"type":"string"},
                     "worker_id": {"type":"string"},
-                    "runner_mode": {"type":"string", "enum": ["process", "tmux", "app_server"]},
+                    "runner_mode": {"type":"string", "enum": ["process", "app_server"]},
                     "app_server_request_policy": {"type":"string", "enum": ["deny_all", "allow_safe_subset", "delegate_fail_open"]},
                     "steer_required": {"type":"boolean"},
                     "interactive_command": {"type":"boolean"},
@@ -5038,7 +5077,6 @@ pub fn handle_tool_call_with_allowed_root(
 mod tests {
     use std::{
         io::{self, Write},
-        process::Command as StdCommand,
         sync::{Arc, Mutex, OnceLock},
         time::{SystemTime, UNIX_EPOCH},
     };
@@ -5166,7 +5204,7 @@ mod tests {
                 "task_id": "task-1",
                 "state": "running",
                 "runtime_state": "running",
-                "runner_mode": "tmux",
+                "runner_mode": "app_server",
                 "session_id": "session-1",
                 "assigned_worker": "worker-a",
                 "retry_count": 0,
@@ -5326,8 +5364,8 @@ mod tests {
             runtime.sessions.insert(
                 task_id.clone(),
                 RuntimeTaskSession {
-                    session_id: "tmux-session-1".to_string(),
-                    runner_mode: RuntimeRunnerMode::Tmux,
+                    session_id: "app-server-session-1".to_string(),
+                    runner_mode: RuntimeRunnerMode::AppServer,
                     attempt_number: 3,
                     trace_id: "trace:steer-observation".to_string(),
                     span_id: "span:steer-observation:3".to_string(),
@@ -5338,7 +5376,7 @@ mod tests {
 
         let sent_at = record_delivery_steer_sent(
             &task_id,
-            "tmux-session-1",
+            "app-server-session-1",
             "Proceed now to RED artifact creation",
         )
         .expect("record steer sent");
@@ -5358,7 +5396,7 @@ mod tests {
         assert!(runtime.delivery_events.iter().any(|event| {
             event.task_id == task_id
                 && event.event_type == "steer_sent"
-                && event.session_id.as_deref() == Some("tmux-session-1")
+                && event.session_id.as_deref() == Some("app-server-session-1")
         }));
         let persisted = runtime
             .store
@@ -5394,11 +5432,11 @@ mod tests {
         }
 
         let instruction = "Proceed now to RED artifact creation";
-        let _ = record_delivery_steer_sent(&task_id, "tmux-session-2", instruction)
+        let _ = record_delivery_steer_sent(&task_id, "app-server-session-2", instruction)
             .expect("record steer sent");
         maybe_record_delivery_steer_observed(
             &task_id,
-            "tmux-session-2",
+            "app-server-session-2",
             "running",
             "running",
             "no matching logs yet",
@@ -5406,7 +5444,7 @@ mod tests {
         .expect("non-matching logs should be ignored");
         maybe_record_delivery_steer_observed(
             &task_id,
-            "tmux-session-2",
+            "app-server-session-2",
             "running",
             "running",
             "Proceed now to RED artifact creation",
@@ -5414,7 +5452,7 @@ mod tests {
         .expect("record steer observed");
         maybe_record_delivery_steer_observed(
             &task_id,
-            "tmux-session-2",
+            "app-server-session-2",
             "running",
             "running",
             "Proceed now to RED artifact creation",
@@ -5462,11 +5500,11 @@ mod tests {
         }
 
         let instruction = "Proceed now to RED artifact creation";
-        let _ = record_delivery_steer_sent(&task_id, "tmux-session-progress", instruction)
+        let _ = record_delivery_steer_sent(&task_id, "app-server-session-progress", instruction)
             .expect("record steer sent");
         maybe_record_delivery_steer_observed(
             &task_id,
-            "tmux-session-progress",
+            "app-server-session-progress",
             "running",
             "running",
             "Proceed now to RED artifact creation",
@@ -5474,7 +5512,7 @@ mod tests {
         .expect("record steer observed");
         let updated_runtime_state = maybe_record_delivery_steer_progress(
             &task_id,
-            "tmux-session-progress",
+            "app-server-session-progress",
             "running",
             "running",
             "Proceed now to RED artifact creation\nRunning command output...\nDone.",
@@ -5519,11 +5557,11 @@ mod tests {
 
         let instruction = "Proceed now to RED artifact creation";
         let baseline_logs = "Proceed now to RED artifact creation";
-        let _ = record_delivery_steer_sent(&task_id, "tmux-session-stalled", instruction)
+        let _ = record_delivery_steer_sent(&task_id, "app-server-session-stalled", instruction)
             .expect("record steer sent");
         maybe_record_delivery_steer_observed(
             &task_id,
-            "tmux-session-stalled",
+            "app-server-session-stalled",
             "running",
             "running",
             baseline_logs,
@@ -5534,7 +5572,7 @@ mod tests {
         for _ in 0..STEER_STALL_POLL_THRESHOLD {
             updated_runtime_state = maybe_record_delivery_steer_progress(
                 &task_id,
-                "tmux-session-stalled",
+                "app-server-session-stalled",
                 "running",
                 "running",
                 baseline_logs,
@@ -5717,35 +5755,11 @@ mod tests {
         assert!(status["stall_duration_ms"].is_number());
     }
 
-    fn tmux_available() -> bool {
-        StdCommand::new("tmux")
-            .arg("-V")
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .map(|status| status.success())
-            .unwrap_or(false)
-    }
-
     #[tokio::test(flavor = "current_thread")]
-    async fn startup_recovery_attaches_live_tmux_session() {
+    async fn startup_recovery_unsupported_tmux_session_transitions_to_failed_retryable() {
         let _runtime_guard = begin_runtime_test();
-        if !tmux_available() {
-            return;
-        }
-
-        let task_id = unique_test_task_id("startup-attach");
-        let session_id = unique_test_task_id("tmux-recovery-session");
-        let output = StdCommand::new("tmux")
-            .args(["new-session", "-d", "-s", &session_id, "bash -lc 'sleep 5'"])
-            .output()
-            .expect("spawn tmux recovery session");
-        assert!(
-            output.status.success(),
-            "tmux new-session should succeed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-
+        let task_id = unique_test_task_id("startup-unsupported-runner");
+        let session_id = unique_test_task_id("tmux-legacy-session");
         {
             let mut runtime = runtime_state().lock().expect("runtime lock");
             runtime
@@ -5763,45 +5777,39 @@ mod tests {
             runtime
                 .store
                 .register_task_attempt(&task_id, &session_id, "tmux")
-                .expect("register attempt");
+                .expect("register legacy attempt");
             runtime.sessions.remove(&task_id);
         }
 
         reconcile_runtime_startup_once()
             .await
-            .expect("startup recovery should attach live tmux session");
+            .expect("startup recovery should handle unsupported runner mode");
 
-        {
-            let runtime = runtime_state().lock().expect("runtime lock");
-            assert!(
-                runtime.sessions.contains_key(&task_id),
-                "startup recovery should re-attach active session"
-            );
-            let task = runtime
-                .store
-                .get_task(&task_id)
-                .expect("read task")
-                .expect("task should exist");
-            assert_eq!(task.state, TaskRuntimeState::Running);
-            assert!(runtime.delivery_events.iter().any(|event| {
-                event.task_id == task_id && event.event_type == "recovery_attached"
-            }));
-        }
+        let runtime = runtime_state().lock().expect("runtime lock");
+        let task = runtime
+            .store
+            .get_task(&task_id)
+            .expect("read task")
+            .expect("task should exist");
+        assert_eq!(task.state, TaskRuntimeState::FailedRetryable);
+        assert!(runtime.delivery_events.iter().any(|event| {
+            event.task_id == task_id
+                && event.event_type == "recovery_unsupported_runner_mode"
+                && event.session_id.as_deref() == Some(session_id.as_str())
+        }));
 
-        let _ = StdCommand::new("tmux")
-            .args(["kill-session", "-t", &session_id])
-            .output();
-        {
-            let mut runtime = runtime_state().lock().expect("runtime lock");
-            runtime.sessions.remove(&task_id);
-            if let Some(task) = runtime.store.get_task(&task_id).expect("read task")
-                && can_transition_to_failed_retryable(task.state)
-            {
-                let _ = runtime
-                    .store
-                    .transition(&task_id, TaskRuntimeState::FailedRetryable);
-            }
-        }
+        let sessions = runtime
+            .store
+            .list_task_sessions(&task_id)
+            .expect("task sessions should be readable");
+        let latest = sessions
+            .iter()
+            .find(|entry| entry.session_id == session_id)
+            .expect("legacy attempt should remain queryable");
+        assert_eq!(
+            latest.terminal_state.as_deref(),
+            Some("unsupported_runner_mode")
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
