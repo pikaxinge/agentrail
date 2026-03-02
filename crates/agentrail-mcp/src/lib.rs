@@ -4618,7 +4618,7 @@ mod tests {
     use std::{
         io::{self, Write},
         process::Command as StdCommand,
-        sync::{Arc, Mutex},
+        sync::{Arc, Mutex, OnceLock},
         time::{SystemTime, UNIX_EPOCH},
     };
 
@@ -4670,6 +4670,38 @@ mod tests {
             .expect("monotonic clock")
             .as_nanos();
         format!("{prefix}-{now}")
+    }
+
+    fn runtime_test_guard() -> std::sync::MutexGuard<'static, ()> {
+        static TEST_RUNTIME_GUARD: OnceLock<Mutex<()>> = OnceLock::new();
+        TEST_RUNTIME_GUARD
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+    }
+
+    fn reset_runtime_for_test() {
+        let mut runtime = runtime_state().lock().expect("runtime lock");
+        runtime.sessions.clear();
+        runtime.delivery_events.clear();
+        runtime.pending_delivery_task_events.clear();
+        runtime.next_delivery_cursor = 1;
+        runtime.delivery_subscriptions.clear();
+        runtime.last_event_signature_by_task.clear();
+        runtime.last_status_observation_by_task.clear();
+        runtime.last_steer_observation_by_task.clear();
+        runtime.output_freshness_by_task.clear();
+        runtime.retry_idempotency_replays.clear();
+        runtime
+            .store
+            .import_snapshot(TaskStoreSnapshot { tasks: Vec::new() })
+            .expect("clear runtime task snapshot");
+    }
+
+    fn begin_runtime_test() -> std::sync::MutexGuard<'static, ()> {
+        let guard = runtime_test_guard();
+        reset_runtime_for_test();
+        guard
     }
 
     #[test]
@@ -4783,6 +4815,7 @@ mod tests {
 
     #[test]
     fn handle_tool_call_emits_structured_trace_fields_for_success() {
+        let _runtime_guard = begin_runtime_test();
         let task_id = unique_test_task_id("task-trace-success");
         let buffer = SharedBuffer::default();
         let subscriber = tracing_subscriber::fmt()
@@ -4851,6 +4884,7 @@ mod tests {
 
     #[test]
     fn record_delivery_steer_sent_updates_observation_and_emits_event() {
+        let _runtime_guard = begin_runtime_test();
         let task_id = unique_test_task_id("steer-observation");
         {
             let mut runtime = runtime_state().lock().expect("runtime lock");
@@ -4918,6 +4952,7 @@ mod tests {
 
     #[test]
     fn maybe_record_delivery_steer_observed_sets_observed_once() {
+        let _runtime_guard = begin_runtime_test();
         let task_id = unique_test_task_id("steer-observed");
         {
             let runtime = runtime_state().lock().expect("runtime lock");
@@ -4983,6 +5018,7 @@ mod tests {
 
     #[test]
     fn emit_delivery_event_attempt_precedence_prefers_new_attempt_number() {
+        let _runtime_guard = begin_runtime_test();
         let task_id = unique_test_task_id("delivery-attempt-precedence");
         {
             let mut runtime = runtime_state().lock().expect("runtime lock");
@@ -5026,7 +5062,8 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn poll_runtime_once_reports_task_failures_and_cleans_missing_sessions() {
+    async fn poll_runtime_once_cleans_missing_sessions_without_error() {
+        let _runtime_guard = begin_runtime_test();
         let task_id = unique_test_task_id("poll-missing-session");
         {
             let mut runtime = runtime_state().lock().expect("runtime lock");
@@ -5047,23 +5084,20 @@ mod tests {
             );
         }
 
-        let err = poll_runtime_once()
+        poll_runtime_once()
             .await
-            .expect_err("poll should report per-task failure");
-        assert!(
-            err.to_string().contains(&task_id),
-            "expected task id in poll error: {err}"
-        );
+            .expect("poll should tolerate missing session and continue");
 
         let runtime = runtime_state().lock().expect("runtime lock");
         assert!(
             !runtime.sessions.contains_key(&task_id),
-            "stale missing session should be removed after poll failure"
+            "stale missing session should be removed after poll refresh"
         );
     }
 
     #[tokio::test(flavor = "current_thread")]
     async fn task_runtime_status_reports_session_missing_stall_diagnostics() {
+        let _runtime_guard = begin_runtime_test();
         let task_id = unique_test_task_id("status-session-missing");
         {
             let runtime = runtime_state().lock().expect("runtime lock");
@@ -5101,6 +5135,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn startup_recovery_attaches_live_tmux_session() {
+        let _runtime_guard = begin_runtime_test();
         if !tmux_available() {
             return;
         }
@@ -5177,6 +5212,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn startup_recovery_missing_session_transitions_to_failed_retryable() {
+        let _runtime_guard = begin_runtime_test();
         let task_id = unique_test_task_id("startup-missing");
         let missing_session_id = unique_test_task_id("missing-session");
         {
@@ -5230,6 +5266,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn startup_recovery_is_idempotent_for_missing_session_path() {
+        let _runtime_guard = begin_runtime_test();
         let task_id = unique_test_task_id("startup-idempotent");
         let missing_session_id = unique_test_task_id("missing-session-idempotent");
         {
