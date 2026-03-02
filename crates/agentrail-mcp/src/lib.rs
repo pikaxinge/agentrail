@@ -13,8 +13,7 @@ use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{
-    Arc,
-    Mutex, OnceLock,
+    Arc, Mutex, OnceLock,
     atomic::{AtomicBool, AtomicU64, Ordering},
 };
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -1087,7 +1086,9 @@ async fn app_server_mark_terminal(
     Ok(())
 }
 
-async fn app_server_refresh_state(session: &Arc<AppServerSession>) -> Result<AppServerSessionState> {
+async fn app_server_refresh_state(
+    session: &Arc<AppServerSession>,
+) -> Result<AppServerSessionState> {
     let mut inner = session.inner.lock().await;
     let mut transitioned_terminal = false;
     if inner.state == AppServerSessionState::Running {
@@ -1145,7 +1146,10 @@ fn app_server_rpc_timeout_ms(method: &str) -> u64 {
             APP_SERVER_TURN_RPC_TIMEOUT_MS,
         )
     } else {
-        parse_env_timeout("AGENTRAIL_APP_SERVER_RPC_TIMEOUT_MS", APP_SERVER_RPC_TIMEOUT_MS)
+        parse_env_timeout(
+            "AGENTRAIL_APP_SERVER_RPC_TIMEOUT_MS",
+            APP_SERVER_RPC_TIMEOUT_MS,
+        )
     }
 }
 
@@ -1177,7 +1181,12 @@ fn extract_turn_id(value: &Value) -> Option<String> {
                 .and_then(Value::as_str)
                 .map(ToString::to_string)
         })
-        .or_else(|| value.get("id").and_then(Value::as_str).map(ToString::to_string))
+        .or_else(|| {
+            value
+                .get("id")
+                .and_then(Value::as_str)
+                .map(ToString::to_string)
+        })
 }
 
 fn terminal_state_from_turn_completion(notification: &Value) -> AppServerSessionState {
@@ -1432,9 +1441,9 @@ async fn app_server_rpc_request(
     let timeout_ms = app_server_rpc_timeout_ms(method);
     let response = match tokio::time::timeout(Duration::from_millis(timeout_ms), rx).await {
         Ok(Ok(response)) => response,
-        Ok(Err(_)) => anyhow::bail!(
-            "app_server request {method} failed: session closed before response"
-        ),
+        Ok(Err(_)) => {
+            anyhow::bail!("app_server request {method} failed: session closed before response")
+        }
         Err(_) => {
             let mut inner = session.inner.lock().await;
             inner.pending.remove(&request_id);
@@ -1609,7 +1618,11 @@ async fn app_server_logs(session_id: &str, tail: usize) -> Result<String> {
     let _ = app_server_refresh_state(&session).await?;
     let logs = session.logs.lock().await;
     if tail == 0 || tail >= logs.len() {
-        return Ok(logs.iter().map(String::as_str).collect::<Vec<_>>().join("\n"));
+        return Ok(logs
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>()
+            .join("\n"));
     }
     Ok(logs
         .iter()

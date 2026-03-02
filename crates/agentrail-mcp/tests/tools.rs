@@ -8,9 +8,9 @@ use std::{
 use agentrail_mcp::handle_tool_call;
 use agentrail_store::TaskStore;
 use serde_json::json;
-use tempfile::tempdir;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
+use tempfile::tempdir;
 
 fn unique_task_id(prefix: &str) -> String {
     let now = SystemTime::now()
@@ -937,8 +937,11 @@ fn delivery_submit_allows_steer_required_for_app_server_without_interactive_comm
 #[test]
 fn delivery_status_maps_app_server_completed_turn_to_ready_to_merge() {
     let tmp = tempdir().expect("tempdir");
-    let (script_path, _request_log_path) =
-        write_fake_app_server_script(tmp.path(), "fake-app-server-completed.sh", Some("completed"));
+    let (script_path, _request_log_path) = write_fake_app_server_script(
+        tmp.path(),
+        "fake-app-server-completed.sh",
+        Some("completed"),
+    );
     let task_id = unique_task_id("task-delivery-app-server-completed");
 
     let _submit = handle_tool_call(
@@ -1043,7 +1046,9 @@ fn delivery_submit_app_server_runner_maps_submit_steer_stop_over_stdio_jsonrpc()
         fs::read_to_string(&request_log_path).expect("fake app server request log should exist");
     let requests = request_log
         .lines()
-        .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("line should be valid json"))
+        .map(|line| {
+            serde_json::from_str::<serde_json::Value>(line).expect("line should be valid json")
+        })
         .collect::<Vec<_>>();
     assert!(
         requests
