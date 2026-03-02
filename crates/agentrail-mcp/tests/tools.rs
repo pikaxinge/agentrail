@@ -2330,6 +2330,218 @@ fn delivery_events_reconnect_with_cursor_replays_without_loss() {
 }
 
 #[test]
+fn delivery_timeline_and_explain_failure_return_stable_payloads_for_unknown_task() {
+    let task_id = unique_task_id("task-timeline-empty");
+
+    let timeline = handle_tool_call(
+        "delivery_timeline",
+        json!({
+            "task_id": task_id,
+            "limit": 5
+        }),
+    )
+    .expect("delivery_timeline should succeed for unknown task");
+
+    assert_eq!(timeline["tool"], "delivery_timeline");
+    assert_eq!(timeline["task_id"], json!(task_id));
+    assert_eq!(timeline["cursor"], json!(0));
+    assert_eq!(timeline["next_cursor"], json!(0));
+    assert_eq!(timeline["has_more"], json!(false));
+    assert_eq!(
+        timeline["events"]
+            .as_array()
+            .expect("events should be array")
+            .len(),
+        0
+    );
+
+    let resumed_timeline = handle_tool_call(
+        "delivery_timeline",
+        json!({
+            "task_id": task_id,
+            "cursor": 99,
+            "limit": 5
+        }),
+    )
+    .expect("delivery_timeline should keep empty timeline responses stable for non-zero cursor");
+    assert_eq!(resumed_timeline["cursor"], json!(99));
+    assert_eq!(resumed_timeline["next_cursor"], json!(99));
+    assert_eq!(resumed_timeline["has_more"], json!(false));
+    assert_eq!(
+        resumed_timeline["events"]
+            .as_array()
+            .expect("events should be array")
+            .len(),
+        0
+    );
+
+    let explain = handle_tool_call(
+        "delivery_explain_failure",
+        json!({
+            "task_id": task_id
+        }),
+    )
+    .expect("delivery_explain_failure should succeed for unknown task");
+
+    assert_eq!(explain["tool"], "delivery_explain_failure");
+    assert_eq!(explain["task_id"], json!(task_id));
+    assert_eq!(explain["runtime_state"], "unknown");
+    assert_eq!(explain["failed"], json!(false));
+    assert!(explain["summary"].is_string());
+    assert!(explain["latest_failure_event"].is_null());
+    assert_eq!(
+        explain["state_transitions"]
+            .as_array()
+            .expect("state_transitions should be array")
+            .len(),
+        0
+    );
+    assert_eq!(explain["timeline_cursor"], json!(0));
+}
+
+#[test]
+fn delivery_timeline_paginates_stably_by_event_cursor() {
+    let tmp = tempdir().expect("tempdir");
+    let task_id = unique_task_id("task-timeline-pagination");
+
+    let _submit = handle_tool_call(
+        "delivery_submit",
+        json!({
+            "task_id": task_id,
+            "worker_id": "worker-a",
+            "runner_mode": "process",
+            "command": "bash",
+            "args": ["-lc", "sleep 5"],
+            "workdir": tmp.path().display().to_string()
+        }),
+    )
+    .expect("delivery_submit should succeed");
+    let _ = wait_for_runtime_state(&task_id, "running");
+
+    let _ = handle_tool_call(
+        "delivery_stop",
+        json!({
+            "task_id": task_id,
+            "reason": "timeline-pagination"
+        }),
+    )
+    .expect("delivery_stop should succeed");
+    let _ = wait_for_runtime_state(&task_id, "failed_retryable");
+
+    let first_page = handle_tool_call(
+        "delivery_timeline",
+        json!({
+            "task_id": task_id,
+            "limit": 2
+        }),
+    )
+    .expect("delivery_timeline first page should succeed");
+    let first_events = first_page["events"]
+        .as_array()
+        .expect("events should be array");
+    assert_eq!(first_events.len(), 2, "expected exact first page size");
+
+    let first_ids = first_events
+        .iter()
+        .map(|event| {
+            event["id"]
+                .as_i64()
+                .expect("timeline event id should be integer")
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        first_ids.windows(2).all(|window| window[0] < window[1]),
+        "first page should be sorted by id ascending: {first_ids:?}"
+    );
+
+    let next_cursor = first_page["next_cursor"]
+        .as_u64()
+        .expect("next_cursor should be u64");
+    let second_page = handle_tool_call(
+        "delivery_timeline",
+        json!({
+            "task_id": task_id,
+            "cursor": next_cursor,
+            "limit": 50
+        }),
+    )
+    .expect("delivery_timeline second page should succeed");
+    let second_events = second_page["events"]
+        .as_array()
+        .expect("events should be array");
+    assert!(
+        second_events
+            .iter()
+            .all(|event| event["cursor"].as_u64().expect("cursor should be u64") > next_cursor),
+        "second page should only include events after cursor {next_cursor}: {second_events:?}"
+    );
+}
+
+#[test]
+fn delivery_explain_failure_references_latest_failure_event() {
+    let tmp = tempdir().expect("tempdir");
+    let task_id = unique_task_id("task-explain-failure");
+
+    let _submit = handle_tool_call(
+        "delivery_submit",
+        json!({
+            "task_id": task_id,
+            "worker_id": "worker-a",
+            "runner_mode": "process",
+            "command": "bash",
+            "args": ["-lc", "sleep 5"],
+            "workdir": tmp.path().display().to_string()
+        }),
+    )
+    .expect("delivery_submit should succeed");
+    let _ = wait_for_runtime_state(&task_id, "running");
+
+    let _ = handle_tool_call(
+        "delivery_stop",
+        json!({
+            "task_id": task_id,
+            "reason": "explain-failure"
+        }),
+    )
+    .expect("delivery_stop should succeed");
+    let _ = wait_for_runtime_state(&task_id, "failed_retryable");
+
+    let explain = handle_tool_call(
+        "delivery_explain_failure",
+        json!({
+            "task_id": task_id
+        }),
+    )
+    .expect("delivery_explain_failure should succeed");
+
+    assert_eq!(explain["tool"], "delivery_explain_failure");
+    assert_eq!(explain["runtime_state"], "failed_retryable");
+    assert_eq!(explain["failed"], json!(true));
+    assert!(
+        explain["summary"]
+            .as_str()
+            .expect("summary should be string")
+            .contains("runtime_state=failed_retryable"),
+        "summary should mention runtime state: {}",
+        explain["summary"]
+    );
+    assert_eq!(explain["latest_failure_event"]["task_id"], json!(task_id));
+    assert!(
+        explain["latest_failure_event"]["id"]
+            .as_i64()
+            .expect("latest failure event id should be integer")
+            > 0
+    );
+    assert!(
+        !explain["state_transitions"]
+            .as_array()
+            .expect("state_transitions should be array")
+            .is_empty(),
+        "state_transitions should include failure-related transitions"
+    );
+}
+
+#[test]
 fn runtime_attempts_and_sessions_persist_for_launches_and_reconnect() {
     let tmp = tempdir().expect("tempdir");
     let task_id = unique_task_id("task-attempt-persist");

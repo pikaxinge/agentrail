@@ -25,7 +25,9 @@ use tracing::{info, warn};
 
 use agentrail_core::{Phase, PhaseStatus, Plan, Step, StepStatus};
 use agentrail_runner::{AgentRunner, ProcessRunner, TaskHandle, TaskSpec, TaskStatus};
-use agentrail_store::{TaskEventDraft, TaskRecord, TaskRuntimeState, TaskStore, TaskStoreSnapshot};
+use agentrail_store::{
+    TaskEventDraft, TaskEventRecord, TaskRecord, TaskRuntimeState, TaskStore, TaskStoreSnapshot,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RuntimeRunnerMode {
@@ -3600,6 +3602,162 @@ fn task_matches_filter(event_task_id: &str, filter: Option<&str>) -> bool {
     }
 }
 
+fn task_event_id_u64(event: &TaskEventRecord) -> u64 {
+    u64::try_from(event.id).unwrap_or_default()
+}
+
+fn task_event_payload_value(event: &TaskEventRecord) -> Value {
+    event
+        .payload_json
+        .as_deref()
+        .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
+        .unwrap_or(Value::Null)
+}
+
+fn task_event_as_json(event: &TaskEventRecord) -> Value {
+    json!({
+        "id": event.id,
+        "cursor": task_event_id_u64(event),
+        "task_id": event.task_id,
+        "attempt": event.attempt,
+        "ts_ms": event.ts_ms,
+        "event_type": event.event_type,
+        "source": event.source,
+        "actor": event.actor,
+        "session_id": event.session_id,
+        "state_before": event.state_before,
+        "state_after": event.state_after,
+        "message": event.message,
+        "payload_json": event.payload_json,
+        "payload": task_event_payload_value(event),
+        "idem_key": event.idem_key
+    })
+}
+
+fn delivery_timeline(args: Value) -> Result<Value> {
+    let task_id = require_task_id("delivery_timeline", &args)?.to_string();
+    let requested_cursor = parse_optional_u64(&args, "cursor")?;
+    let limit = optional_u32(&args, "limit", 50)? as usize;
+    let limit = limit.clamp(1, 500);
+
+    let runtime = runtime_state_mutex()?;
+    let events = runtime.store.list_task_events(&task_id, None)?;
+    let latest_cursor = events.last().map(task_event_id_u64).unwrap_or(0);
+    if let Some(cursor) = requested_cursor
+        && latest_cursor > 0
+    {
+        validate_delivery_cursor_bounds("delivery_timeline", "cursor", cursor, latest_cursor)?;
+    }
+
+    let start_cursor = requested_cursor.unwrap_or(0);
+    let mut next_cursor = start_cursor;
+    let mut items = Vec::new();
+    for event in &events {
+        let event_cursor = task_event_id_u64(event);
+        if event_cursor <= start_cursor {
+            continue;
+        }
+        next_cursor = event_cursor;
+        items.push(task_event_as_json(event));
+        if items.len() >= limit {
+            break;
+        }
+    }
+    let has_more = events.iter().any(|event| {
+        task_event_id_u64(event) > next_cursor && task_event_id_u64(event) > start_cursor
+    });
+
+    Ok(json!({
+        "tool": "delivery_timeline",
+        "task_id": task_id,
+        "cursor": start_cursor,
+        "next_cursor": next_cursor,
+        "has_more": has_more,
+        "events": items
+    }))
+}
+
+fn event_is_failure_signal(event: &TaskEventRecord) -> bool {
+    if matches!(
+        event.event_type.as_str(),
+        "failed"
+            | "stopped"
+            | "needs_attention"
+            | "recovery_missing_session"
+            | "recovery_unsupported_runner_mode"
+    ) {
+        return true;
+    }
+    event
+        .state_after
+        .as_deref()
+        .is_some_and(|label| label.contains("failed") || label == "needs_attention")
+}
+
+fn delivery_explain_failure(args: Value) -> Result<Value> {
+    let task_id = require_task_id("delivery_explain_failure", &args)?.to_string();
+    let runtime = runtime_state_mutex()?;
+    let task = runtime.store.get_task(&task_id)?;
+    let events = runtime.store.list_task_events(&task_id, None)?;
+
+    let runtime_state = task
+        .as_ref()
+        .map(|record| runtime_state_label(record.state).to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+    let failed = task.as_ref().is_some_and(|record| {
+        matches!(
+            record.state,
+            TaskRuntimeState::FailedRetryable
+                | TaskRuntimeState::FailedTerminal
+                | TaskRuntimeState::NeedsAttention
+        )
+    });
+    let latest_failure_event = events
+        .iter()
+        .rev()
+        .find(|event| event_is_failure_signal(event));
+    let latest_event_id = events.last().map(task_event_id_u64).unwrap_or(0);
+    let transitions = events
+        .iter()
+        .filter(|event| {
+            event.state_before.is_some()
+                && event.state_after.is_some()
+                && event.state_before != event.state_after
+        })
+        .rev()
+        .take(3)
+        .map(task_event_as_json)
+        .collect::<Vec<_>>();
+
+    let summary = if task.is_none() {
+        "task not found; no failure summary available".to_string()
+    } else if !failed {
+        format!(
+            "task is not in failure state (runtime_state={runtime_state}); no active failure explanation"
+        )
+    } else if let Some(event) = latest_failure_event {
+        format!(
+            "task failed with runtime_state={runtime_state}; latest failure signal event_type={} source={} event_id={}",
+            event.event_type, event.source, event.id
+        )
+    } else {
+        format!(
+            "task is in failure state (runtime_state={runtime_state}); no failure signal event found in timeline"
+        )
+    };
+
+    Ok(json!({
+        "tool": "delivery_explain_failure",
+        "task_id": task_id,
+        "runtime_state": runtime_state,
+        "failed": failed,
+        "summary": summary,
+        "latest_failure_event": latest_failure_event.map(task_event_as_json).unwrap_or(Value::Null),
+        "state_transitions": transitions,
+        "timeline_cursor": latest_event_id
+    }))
+}
+
 fn delivery_events_subscribe(args: Value) -> Result<Value> {
     let subscriber_id = optional_string(&args, "subscriber_id").unwrap_or_else(next_subscriber_id);
     let requested_cursor = parse_optional_u64(&args, "cursor")?;
@@ -4792,6 +4950,30 @@ fn mcp_tools_descriptor() -> Value {
             }
         },
         {
+            "name":"delivery_timeline",
+            "description":"Return persisted lifecycle timeline events for a task with deterministic pagination",
+            "inputSchema": {
+                "type":"object",
+                "properties": {
+                    "task_id": {"type":"string"},
+                    "limit": {"type":"integer"},
+                    "cursor": {"type":"integer"}
+                },
+                "required": ["task_id"]
+            }
+        },
+        {
+            "name":"delivery_explain_failure",
+            "description":"Return concise deterministic failure explanation linked to timeline events",
+            "inputSchema": {
+                "type":"object",
+                "properties": {
+                    "task_id": {"type":"string"}
+                },
+                "required": ["task_id"]
+            }
+        },
+        {
             "name":"delivery_report",
             "description":"Return aggregated runtime report for all tracked tasks",
             "inputSchema": {
@@ -4984,6 +5166,8 @@ pub fn handle_tool_call_with_allowed_root(
         "delivery_events_subscribe" => delivery_events_subscribe(args),
         "delivery_events_next" => delivery_events_next(args),
         "delivery_events_ack" => delivery_events_ack(args),
+        "delivery_timeline" => delivery_timeline(args),
+        "delivery_explain_failure" => delivery_explain_failure(args),
         "delivery_stop" => block_on_result(delivery_stop_runtime(args)),
         "delivery_cleanup" => block_on_result(delivery_cleanup_runtime(args)),
         "delivery_report" => runtime_report(&args),
@@ -5968,5 +6152,29 @@ mod tests {
             .expect("read task")
             .expect("task should exist");
         assert_eq!(task.state, TaskRuntimeState::FailedRetryable);
+    }
+
+    #[test]
+    fn event_is_failure_signal_detects_needs_attention_state_transition() {
+        let event = TaskEventRecord {
+            id: 42,
+            task_id: "task-needs-attention".to_string(),
+            attempt: 1,
+            ts_ms: 0,
+            event_type: "state_transition".to_string(),
+            source: "mcp_delivery".to_string(),
+            actor: None,
+            session_id: Some("session-1".to_string()),
+            state_before: Some("running".to_string()),
+            state_after: Some("needs_attention".to_string()),
+            message: Some("manual intervention required".to_string()),
+            payload_json: None,
+            idem_key: None,
+        };
+
+        assert!(
+            event_is_failure_signal(&event),
+            "needs_attention transition should be treated as failure signal"
+        );
     }
 }

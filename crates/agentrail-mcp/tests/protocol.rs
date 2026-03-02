@@ -83,6 +83,12 @@ fn tools_list_contains_plan_tools() {
     );
     assert!(tools.iter().any(|t| t["name"] == "delivery_events_next"));
     assert!(tools.iter().any(|t| t["name"] == "delivery_events_ack"));
+    assert!(tools.iter().any(|t| t["name"] == "delivery_timeline"));
+    assert!(
+        tools
+            .iter()
+            .any(|t| t["name"] == "delivery_explain_failure")
+    );
     assert!(tools.iter().any(|t| t["name"] == "delivery_stop"));
     assert!(tools.iter().any(|t| t["name"] == "delivery_cleanup"));
     assert!(tools.iter().any(|t| t["name"] == "delivery_report"));

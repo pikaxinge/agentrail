@@ -166,6 +166,29 @@ App Server server-request handling:
 - `delivery_events_next`: fetch next event page after cursor.
 - `delivery_events_ack`: acknowledge cursor for at-least-once delivery.
 
+### `delivery_timeline`
+- Returns persisted lifecycle timeline events for one task from `task_events`.
+- Required input: `task_id`.
+- Optional:
+  - `limit` (default `50`, clamped to `1..500`)
+  - `cursor` (event-id cursor; returns events strictly after cursor)
+- Response semantics:
+  - stable ordering by persisted event id (ascending)
+  - deterministic pagination fields: `cursor`, `next_cursor`, `has_more`
+  - empty timeline returns stable non-error payload (`events=[]`, `next_cursor` unchanged)
+
+### `delivery_explain_failure`
+- Returns concise deterministic failure explanation for one task, linked to timeline events.
+- Required input: `task_id`.
+- Response includes:
+  - `runtime_state`
+  - `failed` boolean
+  - `summary` deterministic text
+  - `latest_failure_event` (timeline-linked event object or `null`)
+  - `state_transitions` (recent relevant transitions)
+  - `timeline_cursor` (latest known timeline cursor)
+- Empty or unknown task cases return stable non-error payloads.
+
 ### `delivery_report`
 - Returns aggregated runtime summary and task rows.
 - Supports filters: `scope_id`, `states`, `updated_since_epoch_ms`, pagination with `limit` and `cursor`.
