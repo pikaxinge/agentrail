@@ -1,187 +1,168 @@
-# AGENTS.md
+# AGENTS
 
-This document defines how coding agents should operate in `agentrail`.
+> Purpose: run deterministic, MCP-driven self-bootstrap delivery for the `agentrail` repository.
 
-## Project mission
-- Build a Rust-native orchestration control plane for chat-driven multi-agent execution.
-- Preserve behavior-compatibility level 2 with legacy CLI/MCP semantics.
-- Prioritize correctness and observability over speculative optimization.
+## Role & objective
+- Role: Owner + Orchestrator (single primary session).
+- Objective: deliver one issue per round from scope lock to merged PR, then close with retrospective and handoff.
 
-## Architecture boundaries
-- `crates/agentrail-core`: domain model, state machine, DAG and validation rules.
-- `crates/agentrail-plan-io`: plan.yaml parsing, hashing, CAS checks, atomic writes.
-- `crates/agentrail-store`: transactional runtime state (target: SQLite WAL).
-- `crates/agentrail-runner`: runner abstraction and adapters (`ProcessRunner`, `TmuxRunner`).
-- `crates/agentrail-mcp`: MCP transport and tool interface.
-- `crates/agentrail-cli`: user-facing CLI and compatibility command surface.
-- `crates/agentrail-dashboard`: static HTML and Mermaid-based visualization rendering.
-- `crates/agentrail-compat-tests`: compatibility/differential harness.
+## Constraints (non-negotiable)
+- One round = one issue = one branch + one PR path.
+- MCP-first execution: submit, observe, steer, stop, cleanup through MCP tools.
+- Primary orchestrator session does not perform manual code edits during MCP-only rounds.
+- Do not close a round at "PR opened"; close only after merge + retro + handoff.
+- Prefer `runner_mode=tmux` for coding tasks that may need live correction.
+- Use `runner_mode=process` only for deterministic one-shot tasks that do not require steering.
+- No destructive git/history operations unless explicitly requested.
+- No completion claims without command evidence.
 
-## Engineering principles
-- Do the simplest thing that is correct.
-- Keep domain logic pure; IO and transport live outside core.
-- Maintain deterministic behavior for status, scheduling, and checkpoints.
-- Any write path touching plans must keep CAS semantics.
+## Tech & data
+- Language/toolchain: Rust workspace, Cargo, clippy/fmt/test toolchain.
+- Runtime/state: SQLite-backed runtime store (WAL), plan YAML state, MCP runtime envelopes.
+- Main inputs:
+  - repository source code and tests
+  - `plan.yaml` files
+  - docs in `docs/`
+  - issue/PR metadata from git workflow
+- Main references:
+  - `docs/mcp-tools.md`
+  - `docs/testing-policy.md`
+  - `docs/architecture/SYSTEM_ARCHITECTURE.md`
 
-## Workflow for each task
-1. Read relevant docs under `docs/requirements` and `docs/architecture`.
-2. Add or update tests first for behavior changes.
-3. Implement minimal code to satisfy tests.
-4. Run required verification commands.
-5. Commit focused changes with clear message.
-
-For full session orchestration (DAG decomposition, parallel workers, review loop, CI gates, and cleanup), see:
-- `docs/operations/SESSION_ORCHESTRATION_WORKFLOW.md`
-- `docs/operations/BOOTSTRAP_LOOP.md`
-- When running self-bootstrap rounds, the orchestrator must explicitly load and follow skill `agentrail-self-bootstrap-loop` as the authoritative execution contract.
-
-## TMUX Round Protocol (Required for Self-Bootstrap)
-Use this protocol when an orchestrator controls codex/agents through tmux sessions.
-
-### Control model
-- `agentrail` MCP tools are the default control plane.
-- `tmux` is runtime transport for long tasks and steering, not a replacement for `agentrail`.
-- Any non-MCP action (`shell` hotfix/manual git surgery/direct code patching) is a break-glass event and must be logged as friction.
-- During self-bootstrap rounds, the owner+orchestrator primary session must not use any superpower-style command/instruction path.
-- Superpower-style instructions are allowed only inside subordinate runner sessions (for example worker codex sessions launched by MCP).
-
-### One round = one closed loop
-Each tmux session should run one full round and then exit.
-
-1. Input + Scope:
-- load task goal, acceptance criteria, and constraints.
-
-2. Plan:
-- decompose into DAG (parallel nodes + dependencies).
-
-3. Execute:
-- dispatch workers, run review loops, converge to passing implementation.
-
-4. Validate:
-- run CI-equivalent checks (`fmt`, `check`, `test`, locked mode when relevant).
-
-5. Integrate:
-- open PR, satisfy review/CI gates, merge.
-
-6. Reflect:
-- write retrospective for this round (what blocked smooth execution).
-
-7. Friction logging:
-- open at least one friction issue when there was any non-smooth step.
-
-8. Handoff:
-- write next-round handoff state (remaining tasks, new issues, expected MCP version).
-
-9. Exit session:
-- end this tmux round after close gate passes.
-
-### Hard gates
-Round close gate (must pass before tmux session exit):
-- PR state is `MERGED`.
-- Retrospective file exists and is non-empty.
-- Friction issue(s) created when friction occurred.
-- Next-round handoff file exists.
-
-Round open gate (must pass before next tmux round starts):
-- target binary build succeeded.
-- MCP version/probe matches expected revision.
-- required MCP tool surface is available:
+## Project testing strategy
+- Unit/integration:
+  - `cargo test --workspace --all-targets` (full)
+  - targeted crate tests when scope is narrow
+- MCP/protocol:
+  - `cargo check -p agentrail-mcp`
+  - `cargo test -p agentrail-mcp --test protocol --test tools`
+- Build/run:
+  - `cargo fmt --all --check`
+  - `cargo check --workspace --all-targets`
+  - `cargo build -p agentrail-mcp`
+- MCP tools in scope:
   - `plan_*`
   - `orchestrate_*`
   - `delivery_*`
+  - `agentrail/reload` (worker hot reload)
 
-### Autonomous worker guard (required)
-- For non-interactive coding rounds launched through MCP, use `scripts/codex-guarded-exec.sh`.
-- The guard must enforce a no-edit timeout and fail fast when the worker loops in read/search without mutating the workspace.
-- Do not run raw `codex exec` directly for autonomous delivery rounds unless explicitly debugging guard behavior.
+## E2E loop
+E2E loop = plan → issues → implement → test → review → commit → regression.
 
-### Smoothness targets
-- `non_mcp_actions = 0` (target).
-- high CI first-pass rate.
-- low review rework loops.
-- no unresolved P0/P1 friction issues.
+Round gates:
+1. Open Gate:
+- sync `main`
+- lock issue scope (DoD, non-goals)
+- ensure current MCP binary and tool surface
+2. Execute Gate:
+- `delivery_submit`
+- `delivery_events_subscribe/next/ack` + `delivery_status`
+- `delivery_steer` for drift correction
+- `delivery_stop` + narrowed resubmit on stuck runs
+3. Merge Gate:
+- keep branch up-to-date
+- pass required CI checks and review requirements
+- merge PR
+4. Close Gate:
+- retrospective + handoff artifacts
+- `delivery_report`
+- `delivery_cleanup`
 
-The loop is not complete at merge. It is complete only after: merge -> retrospective -> friction issue creation -> handoff.
+## Review workflow (two-step, required)
+Step 1: DoD review loop (during execution)
+- DoD must include explicit review checkpoints, not only implementation checkpoints.
+- Use an iterative loop until green:
+  1. implement change slice
+  2. run required tests/checks for scope
+  3. review diffs and behavior against DoD
+  4. fix gaps and repeat
+- Keep this loop active until CI-required checks and review requirements are satisfied.
 
-## Owner+Orchestrator Self-Bootstrap Contract (Hard Rules)
-These rules are mandatory for self-bootstrap rounds and must be treated as a fixed execution contract.
+Step 2: final agent self-review (before round close)
+- After PR is merge-ready (or merged), run a self-review that covers:
+  - code and behavior correctness
+  - workflow smoothness from orchestrator/operator perspective
+  - MCP usability clarity from end-user perspective (tool discoverability, semantics, error clarity, docs clarity)
+- For any non-smooth point, open a friction issue with repro + impact + expected behavior.
+- For any product/functionality improvement opportunity, open a functional issue with user value and acceptance criteria.
+- Record both outcomes in retrospective/handoff:
+  - what was learned
+  - what issue(s) were opened
+  - why this improves next-round smoothness
 
-1. Single-goal round:
-- One round handles exactly one issue.
-- Do not start another issue before current round reaches Close Gate.
+## Plan & issue generation
+- Use the `plan` skill for plan decomposition and issue generation when creating new workstreams.
+- Every issue plan must include:
+  - implementation steps
+  - test strategy
+  - risks
+  - rollback/safety notes
+  - acceptance criteria (DoD)
 
-2. Open Gate (required):
-- Sync `main`, define round issue, DoD, and non-goals.
-- Ensure MCP binary matches current target commit.
-- If mismatch: run `cargo build -p agentrail-mcp`, then call `agentrail/reload`.
-- Verify tool surface is available: `plan_*`, `orchestrate_*`, `delivery_*`.
-- For steerable coding rounds, verify `tmux` is available.
+## Issue workflow (GitHub-first)
+- Default workflow is GitHub issue-driven; Issue CSV is optional.
+- One round must map to one GitHub issue and one PR.
+- Source of truth for scope is the issue body: objective, acceptance criteria, and non-goals.
+- Round sequence:
+  1. Pick one open issue (bootstrap-generated friction issues have priority).
+  2. Run DoD triage on latest `main` before coding:
+     - inspect issue scope, relevant code paths, tests, and recent related changes
+     - determine whether a concrete defect is already evident from code/behavior evidence
+     - reproduction is recommended when diagnosis is uncertain, but not mandatory if defect is already clear
+  3. If a concrete defect is confirmed (with or without reproduction):
+     - lock DoD/non-goals into the round brief
+     - create branch `issue-<number>-<slug>`
+     - execute implementation and tests through MCP loop
+     - open PR linked to the issue with `Fixes #<number>`
+     - keep PR up-to-date and green until merge
+     - merge PR, verify issue auto-closes, then write retro + handoff
+  4. If no concrete defect is confirmed:
+     - attempt a minimal reproduction workflow from issue steps/symptoms
+     - if reproduction succeeds, treat as confirmed defect and follow step 3
+     - if reproduction still fails, search for existing fix evidence in repository history (PR/commit/code path)
+     - validate that the suspected fix covers the reported symptom
+     - if evidence is sufficient, comment on issue with:
+       - triage summary and reproduction outcome
+       - linked PR/commit and relevant code location
+       - verification notes on latest `main`
+     - close the issue without opening a new branch/PR
+     - record this decision in round retro/handoff, then move to next eligible issue
+- If blocked:
+  - post an issue comment with blocker, impact, and next action
+  - open a linked friction issue when the blocker is tooling/runtime/process related
 
-3. Execute Gate (MCP-only):
-- Primary owner+orchestrator session must control execution via MCP tools only.
-- Submit coding task through `delivery_submit` with `runner_mode=tmux`.
-- For steer-required rounds, enforce `steer_required=true` and `interactive_command=true`.
-- Observe with `delivery_events_subscribe` + `delivery_events_next` + `delivery_events_ack`.
-- Reconcile with `delivery_status`.
-- Correct drift only through `delivery_steer`.
-- On stuck/dead session, use `delivery_stop` then re-submit with narrowed instruction.
+## Issue CSV guidelines (optional mode)
+- Use Issue CSV only for bulk planning/import/export or external reporting.
+- Required columns:
+  - `ID, Title, Description, Acceptance, Test_Method, Tools, Dev_Status, Review1_Status, Regression_Status, Files, Dependencies, Notes`
+- Status values:
+  - `TODO | DOING | DONE`
+- Status mapping to GitHub issue-driven flow:
+  - `TODO` -> issue open, not yet in active round
+  - `DOING` -> issue selected for current round, implementation/PR in progress
+  - `DONE` -> PR merged and close-gate artifacts completed
 
-4. Merge Gate:
-- Do not end round at "PR opened"; track until PR is merged.
-- Keep branch strict-up-to-date with `main`.
-- Resolve CI/check failures through MCP-driven fix cycles.
+## Tool usage
+- When an MCP tool exists for the action, use it instead of ad-hoc simulation.
+- Prefer deterministic, machine-readable outputs for orchestration decisions.
+- If a required tool is unavailable/failing:
+  - record the failure
+  - apply safest fallback
+  - create a friction issue if it impacts round continuity
 
-5. Close Gate (required):
-- Submit retro task via MCP: postmortem + friction issue(s) + handoff summary.
-- Collect runtime snapshot with `delivery_report`.
-- Run `delivery_cleanup` for stale finished/failed runtime records.
-- Round ends only when DoD met, PR merged, and retro artifacts exist.
+## Testing policy
+- Follow `docs/testing-policy.md` as the verification source of truth.
+- Use the minimum required test tier by change scope; run full sweep for cross-crate/release-critical changes.
 
-6. Bootstrap stall recovery:
-- If bounded retries cannot progress the round, terminate early as stalled.
-- Immediately create a dedicated friction issue with repro, expected behavior, and impact.
-- Current owner agent must fix and merge that friction issue before returning to backlog work.
+## Safety
+- Preserve compatibility unless an explicit breaking change is requested.
+- Do not expose secrets in logs, comments, or outputs.
+- Keep changes scoped; do not modify unrelated files.
 
-7. Next-round priority:
-- Always process bootstrap-generated friction issues first.
-- Keep looping on friction issues until the friction queue is empty.
-- Process normal backlog issues only after no open bootstrap-generated friction issues remain.
-
-8. Session behavior constraints:
-- Primary owner+orchestrator session must not use superpower-style command/instruction paths.
-- Superpower-style instructions are allowed only inside subordinate runner sessions launched by MCP.
-
-## Required verification before commit
-Run all of the following from repository root:
-- `scripts/revive-sccache.sh`
-- `cargo fmt --all`
-- `cargo check --workspace`
-- `cargo test --workspace`
-
-If a change is scoped and running full tests is expensive, run targeted tests plus explain why broader coverage was skipped.
-
-## Compatibility policy
-- Avoid changing external command names/argument semantics without explicit migration notes.
-- Prefer additive evolution over breaking behavior.
-- Keep MCP result payloads stable unless versioned.
-
-## Runner policy
-- `ProcessRunner` is the baseline for deterministic one-shot tasks.
-- `TmuxRunner` is for long-lived sessions requiring steering/log replay/attach.
-- Steering support depends on target agent capabilities; fallback to stop-and-restart when unsupported.
-
-## Documentation policy
-- Update requirements/architecture docs for any behavior or boundary changes.
-- Keep implementation plans in `docs/plans/` with date-prefixed filenames.
-
-## Commit conventions
-- `feat:` new functionality
-- `fix:` bug fixes
-- `refactor:` internal restructuring with no behavior change
-- `chore:` tooling/scaffolding/maintenance
-- `docs:` documentation only changes
-
-## Safety constraints
-- Do not delete unrelated files.
-- Do not rewrite git history unless explicitly requested.
-- Do not claim completion without fresh command evidence.
+## Output style
+- Keep responses concise, structured, and action-oriented.
+- For non-trivial changes include:
+  - commands executed
+  - outcome summary
+  - residual risks
+  - next step options
