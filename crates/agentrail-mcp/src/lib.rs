@@ -78,6 +78,18 @@ struct RuntimeTaskSession {
     runner_mode: RuntimeRunnerMode,
 }
 
+#[derive(Debug, Clone)]
+struct RetryTransitionContext {
+    old_retry_count: u32,
+    new_retry_count: u32,
+}
+
+#[derive(Debug, Clone)]
+struct StartRegistration {
+    runtime_state: TaskRuntimeState,
+    attempt_number: u32,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct DeliveryEvent {
     cursor: u64,
@@ -87,6 +99,8 @@ struct DeliveryEvent {
     state: String,
     runtime_state: String,
     session_id: Option<String>,
+    old_attempt_number: Option<u32>,
+    new_attempt_number: Option<u32>,
 }
 
 impl DeliveryEvent {
@@ -98,7 +112,9 @@ impl DeliveryEvent {
             "timestamp": self.timestamp,
             "state": self.state,
             "runtime_state": self.runtime_state,
-            "session_id": self.session_id
+            "session_id": self.session_id,
+            "old_attempt_number": self.old_attempt_number,
+            "new_attempt_number": self.new_attempt_number
         })
     }
 }
@@ -109,6 +125,8 @@ struct DeliveryEventSignature {
     state: String,
     runtime_state: String,
     session_id: Option<String>,
+    old_attempt_number: Option<u32>,
+    new_attempt_number: Option<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -141,6 +159,7 @@ struct RuntimeState {
     last_event_signature_by_task: HashMap<String, DeliveryEventSignature>,
     last_status_observation_by_task: HashMap<String, DeliveryStatusObservation>,
     last_steer_observation_by_task: HashMap<String, DeliverySteerObservation>,
+    retry_idempotency_replays: HashMap<String, Value>,
 }
 
 #[derive(Debug, Clone)]
@@ -269,6 +288,7 @@ fn runtime_state() -> &'static Mutex<RuntimeState> {
             last_event_signature_by_task: HashMap::new(),
             last_status_observation_by_task: HashMap::new(),
             last_steer_observation_by_task: HashMap::new(),
+            retry_idempotency_replays: HashMap::new(),
         })
     })
 }
@@ -313,6 +333,52 @@ fn reset_delivery_tracking(runtime: &mut RuntimeState, task_id: &str) {
     runtime.last_steer_observation_by_task.remove(task_id);
 }
 
+fn retry_idempotency_cache_key(task_id: &str, idempotency_key: &str) -> String {
+    format!("{task_id}\u{001f}{idempotency_key}")
+}
+
+fn lookup_retry_idempotency_replay(task_id: &str, idempotency_key: &str) -> Result<Option<Value>> {
+    let runtime = runtime_state_mutex()?;
+    let key = retry_idempotency_cache_key(task_id, idempotency_key);
+    Ok(runtime.retry_idempotency_replays.get(&key).cloned())
+}
+
+fn store_retry_idempotency_replay(
+    task_id: &str,
+    idempotency_key: &str,
+    replay: &Value,
+) -> Result<()> {
+    let mut runtime = runtime_state_mutex()?;
+    let key = retry_idempotency_cache_key(task_id, idempotency_key);
+    runtime
+        .retry_idempotency_replays
+        .insert(key, replay.clone());
+    Ok(())
+}
+
+fn retry_eligibility_reason(state: TaskRuntimeState) -> Option<&'static str> {
+    match state {
+        TaskRuntimeState::Queued => Some("already_queued"),
+        TaskRuntimeState::Preparing | TaskRuntimeState::Running => Some("already_active"),
+        TaskRuntimeState::ReviewFailed => Some("review_loop_state"),
+        TaskRuntimeState::Fixing => Some("fix_loop_state"),
+        TaskRuntimeState::Validating => Some("validation_state"),
+        TaskRuntimeState::ReadyToMerge => Some("ready_to_merge"),
+        TaskRuntimeState::Merged => Some("already_merged"),
+        TaskRuntimeState::FailedTerminal => Some("terminal_failure"),
+        TaskRuntimeState::FailedRetryable | TaskRuntimeState::NeedsAttention => None,
+    }
+}
+
+fn deterministic_retry_ineligible_error(task_id: &str, state: TaskRuntimeState) -> anyhow::Error {
+    anyhow::anyhow!(
+        "retry ineligible: runtime_state={} reason={} allowed=failed_retryable,needs_attention; invalid runtime state for orchestrate_start: {task_id} cannot start from {}",
+        runtime_state_label(state),
+        retry_eligibility_reason(state).unwrap_or("not_retryable"),
+        runtime_state_label(state)
+    )
+}
+
 fn emit_delivery_event(
     runtime: &mut RuntimeState,
     task_id: &str,
@@ -320,12 +386,16 @@ fn emit_delivery_event(
     state: &str,
     runtime_state: &str,
     session_id: Option<String>,
+    old_attempt_number: Option<u32>,
+    new_attempt_number: Option<u32>,
 ) {
     let signature = DeliveryEventSignature {
         event_type: event_type.to_string(),
         state: state.to_string(),
         runtime_state: runtime_state.to_string(),
         session_id: session_id.clone(),
+        old_attempt_number,
+        new_attempt_number,
     };
     if runtime
         .last_event_signature_by_task
@@ -345,6 +415,8 @@ fn emit_delivery_event(
         state: state.to_string(),
         runtime_state: runtime_state.to_string(),
         session_id,
+        old_attempt_number,
+        new_attempt_number,
     });
     runtime
         .last_event_signature_by_task
@@ -376,6 +448,8 @@ fn emit_delivery_status_events(
             state,
             runtime_state,
             session_id.clone(),
+            None,
+            None,
         );
         runtime
             .last_status_observation_by_task
@@ -390,6 +464,8 @@ fn emit_delivery_status_events(
             state,
             runtime_state,
             session_id,
+            None,
+            None,
         );
     }
 
@@ -413,6 +489,8 @@ fn record_delivery_steer_sent(task_id: &str, session_id: &str) -> Result<u64> {
         &state,
         &runtime_state,
         Some(session_id.to_string()),
+        None,
+        None,
     );
     runtime.last_steer_observation_by_task.insert(
         task_id.to_string(),
@@ -456,6 +534,8 @@ fn maybe_record_delivery_steer_observed(
         state,
         runtime_state,
         Some(session_id.to_string()),
+        None,
+        None,
     );
 
     Ok(())
@@ -880,8 +960,10 @@ fn ensure_task_preparing(
     worker_id: &str,
     retry_budget: u32,
     scope_id: Option<&str>,
-) -> Result<()> {
+    is_retry_replay: bool,
+) -> Result<Option<RetryTransitionContext>> {
     let mut runtime = runtime_state_mutex()?;
+    let mut retry_context = None;
 
     match runtime.store.get_task(task_id)? {
         None => {
@@ -904,6 +986,20 @@ fn ensure_task_preparing(
                 }
             }
             TaskRuntimeState::FailedRetryable | TaskRuntimeState::NeedsAttention => {
+                if !is_retry_replay {
+                    if existing.retry_count >= existing.retry_budget {
+                        anyhow::bail!(
+                            "retry budget exhausted: task_id={task_id} retry_count={} retry_budget={}",
+                            existing.retry_count,
+                            existing.retry_budget
+                        );
+                    }
+                    let updated = runtime.store.increment_retry(task_id)?;
+                    retry_context = Some(RetryTransitionContext {
+                        old_retry_count: existing.retry_count,
+                        new_retry_count: updated.retry_count,
+                    });
+                }
                 runtime
                     .store
                     .reassign_worker(task_id, worker_id.to_string())?;
@@ -917,10 +1013,10 @@ fn ensure_task_preparing(
                     .transition(task_id, TaskRuntimeState::Queued)?;
             }
             _ => {
-                anyhow::bail!(
-                    "invalid runtime state for orchestrate_start: {task_id} cannot start from {}",
-                    runtime_state_label(existing.state)
-                );
+                return Err(deterministic_retry_ineligible_error(
+                    task_id,
+                    existing.state,
+                ));
             }
         },
     }
@@ -939,7 +1035,7 @@ fn ensure_task_preparing(
         .store
         .transition(task_id, TaskRuntimeState::Preparing)?;
     reset_delivery_tracking(&mut runtime, task_id);
-    Ok(())
+    Ok(retry_context)
 }
 
 fn mark_task_start_failed(task_id: &str) -> Result<()> {
@@ -961,7 +1057,7 @@ fn register_running_session(
     task_id: &str,
     runner_mode: RuntimeRunnerMode,
     session_id: String,
-) -> Result<TaskRuntimeState> {
+) -> Result<StartRegistration> {
     let mut runtime = runtime_state()
         .lock()
         .map_err(|_| anyhow::anyhow!("runtime state lock poisoned"))?;
@@ -980,26 +1076,45 @@ fn register_running_session(
             runner_mode,
         },
     );
-    runtime
-        .store
-        .register_task_attempt(task_id, &session_id, runner_mode.as_str())?;
+    let attempt =
+        runtime
+            .store
+            .register_task_attempt(task_id, &session_id, runner_mode.as_str())?;
     let task = runtime
         .store
         .get_task(task_id)?
         .ok_or_else(|| anyhow::anyhow!("task not found in runtime store: {task_id}"))?;
-    Ok(task.state)
+    Ok(StartRegistration {
+        runtime_state: task.state,
+        attempt_number: attempt.attempt_number,
+    })
 }
 
 async fn orchestrate_start_runtime(args: Value) -> Result<Value> {
     let task_id = require_task_id("orchestrate_start", &args)?.to_string();
     let worker_id = optional_string(&args, "worker_id").unwrap_or_else(|| "worker-default".into());
     let scope_id = optional_string(&args, "scope_id");
+    let idempotency_key = optional_string(&args, "idempotency_key");
     let retry_budget = optional_u32(&args, "retry_budget", 3)?;
     let runner_mode = RuntimeRunnerMode::parse(args.get("runner_mode").and_then(Value::as_str))?;
     let (command, command_args) = resolve_start_command_and_args(&args)?;
     let workdir = optional_string(&args, "workdir").unwrap_or_else(|| ".".to_string());
 
-    ensure_task_preparing(&task_id, &worker_id, retry_budget, scope_id.as_deref())?;
+    if let Some(idempotency_key) = idempotency_key.as_deref()
+        && let Some(replay) = lookup_retry_idempotency_replay(&task_id, idempotency_key)?
+    {
+        let mut replay = replay;
+        replay["idempotent_replay"] = json!(true);
+        return Ok(replay);
+    }
+
+    let retry_context = ensure_task_preparing(
+        &task_id,
+        &worker_id,
+        retry_budget,
+        scope_id.as_deref(),
+        false,
+    )?;
 
     let spec = TaskSpec {
         id: task_id.clone(),
@@ -1016,7 +1131,31 @@ async fn orchestrate_start_runtime(args: Value) -> Result<Value> {
         }
     };
 
-    let runtime_state = register_running_session(&task_id, runner_mode, handle.session_id.clone())?;
+    let registration = register_running_session(&task_id, runner_mode, handle.session_id.clone())?;
+    let runtime_state = runtime_state_label(registration.runtime_state);
+
+    if let Some(retry_context) = retry_context.as_ref() {
+        let mut runtime = runtime_state_mutex()?;
+        emit_delivery_event(
+            &mut runtime,
+            &task_id,
+            "retry_started",
+            "running",
+            runtime_state,
+            Some(handle.session_id.clone()),
+            Some(registration.attempt_number.saturating_sub(1)),
+            Some(registration.attempt_number),
+        );
+        info!(
+            operation = "retry_start",
+            task_id = task_id,
+            old_retry_count = retry_context.old_retry_count,
+            new_retry_count = retry_context.new_retry_count,
+            old_attempt_number = registration.attempt_number.saturating_sub(1),
+            new_attempt_number = registration.attempt_number,
+            "registered retry transition and attempt audit"
+        );
+    }
 
     info!(
         operation = "mcp_tool_call",
@@ -1028,14 +1167,24 @@ async fn orchestrate_start_runtime(args: Value) -> Result<Value> {
         "started orchestrated task"
     );
 
-    Ok(json!({
+    let response = json!({
         "tool": "orchestrate_start",
         "task_id": task_id,
         "status": "accepted",
         "session_id": handle.session_id,
         "runner_mode": runner_mode.as_str(),
-        "runtime_state": runtime_state_label(runtime_state)
-    }))
+        "runtime_state": runtime_state,
+        "attempt_number": registration.attempt_number,
+        "idempotent_replay": false
+    });
+
+    if retry_context.is_some()
+        && let Some(idempotency_key) = idempotency_key.as_deref()
+    {
+        store_retry_idempotency_replay(&task_id, idempotency_key, &response)?;
+    }
+
+    Ok(response)
 }
 
 async fn task_runtime_status(task_id: &str, tail: usize) -> Result<Value> {
@@ -1926,6 +2075,8 @@ fn emit_recovery_event(
         "recovery",
         runtime_state,
         session_id,
+        None,
+        None,
     );
     Ok(())
 }
@@ -2697,7 +2848,8 @@ fn mcp_tools_descriptor() -> Value {
                         "items": {"type":"string"}
                     },
                     "workdir": {"type":"string"},
-                    "retry_budget": {"type":"integer"}
+                    "retry_budget": {"type":"integer"},
+                    "idempotency_key": {"type":"string"}
                 },
                 "required": ["task_id"]
             }
@@ -2744,7 +2896,8 @@ fn mcp_tools_descriptor() -> Value {
                         "items": {"type":"string"}
                     },
                     "workdir": {"type":"string"},
-                    "retry_budget": {"type":"integer"}
+                    "retry_budget": {"type":"integer"},
+                    "idempotency_key": {"type":"string"}
                 },
                 "required": ["task_id"]
             }
@@ -2969,7 +3122,13 @@ pub fn handle_tool_call_with_allowed_root(
         "delivery_submit" => {
             validate_delivery_submit_preflight(&args)?;
             let orchestration = block_on_result(orchestrate_start_runtime(args))?;
-            if let Some(task_id) = orchestration.get("task_id").and_then(Value::as_str) {
+            let idempotent_replay = orchestration
+                .get("idempotent_replay")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            if !idempotent_replay
+                && let Some(task_id) = orchestration.get("task_id").and_then(Value::as_str)
+            {
                 let runtime_state = orchestration
                     .get("runtime_state")
                     .and_then(Value::as_str)
@@ -2986,6 +3145,8 @@ pub fn handle_tool_call_with_allowed_root(
                     "submitted",
                     runtime_state,
                     session_id.clone(),
+                    None,
+                    None,
                 );
                 emit_delivery_event(
                     &mut runtime,
@@ -2994,6 +3155,8 @@ pub fn handle_tool_call_with_allowed_root(
                     "running",
                     runtime_state,
                     session_id,
+                    None,
+                    None,
                 );
             }
             Ok(json!({

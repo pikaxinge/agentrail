@@ -251,6 +251,248 @@ fn orchestrate_start_rejects_restart_when_runtime_state_is_not_restartable() {
 }
 
 #[test]
+fn delivery_submit_retry_matrix_rejects_ready_to_merge_with_deterministic_reason() {
+    let tmp = tempdir().expect("tempdir");
+    let task_id = unique_task_id("task-retry-matrix-ready-to-merge");
+
+    let _ = handle_tool_call(
+        "delivery_submit",
+        json!({
+            "task_id": task_id,
+            "worker_id": "worker-a",
+            "runner_mode": "process",
+            "command": "bash",
+            "args": ["-lc", "true"],
+            "workdir": tmp.path().display().to_string()
+        }),
+    )
+    .expect("initial submit should succeed");
+
+    let _ = wait_for_runtime_state(&task_id, "ready_to_merge");
+
+    let err = handle_tool_call(
+        "delivery_submit",
+        json!({
+            "task_id": task_id,
+            "worker_id": "worker-a",
+            "runner_mode": "process",
+            "command": "bash",
+            "args": ["-lc", "true"],
+            "workdir": tmp.path().display().to_string()
+        }),
+    )
+    .expect_err("retry from ready_to_merge should be rejected");
+
+    assert!(
+        err.to_string()
+            .contains("retry ineligible: runtime_state=ready_to_merge"),
+        "expected deterministic retry ineligibility reason, got: {err}"
+    );
+}
+
+#[test]
+fn delivery_submit_retry_budget_is_enforced_with_deterministic_reason() {
+    let tmp = tempdir().expect("tempdir");
+    let task_id = unique_task_id("task-retry-budget");
+
+    let _ = handle_tool_call(
+        "delivery_submit",
+        json!({
+            "task_id": task_id,
+            "worker_id": "worker-a",
+            "runner_mode": "process",
+            "retry_budget": 1,
+            "command": "bash",
+            "args": ["-lc", "sleep 5"],
+            "workdir": tmp.path().display().to_string()
+        }),
+    )
+    .expect("initial submit should succeed");
+    let _ = wait_for_runtime_state(&task_id, "running");
+
+    let _ = handle_tool_call(
+        "delivery_stop",
+        json!({
+            "task_id": task_id,
+            "reason": "retry-cycle-1"
+        }),
+    )
+    .expect("first stop should succeed");
+    let _ = wait_for_runtime_state(&task_id, "failed_retryable");
+
+    let _ = handle_tool_call(
+        "delivery_submit",
+        json!({
+            "task_id": task_id,
+            "worker_id": "worker-a",
+            "runner_mode": "process",
+            "retry_budget": 1,
+            "command": "bash",
+            "args": ["-lc", "sleep 5"],
+            "workdir": tmp.path().display().to_string()
+        }),
+    )
+    .expect("first retry submit should succeed");
+    let _ = wait_for_runtime_state(&task_id, "running");
+
+    let _ = handle_tool_call(
+        "delivery_stop",
+        json!({
+            "task_id": task_id,
+            "reason": "retry-cycle-2"
+        }),
+    )
+    .expect("second stop should succeed");
+    let _ = wait_for_runtime_state(&task_id, "failed_retryable");
+
+    let err = handle_tool_call(
+        "delivery_submit",
+        json!({
+            "task_id": task_id,
+            "worker_id": "worker-a",
+            "runner_mode": "process",
+            "retry_budget": 1,
+            "command": "bash",
+            "args": ["-lc", "sleep 5"],
+            "workdir": tmp.path().display().to_string()
+        }),
+    )
+    .expect_err("submit beyond retry_budget should fail");
+
+    assert!(
+        err.to_string().contains("retry budget exhausted"),
+        "expected deterministic retry budget rejection, got: {err}"
+    );
+}
+
+#[test]
+fn delivery_submit_retry_idempotency_key_deduplicates_duplicate_requests() {
+    let tmp = tempdir().expect("tempdir");
+    let task_id = unique_task_id("task-retry-idempotency");
+
+    let _ = handle_tool_call(
+        "delivery_submit",
+        json!({
+            "task_id": task_id,
+            "worker_id": "worker-a",
+            "runner_mode": "process",
+            "retry_budget": 3,
+            "command": "bash",
+            "args": ["-lc", "sleep 5"],
+            "workdir": tmp.path().display().to_string()
+        }),
+    )
+    .expect("initial submit should succeed");
+    let _ = wait_for_runtime_state(&task_id, "running");
+
+    let _ = handle_tool_call(
+        "delivery_stop",
+        json!({
+            "task_id": task_id,
+            "reason": "enter-retryable"
+        }),
+    )
+    .expect("stop should succeed");
+    let _ = wait_for_runtime_state(&task_id, "failed_retryable");
+
+    let first_retry = handle_tool_call(
+        "delivery_submit",
+        json!({
+            "task_id": task_id,
+            "worker_id": "worker-a",
+            "runner_mode": "process",
+            "idempotency_key": "retry-key-1",
+            "command": "bash",
+            "args": ["-lc", "sleep 5"],
+            "workdir": tmp.path().display().to_string()
+        }),
+    )
+    .expect("first retry submit should succeed");
+
+    let second_retry = handle_tool_call(
+        "delivery_submit",
+        json!({
+            "task_id": task_id,
+            "worker_id": "worker-a",
+            "runner_mode": "process",
+            "idempotency_key": "retry-key-1",
+            "command": "bash",
+            "args": ["-lc", "sleep 5"],
+            "workdir": tmp.path().display().to_string()
+        }),
+    )
+    .expect("duplicate retry submit should be idempotent");
+
+    assert_eq!(
+        first_retry["orchestration"]["session_id"], second_retry["orchestration"]["session_id"],
+        "idempotent duplicate should return the same session"
+    );
+}
+
+#[test]
+fn delivery_retry_events_include_old_and_new_attempt_numbers() {
+    let tmp = tempdir().expect("tempdir");
+    let task_id = unique_task_id("task-retry-attempt-audit");
+    let (subscriber_id, _) = subscribe_events(&task_id);
+
+    let _ = handle_tool_call(
+        "delivery_submit",
+        json!({
+            "task_id": task_id,
+            "worker_id": "worker-a",
+            "runner_mode": "process",
+            "command": "bash",
+            "args": ["-lc", "sleep 5"],
+            "workdir": tmp.path().display().to_string()
+        }),
+    )
+    .expect("initial submit should succeed");
+    let _ = wait_for_runtime_state(&task_id, "running");
+
+    let _ = handle_tool_call(
+        "delivery_stop",
+        json!({
+            "task_id": task_id,
+            "reason": "prepare-retry"
+        }),
+    )
+    .expect("stop should succeed");
+    let _ = wait_for_runtime_state(&task_id, "failed_retryable");
+
+    let _ = handle_tool_call(
+        "delivery_submit",
+        json!({
+            "task_id": task_id,
+            "worker_id": "worker-a",
+            "runner_mode": "process",
+            "idempotency_key": "retry-audit-key",
+            "command": "bash",
+            "args": ["-lc", "sleep 5"],
+            "workdir": tmp.path().display().to_string()
+        }),
+    )
+    .expect("retry submit should succeed");
+
+    let next = next_events(&subscriber_id, &task_id, 128);
+    let events = next["events"].as_array().expect("events should be array");
+
+    let has_attempt_delta = events.iter().any(|event| {
+        event
+            .get("old_attempt_number")
+            .and_then(serde_json::Value::as_u64)
+            .is_some()
+            && event
+                .get("new_attempt_number")
+                .and_then(serde_json::Value::as_u64)
+                .is_some()
+    });
+    assert!(
+        has_attempt_delta,
+        "expected retry audit fields old_attempt_number/new_attempt_number in events: {events:?}"
+    );
+}
+
+#[test]
 fn orchestrate_terminal_session_is_unregistered_for_steer() {
     let tmp = tempdir().expect("tempdir");
     let task_id = unique_task_id("task-terminal-cleanup");
