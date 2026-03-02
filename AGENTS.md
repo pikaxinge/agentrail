@@ -33,6 +33,7 @@ This document defines how coding agents should operate in `agentrail`.
 For full session orchestration (DAG decomposition, parallel workers, review loop, CI gates, and cleanup), see:
 - `docs/operations/SESSION_ORCHESTRATION_WORKFLOW.md`
 - `docs/operations/BOOTSTRAP_LOOP.md`
+- When running self-bootstrap rounds, the orchestrator must explicitly load and follow skill `agentrail-self-bootstrap-loop` as the authoritative execution contract.
 
 ## TMUX Round Protocol (Required for Self-Bootstrap)
 Use this protocol when an orchestrator controls codex/agents through tmux sessions.
