@@ -41,6 +41,8 @@ Use this protocol when an orchestrator controls codex/agents through tmux sessio
 - `agentrail` MCP tools are the default control plane.
 - `tmux` is runtime transport for long tasks and steering, not a replacement for `agentrail`.
 - Any non-MCP action (`shell` hotfix/manual git surgery/direct code patching) is a break-glass event and must be logged as friction.
+- During self-bootstrap rounds, the owner+orchestrator primary session must not use any superpower-style command/instruction path.
+- Superpower-style instructions are allowed only inside subordinate runner sessions (for example worker codex sessions launched by MCP).
 
 ### One round = one closed loop
 Each tmux session should run one full round and then exit.
