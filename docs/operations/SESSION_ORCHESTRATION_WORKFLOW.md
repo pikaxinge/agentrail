@@ -37,6 +37,7 @@ This runbook defines how a session-level orchestrator executes development tasks
 - Non-MCP actions (`shell`/direct file edits/manual git surgery) are break-glass actions and must be logged as friction events.
 - For autonomous Codex workers under `delivery_submit`, use `runner_mode=app_server`.
 - `runner_mode=process` intentionally rejects `codex exec` / `codex-guarded-exec` command shapes.
+- App Server server-request policy is explicit: `app_server_request_policy` defaults to `deny_all` and is only valid with `runner_mode=app_server`.
 - `scripts/codex-guarded-exec.sh` remains a direct shell fallback helper for fail-fast no-mutation guarding.
 - Required MCP surfaces for orchestration loop:
   - planning: `plan_next`, `plan_claim`, `plan_complete`, `plan_status`, `plan_show`

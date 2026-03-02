@@ -7,7 +7,7 @@ use std::{
 
 use agentrail_mcp::handle_tool_call;
 use agentrail_store::TaskStore;
-use serde_json::json;
+use serde_json::{Value, json};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use tempfile::tempdir;
@@ -122,6 +122,33 @@ fn runtime_store_dsn() -> String {
         .unwrap_or_else(|| "sqlite://.agentrail/runtime.db".to_string())
 }
 
+fn parse_json_lines(raw: &str) -> Vec<Value> {
+    raw.lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .collect()
+}
+
+fn wait_for_server_response_line(log_path: &Path, expected_id: &Value) -> Value {
+    let mut last_log = String::new();
+    for _ in 0..80 {
+        if let Ok(raw) = fs::read_to_string(log_path) {
+            last_log = raw.clone();
+            let lines = parse_json_lines(&raw);
+            if let Some(response) = lines.into_iter().find(|line| {
+                line.get("id") == Some(expected_id)
+                    && (line.get("result").is_some() || line.get("error").is_some())
+            }) {
+                return response;
+            }
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+    panic!(
+        "timed out waiting for server response id={expected_id}: {last_log}",
+        expected_id = expected_id
+    );
+}
+
 fn write_fake_app_server_script(
     root: &Path,
     script_name: &str,
@@ -192,15 +219,18 @@ done
 fn write_fake_app_server_with_server_request_script(
     root: &Path,
     script_name: &str,
+    server_request_json: &str,
 ) -> (PathBuf, PathBuf) {
     let script_path = root.join(script_name);
     let log_path = root.join(format!("{script_name}.requests.log"));
     let escaped_log_path = log_path.display().to_string().replace('\'', "'\"'\"'");
+    let escaped_server_request_json = server_request_json.replace('\'', "'\"'\"'");
     let script = format!(
         r#"#!/usr/bin/env bash
 set -euo pipefail
 
 LOG_PATH='{escaped_log_path}'
+SERVER_REQUEST_JSON='{escaped_server_request_json}'
 sent_server_request=0
 
 while IFS= read -r line; do
@@ -217,7 +247,7 @@ while IFS= read -r line; do
     printf '{{"id":%s,"result":{{"turn":{{"id":"turn-1"}}}}}}\n' "$id"
     if [[ "$sent_server_request" -eq 0 ]]; then
       sent_server_request=1
-      printf '{{"id":777,"method":"approval/request","params":{{"reason":"test-server-request"}}}}\n'
+      printf '%s\n' "$SERVER_REQUEST_JSON"
     fi
   elif [[ "$line" == *'"method":"turn/interrupt"'* ]]; then
     printf '{{"id":%s,"result":{{"accepted":true}}}}\n' "$id"
@@ -1140,6 +1170,60 @@ fn delivery_submit_rejects_process_runner_for_guarded_exec_wrapper() {
 }
 
 #[test]
+fn delivery_submit_rejects_app_server_request_policy_without_app_server_runner() {
+    let tmp = tempdir().expect("tempdir");
+    let task_id = unique_task_id("task-delivery-policy-invalid-runner");
+
+    let err = handle_tool_call(
+        "delivery_submit",
+        json!({
+            "task_id": task_id,
+            "worker_id": "worker-a",
+            "runner_mode": "process",
+            "app_server_request_policy": "allow_safe_subset",
+            "command": "bash",
+            "args": ["-lc", "echo should-not-run"],
+            "workdir": tmp.path().display().to_string()
+        }),
+    )
+    .expect_err(
+        "delivery_submit should reject app_server_request_policy without app_server runner",
+    );
+
+    assert!(
+        err.to_string()
+            .contains("invalid app_server_request_policy: requires runner_mode=app_server"),
+        "expected app_server_request_policy runner-mode validation error, got: {err}"
+    );
+}
+
+#[test]
+fn delivery_submit_rejects_unsupported_app_server_request_policy() {
+    let tmp = tempdir().expect("tempdir");
+    let task_id = unique_task_id("task-delivery-policy-unsupported");
+
+    let err = handle_tool_call(
+        "delivery_submit",
+        json!({
+            "task_id": task_id,
+            "worker_id": "worker-a",
+            "runner_mode": "app_server",
+            "app_server_request_policy": "unknown-mode",
+            "command": "bash",
+            "args": ["-lc", "echo should-not-run"],
+            "workdir": tmp.path().display().to_string()
+        }),
+    )
+    .expect_err("delivery_submit should reject unsupported app_server_request_policy");
+
+    assert!(
+        err.to_string()
+            .contains("unsupported app_server_request_policy: unknown-mode"),
+        "expected deterministic unsupported-policy validation error, got: {err}"
+    );
+}
+
+#[test]
 fn delivery_submit_defaults_runner_mode_to_process_when_omitted() {
     let tmp = tempdir().expect("tempdir");
     let task_id = unique_task_id("task-delivery-default-runner");
@@ -1352,11 +1436,12 @@ fn delivery_submit_app_server_runner_maps_submit_steer_stop_over_stdio_jsonrpc()
 }
 
 #[test]
-fn delivery_submit_app_server_replies_error_to_server_initiated_request() {
+fn delivery_submit_app_server_approval_request_defaults_to_deny_all_policy() {
     let tmp = tempdir().expect("tempdir");
     let (script_path, request_log_path) = write_fake_app_server_with_server_request_script(
         tmp.path(),
         "fake-app-server-server-request.sh",
+        r#"{"id":"approval-1","method":"approval/request","params":{"command":"git status","reason":"test-server-request"}}"#,
     );
     let task_id = unique_task_id("task-delivery-app-server-server-request");
 
@@ -1374,7 +1459,8 @@ fn delivery_submit_app_server_replies_error_to_server_initiated_request() {
     .expect("delivery_submit should succeed for app_server runner");
     assert_eq!(submit["orchestration"]["status"], "accepted");
 
-    thread::sleep(Duration::from_millis(150));
+    let response = wait_for_server_response_line(&request_log_path, &json!("approval-1"));
+    assert_eq!(response["result"], "decline");
 
     let _stop = handle_tool_call(
         "delivery_stop",
@@ -1384,17 +1470,240 @@ fn delivery_submit_app_server_replies_error_to_server_initiated_request() {
         }),
     )
     .expect("delivery_stop should succeed");
+}
 
-    let request_log =
-        fs::read_to_string(&request_log_path).expect("fake app server request log should exist");
-    assert!(
-        request_log.contains("\"id\":777"),
-        "client should respond to server-initiated request id 777: {request_log}"
+#[test]
+fn delivery_submit_app_server_approval_request_allows_safe_subset_policy() {
+    let tmp = tempdir().expect("tempdir");
+    let (script_path, request_log_path) = write_fake_app_server_with_server_request_script(
+        tmp.path(),
+        "fake-app-server-server-request-allow.sh",
+        r#"{"id":778,"method":"approval/request","params":{"command":"git status","reason":"test-server-request"}}"#,
     );
-    assert!(
-        request_log.contains("unsupported app_server server request method"),
-        "client should return deterministic unsupported-method error for server request: {request_log}"
+    let task_id = unique_task_id("task-delivery-app-server-server-request-allow");
+
+    let submit = handle_tool_call(
+        "delivery_submit",
+        json!({
+            "task_id": task_id,
+            "worker_id": "worker-a",
+            "runner_mode": "app_server",
+            "app_server_request_policy": "allow_safe_subset",
+            "command": script_path.display().to_string(),
+            "args": [],
+            "workdir": tmp.path().display().to_string()
+        }),
+    )
+    .expect("delivery_submit should succeed for app_server runner");
+    assert_eq!(submit["orchestration"]["status"], "accepted");
+
+    let response = wait_for_server_response_line(&request_log_path, &json!(778));
+    assert_eq!(response["result"], "accept");
+
+    let _stop = handle_tool_call(
+        "delivery_stop",
+        json!({
+            "task_id": task_id,
+            "reason": "cleanup"
+        }),
+    )
+    .expect("delivery_stop should succeed");
+}
+
+#[test]
+fn delivery_submit_app_server_approval_request_denies_unsafe_safe_subset_command() {
+    let tmp = tempdir().expect("tempdir");
+    let (script_path, request_log_path) = write_fake_app_server_with_server_request_script(
+        tmp.path(),
+        "fake-app-server-server-request-deny-unsafe.sh",
+        r#"{"id":781,"method":"approval/request","params":{"command":"git status & whoami","reason":"test-server-request"}}"#,
     );
+    let task_id = unique_task_id("task-delivery-app-server-server-request-deny-unsafe");
+
+    let submit = handle_tool_call(
+        "delivery_submit",
+        json!({
+            "task_id": task_id,
+            "worker_id": "worker-a",
+            "runner_mode": "app_server",
+            "app_server_request_policy": "allow_safe_subset",
+            "command": script_path.display().to_string(),
+            "args": [],
+            "workdir": tmp.path().display().to_string()
+        }),
+    )
+    .expect("delivery_submit should succeed for app_server runner");
+    assert_eq!(submit["orchestration"]["status"], "accepted");
+
+    let response = wait_for_server_response_line(&request_log_path, &json!(781));
+    assert_eq!(response["result"], "decline");
+
+    let _stop = handle_tool_call(
+        "delivery_stop",
+        json!({
+            "task_id": task_id,
+            "reason": "cleanup"
+        }),
+    )
+    .expect("delivery_stop should succeed");
+}
+
+#[test]
+fn delivery_submit_app_server_handles_command_execution_request_approval_method() {
+    let tmp = tempdir().expect("tempdir");
+    let (script_path, request_log_path) = write_fake_app_server_with_server_request_script(
+        tmp.path(),
+        "fake-app-server-server-request-command-approval.sh",
+        r#"{"id":782,"method":"item/commandExecution/requestApproval","params":{"command":"git status","reason":"test-server-request"}}"#,
+    );
+    let task_id = unique_task_id("task-delivery-app-server-server-request-command-approval");
+
+    let submit = handle_tool_call(
+        "delivery_submit",
+        json!({
+            "task_id": task_id,
+            "worker_id": "worker-a",
+            "runner_mode": "app_server",
+            "app_server_request_policy": "allow_safe_subset",
+            "command": script_path.display().to_string(),
+            "args": [],
+            "workdir": tmp.path().display().to_string()
+        }),
+    )
+    .expect("delivery_submit should succeed for app_server runner");
+    assert_eq!(submit["orchestration"]["status"], "accepted");
+
+    let response = wait_for_server_response_line(&request_log_path, &json!(782));
+    assert_eq!(response["result"], "accept");
+
+    let _stop = handle_tool_call(
+        "delivery_stop",
+        json!({
+            "task_id": task_id,
+            "reason": "cleanup"
+        }),
+    )
+    .expect("delivery_stop should succeed");
+}
+
+#[test]
+fn delivery_submit_app_server_handles_suffix_request_approval_method() {
+    let tmp = tempdir().expect("tempdir");
+    let (script_path, request_log_path) = write_fake_app_server_with_server_request_script(
+        tmp.path(),
+        "fake-app-server-server-request-suffix-approval.sh",
+        r#"{"id":783,"method":"item/custom/requestApproval","params":{"command":"git status","reason":"test-server-request"}}"#,
+    );
+    let task_id = unique_task_id("task-delivery-app-server-server-request-suffix-approval");
+
+    let submit = handle_tool_call(
+        "delivery_submit",
+        json!({
+            "task_id": task_id,
+            "worker_id": "worker-a",
+            "runner_mode": "app_server",
+            "command": script_path.display().to_string(),
+            "args": [],
+            "workdir": tmp.path().display().to_string()
+        }),
+    )
+    .expect("delivery_submit should succeed for app_server runner");
+    assert_eq!(submit["orchestration"]["status"], "accepted");
+
+    let response = wait_for_server_response_line(&request_log_path, &json!(783));
+    assert_eq!(response["result"], "decline");
+
+    let _stop = handle_tool_call(
+        "delivery_stop",
+        json!({
+            "task_id": task_id,
+            "reason": "cleanup"
+        }),
+    )
+    .expect("delivery_stop should succeed");
+}
+
+#[test]
+fn delivery_submit_app_server_returns_error_for_unsupported_server_request_method() {
+    let tmp = tempdir().expect("tempdir");
+    let (script_path, request_log_path) = write_fake_app_server_with_server_request_script(
+        tmp.path(),
+        "fake-app-server-server-request-unsupported.sh",
+        r#"{"id":779,"method":"input/request","params":{"prompt":"test-server-request"}}"#,
+    );
+    let task_id = unique_task_id("task-delivery-app-server-server-request-unsupported");
+
+    let submit = handle_tool_call(
+        "delivery_submit",
+        json!({
+            "task_id": task_id,
+            "worker_id": "worker-a",
+            "runner_mode": "app_server",
+            "command": script_path.display().to_string(),
+            "args": [],
+            "workdir": tmp.path().display().to_string()
+        }),
+    )
+    .expect("delivery_submit should succeed for app_server runner");
+    assert_eq!(submit["orchestration"]["status"], "accepted");
+
+    let response = wait_for_server_response_line(&request_log_path, &json!(779));
+    assert_eq!(response["error"]["code"], -32601);
+    assert_eq!(
+        response["error"]["message"],
+        "unsupported app_server server request method: input/request"
+    );
+
+    let _stop = handle_tool_call(
+        "delivery_stop",
+        json!({
+            "task_id": task_id,
+            "reason": "cleanup"
+        }),
+    )
+    .expect("delivery_stop should succeed");
+}
+
+#[test]
+fn delivery_submit_app_server_delegate_fail_open_policy_is_disabled() {
+    let tmp = tempdir().expect("tempdir");
+    let (script_path, request_log_path) = write_fake_app_server_with_server_request_script(
+        tmp.path(),
+        "fake-app-server-server-request-delegate.sh",
+        r#"{"id":784,"method":"approval/request","params":{"command":"git status","reason":"test-server-request"}}"#,
+    );
+    let task_id = unique_task_id("task-delivery-app-server-server-request-delegate");
+
+    let submit = handle_tool_call(
+        "delivery_submit",
+        json!({
+            "task_id": task_id,
+            "worker_id": "worker-a",
+            "runner_mode": "app_server",
+            "app_server_request_policy": "delegate_fail_open",
+            "command": script_path.display().to_string(),
+            "args": [],
+            "workdir": tmp.path().display().to_string()
+        }),
+    )
+    .expect("delivery_submit should succeed for app_server runner");
+    assert_eq!(submit["orchestration"]["status"], "accepted");
+
+    let response = wait_for_server_response_line(&request_log_path, &json!(784));
+    assert_eq!(response["error"]["code"], -32050);
+    assert_eq!(
+        response["error"]["message"],
+        "app_server request policy delegate_fail_open is disabled"
+    );
+
+    let _stop = handle_tool_call(
+        "delivery_stop",
+        json!({
+            "task_id": task_id,
+            "reason": "cleanup"
+        }),
+    )
+    .expect("delivery_stop should succeed");
 }
 
 #[test]

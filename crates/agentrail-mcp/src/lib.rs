@@ -54,6 +54,32 @@ impl RuntimeRunnerMode {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AppServerServerRequestPolicy {
+    DenyAll,
+    AllowSafeSubset,
+    DelegateFailOpen,
+}
+
+impl AppServerServerRequestPolicy {
+    fn parse(raw: Option<&str>) -> Result<Self> {
+        match raw.unwrap_or("deny_all") {
+            "deny_all" => Ok(Self::DenyAll),
+            "allow_safe_subset" => Ok(Self::AllowSafeSubset),
+            "delegate_fail_open" => Ok(Self::DelegateFailOpen),
+            other => anyhow::bail!("unsupported app_server_request_policy: {other}"),
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::DenyAll => "deny_all",
+            Self::AllowSafeSubset => "allow_safe_subset",
+            Self::DelegateFailOpen => "delegate_fail_open",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CleanupRetentionMode {
     Purge,
     Retain,
@@ -225,6 +251,7 @@ impl AppServerSessionState {
 struct AppServerSession {
     task_id: String,
     logs: Arc<AsyncMutex<VecDeque<String>>>,
+    server_request_policy: AppServerServerRequestPolicy,
     inner: AsyncMutex<AppServerSessionInner>,
     writer: AsyncMutex<Option<ChildStdin>>,
     sequence: u64,
@@ -245,6 +272,9 @@ static RUNTIME_STATE: OnceLock<Mutex<RuntimeState>> = OnceLock::new();
 static DELIVERY_SUBSCRIBER_SEQ: AtomicU64 = AtomicU64::new(1);
 static APP_SERVER_SESSIONS: OnceLock<Mutex<HashMap<String, Arc<AppServerSession>>>> =
     OnceLock::new();
+static APP_SERVER_TASK_REQUEST_POLICIES: OnceLock<
+    Mutex<HashMap<String, AppServerServerRequestPolicy>>,
+> = OnceLock::new();
 static APP_SERVER_SESSION_SEQ: AtomicU64 = AtomicU64::new(1);
 
 const DEFAULT_RUNTIME_STORE_DSN: &str = "sqlite://.agentrail/runtime.db";
@@ -1338,6 +1368,53 @@ fn validate_delivery_submit_preflight(args: &Value) -> Result<()> {
     Ok(())
 }
 
+fn app_server_request_policies() -> &'static Mutex<HashMap<String, AppServerServerRequestPolicy>> {
+    APP_SERVER_TASK_REQUEST_POLICIES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn app_server_take_request_policy_for_task(task_id: &str) -> AppServerServerRequestPolicy {
+    match app_server_request_policies().lock() {
+        Ok(mut policies) => policies
+            .remove(task_id)
+            .unwrap_or(AppServerServerRequestPolicy::DenyAll),
+        Err(_) => AppServerServerRequestPolicy::DenyAll,
+    }
+}
+
+fn app_server_set_request_policy_for_task(
+    task_id: &str,
+    policy: AppServerServerRequestPolicy,
+) -> Result<()> {
+    let mut policies = app_server_request_policies()
+        .lock()
+        .map_err(|_| anyhow::anyhow!("app_server request policy registry lock poisoned"))?;
+    policies.insert(task_id.to_string(), policy);
+    Ok(())
+}
+
+fn app_server_clear_request_policy_for_task(task_id: &str) -> Result<()> {
+    let mut policies = app_server_request_policies()
+        .lock()
+        .map_err(|_| anyhow::anyhow!("app_server request policy registry lock poisoned"))?;
+    policies.remove(task_id);
+    Ok(())
+}
+
+fn app_server_request_policy_from_args(
+    args: &Value,
+    runner_mode: RuntimeRunnerMode,
+) -> Result<AppServerServerRequestPolicy> {
+    let policy = AppServerServerRequestPolicy::parse(
+        optional_string(args, "app_server_request_policy").as_deref(),
+    )?;
+    if args.get("app_server_request_policy").is_some()
+        && runner_mode != RuntimeRunnerMode::AppServer
+    {
+        anyhow::bail!("invalid app_server_request_policy: requires runner_mode=app_server");
+    }
+    Ok(policy)
+}
+
 fn app_server_sessions() -> &'static Mutex<HashMap<String, Arc<AppServerSession>>> {
     APP_SERVER_SESSIONS.get_or_init(|| Mutex::new(HashMap::new()))
 }
@@ -1477,6 +1554,72 @@ fn extract_jsonrpc_id(value: &Value) -> Option<u64> {
         .or_else(|| value.get("id").and_then(Value::as_str)?.parse::<u64>().ok())
 }
 
+fn extract_jsonrpc_id_value(value: &Value) -> Option<Value> {
+    value.get("id").filter(|id| !id.is_null()).cloned()
+}
+
+fn is_app_server_approval_request_method(method: &str) -> bool {
+    matches!(
+        method,
+        "approval/request" | "item/commandExecution/requestApproval"
+    ) || method.ends_with("/requestApproval")
+}
+
+fn app_server_request_id_for_audit(id: &Value) -> String {
+    if let Some(raw) = id.as_str() {
+        return raw.to_string();
+    }
+    if let Some(raw) = id.as_u64() {
+        return raw.to_string();
+    }
+    id.to_string()
+}
+
+fn app_server_extract_request_command(params: Option<&Value>) -> Option<String> {
+    let Some(params) = params else {
+        return None;
+    };
+    params
+        .get("command")
+        .and_then(Value::as_str)
+        .map(ToString::to_string)
+        .or_else(|| {
+            params
+                .get("commandLine")
+                .and_then(Value::as_str)
+                .map(ToString::to_string)
+        })
+        .or_else(|| {
+            params
+                .get("request")
+                .and_then(|value| value.get("command"))
+                .and_then(Value::as_str)
+                .map(ToString::to_string)
+        })
+}
+
+fn app_server_command_uses_shell_meta(command: &str) -> bool {
+    ["&&", "||", ";", "|", "&", ">", "<", "$(", "`", "\n", "\r"]
+        .iter()
+        .any(|token| command.contains(token))
+}
+
+fn app_server_is_safe_subset_command(command: &str) -> bool {
+    let trimmed = command.trim();
+    if trimmed.is_empty() || app_server_command_uses_shell_meta(trimmed) {
+        return false;
+    }
+    let mut parts = trimmed.split_whitespace();
+    let Some(head) = parts.next() else {
+        return false;
+    };
+    match head {
+        "pwd" | "ls" | "cat" | "echo" | "rg" | "find" => true,
+        "git" => matches!(parts.next(), Some("status" | "diff" | "show")),
+        _ => false,
+    }
+}
+
 fn app_server_rpc_timeout_ms(method: &str) -> u64 {
     let parse_env_timeout = |name: &str, default_value: u64| -> u64 {
         std::env::var(name)
@@ -1605,8 +1748,9 @@ async fn app_server_rpc_notify(
 
 async fn app_server_reply_server_request_error(
     session: &Arc<AppServerSession>,
-    id: u64,
-    method: &str,
+    id: &Value,
+    code: i64,
+    message: &str,
 ) -> Result<()> {
     let mut writer = session.writer.lock().await;
     let Some(stdin) = writer.as_mut() else {
@@ -1615,14 +1759,109 @@ async fn app_server_reply_server_request_error(
     let response = json!({
         "id": id,
         "error": {
-            "code": -32601,
-            "message": format!("unsupported app_server server request method: {method}")
+            "code": code,
+            "message": message
         }
     });
     let payload = serde_json::to_string(&response)?;
     stdin.write_all(payload.as_bytes()).await?;
     stdin.write_all(b"\n").await?;
     stdin.flush().await?;
+    Ok(())
+}
+
+async fn app_server_reply_server_request_result(
+    session: &Arc<AppServerSession>,
+    id: &Value,
+    result: Value,
+) -> Result<()> {
+    let mut writer = session.writer.lock().await;
+    let Some(stdin) = writer.as_mut() else {
+        return Ok(());
+    };
+    let response = json!({
+        "id": id,
+        "result": result
+    });
+    let payload = serde_json::to_string(&response)?;
+    stdin.write_all(payload.as_bytes()).await?;
+    stdin.write_all(b"\n").await?;
+    stdin.flush().await?;
+    Ok(())
+}
+
+async fn app_server_handle_server_request(
+    session: &Arc<AppServerSession>,
+    id: &Value,
+    method: &str,
+    params: Option<&Value>,
+) -> Result<()> {
+    if !is_app_server_approval_request_method(method) {
+        let message = format!("unsupported app_server server request method: {method}");
+        app_server_reply_server_request_error(session, id, -32601, &message).await?;
+        append_app_server_log_line(
+            &session.logs,
+            format!(
+                "[app_server_adapter] server_request id={} method={} policy={} outcome=unsupported",
+                app_server_request_id_for_audit(id),
+                method,
+                session.server_request_policy.as_str()
+            ),
+        )
+        .await;
+        return Ok(());
+    }
+
+    let (outcome, reason, response_result, response_error): (
+        &str,
+        &'static str,
+        Option<Value>,
+        Option<(i64, String)>,
+    ) = match session.server_request_policy {
+        AppServerServerRequestPolicy::DenyAll => {
+            ("deny", "policy_deny_all", Some(json!("decline")), None)
+        }
+        AppServerServerRequestPolicy::AllowSafeSubset => {
+            let command = app_server_extract_request_command(params);
+            let is_safe = command
+                .as_deref()
+                .is_some_and(app_server_is_safe_subset_command);
+            if is_safe {
+                ("allow", "safe_subset_allow", Some(json!("accept")), None)
+            } else {
+                ("deny", "safe_subset_deny", Some(json!("decline")), None)
+            }
+        }
+        AppServerServerRequestPolicy::DelegateFailOpen => (
+            "error",
+            "delegate_fail_open_disabled",
+            None,
+            Some((
+                -32050,
+                "app_server request policy delegate_fail_open is disabled".to_string(),
+            )),
+        ),
+    };
+
+    if let Some((code, message)) = response_error {
+        app_server_reply_server_request_error(session, id, code, &message).await?;
+    } else if let Some(result) = response_result {
+        app_server_reply_server_request_result(session, id, result).await?;
+    }
+
+    append_app_server_log_line(
+        &session.logs,
+        format!(
+            "[app_server_adapter] server_request id={} method={} policy={} outcome={} reason={}",
+            app_server_request_id_for_audit(id),
+            method,
+            session.server_request_policy.as_str(),
+            outcome,
+            reason
+        ),
+    )
+    .await;
+
     Ok(())
 }
 
@@ -1639,14 +1878,34 @@ async fn app_server_handle_json_line(session: &Arc<AppServerSession>, line: &str
         }
     };
 
-    if let Some(id) = extract_jsonrpc_id(&parsed) {
+    if let Some(id_value) = extract_jsonrpc_id_value(&parsed) {
         let request_method = parsed
             .get("method")
             .and_then(Value::as_str)
             .map(ToString::to_string);
+        if let Some(method) = request_method.as_deref() {
+            if let Err(error) =
+                app_server_handle_server_request(session, &id_value, method, parsed.get("params"))
+                    .await
+            {
+                append_app_server_log_line(
+                    &session.logs,
+                    format!(
+                        "[app_server_adapter] server_request id={} method={} outcome=handler_error error={error}",
+                        app_server_request_id_for_audit(&id_value),
+                        method
+                    ),
+                )
+                .await;
+                let _ = app_server_mark_terminal(session, AppServerSessionState::Failed).await;
+            }
+            return;
+        }
+
+        let pending_id = extract_jsonrpc_id(&parsed);
         let (sender, deferred_terminal_state) = {
             let mut inner = session.inner.lock().await;
-            let sender = inner.pending.remove(&id);
+            let sender = pending_id.and_then(|id| inner.pending.remove(&id));
             if let Some(turn_id) = parsed
                 .get("result")
                 .and_then(extract_turn_id)
@@ -1663,8 +1922,6 @@ async fn app_server_handle_json_line(session: &Arc<AppServerSession>, line: &str
         };
         if let Some(sender) = sender {
             let _ = sender.send(parsed);
-        } else if let Some(method) = request_method.as_deref() {
-            let _ = app_server_reply_server_request_error(session, id, method).await;
         }
         if let Some(terminal_state) = deferred_terminal_state {
             let _ = app_server_mark_terminal(session, terminal_state).await;
@@ -1805,6 +2062,7 @@ async fn app_server_rpc_request(
 }
 
 async fn app_server_start(spec: TaskSpec) -> Result<TaskHandle> {
+    let server_request_policy = app_server_take_request_policy_for_task(&spec.id);
     fs::create_dir_all(&spec.workdir)?;
     let mut command = Command::new(&spec.command);
     command
@@ -1833,6 +2091,7 @@ async fn app_server_start(spec: TaskSpec) -> Result<TaskHandle> {
     let session = Arc::new(AppServerSession {
         task_id: spec.id.clone(),
         logs: Arc::new(AsyncMutex::new(VecDeque::new())),
+        server_request_policy,
         inner: AsyncMutex::new(AppServerSessionInner {
             state: AppServerSessionState::Running,
             child: Some(child),
@@ -2283,6 +2542,7 @@ async fn orchestrate_start_runtime(args: Value) -> Result<Value> {
         optional_string(&args, "parent_span_id").filter(|value| !value.trim().is_empty());
     let retry_budget = optional_u32(&args, "retry_budget", 3)?;
     let runner_mode = RuntimeRunnerMode::parse(args.get("runner_mode").and_then(Value::as_str))?;
+    let app_server_request_policy = app_server_request_policy_from_args(&args, runner_mode)?;
     let (command, command_args) = resolve_start_command_and_args(&args)?;
     let workdir = optional_string(&args, "workdir").unwrap_or_else(|| ".".to_string());
 
@@ -2309,9 +2569,16 @@ async fn orchestrate_start_runtime(args: Value) -> Result<Value> {
         workdir,
     };
 
+    if runner_mode == RuntimeRunnerMode::AppServer {
+        app_server_set_request_policy_for_task(&task_id, app_server_request_policy)?;
+    }
+
     let handle = match runner_start(runner_mode, spec).await {
         Ok(handle) => handle,
         Err(error) => {
+            if runner_mode == RuntimeRunnerMode::AppServer {
+                let _ = app_server_clear_request_policy_for_task(&task_id);
+            }
             let _ = mark_task_start_failed(&task_id);
             return Err(error);
         }
@@ -4268,6 +4535,7 @@ fn mcp_tools_descriptor() -> Value {
                     "scope_id": {"type":"string"},
                     "worker_id": {"type":"string"},
                     "runner_mode": {"type":"string", "enum": ["process", "tmux", "app_server"]},
+                    "app_server_request_policy": {"type":"string", "enum": ["deny_all", "allow_safe_subset", "delegate_fail_open"]},
                     "command": {"type":"string"},
                     "args": {
                         "type":"array",
@@ -4316,6 +4584,7 @@ fn mcp_tools_descriptor() -> Value {
                     "scope_id": {"type":"string"},
                     "worker_id": {"type":"string"},
                     "runner_mode": {"type":"string", "enum": ["process", "tmux", "app_server"]},
+                    "app_server_request_policy": {"type":"string", "enum": ["deny_all", "allow_safe_subset", "delegate_fail_open"]},
                     "steer_required": {"type":"boolean"},
                     "interactive_command": {"type":"boolean"},
                     "command": {"type":"string"},
