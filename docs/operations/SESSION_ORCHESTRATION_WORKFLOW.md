@@ -29,6 +29,7 @@ This runbook defines how a session-level orchestrator executes development tasks
     - Wrapper prerequisites: `gh` + `jq`, and a GitHub `remote.origin.url`; fallback only supports `--title`, `--body`, `--body-file`.
 14. Keep PR branch strict-up-to-date with `main` and resolve review comments.
 15. Merge only after branch protection requirements are satisfied.
+    - In multi-worktree sessions, prefer `scripts/gh-pr-merge-safe.sh <pr-number> --merge --delete-branch` to handle local cleanup conflicts deterministically.
 16. Post-merge cleanup:
     - remove temporary worktrees
     - prune stale worktree metadata
