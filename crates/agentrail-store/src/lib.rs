@@ -173,6 +173,39 @@ pub struct TaskSessionRecord {
     pub ended_epoch_ms: Option<i64>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TaskEventRecord {
+    pub id: i64,
+    pub task_id: String,
+    pub attempt: u32,
+    pub ts_ms: i64,
+    pub event_type: String,
+    pub source: String,
+    pub actor: Option<String>,
+    pub session_id: Option<String>,
+    pub state_before: Option<String>,
+    pub state_after: Option<String>,
+    pub message: Option<String>,
+    pub payload_json: Option<String>,
+    pub idem_key: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TaskEventDraft {
+    pub task_id: String,
+    pub attempt: u32,
+    pub ts_ms: i64,
+    pub event_type: String,
+    pub source: String,
+    pub actor: Option<String>,
+    pub session_id: Option<String>,
+    pub state_before: Option<String>,
+    pub state_after: Option<String>,
+    pub message: Option<String>,
+    pub payload_json: Option<String>,
+    pub idem_key: Option<String>,
+}
+
 #[derive(Debug)]
 pub struct TaskStore {
     pub dsn: String,
@@ -256,6 +289,23 @@ impl TaskStore {
             CREATE INDEX IF NOT EXISTS idx_task_sessions_task
                 ON task_sessions (task_id, started_epoch_ms);",
         )?;
+        connection.execute_batch(
+            "CREATE TABLE IF NOT EXISTS task_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                task_id TEXT NOT NULL,
+                attempt INTEGER NOT NULL,
+                ts_ms INTEGER NOT NULL,
+                event_type TEXT NOT NULL,
+                source TEXT NOT NULL,
+                actor TEXT,
+                session_id TEXT,
+                state_before TEXT,
+                state_after TEXT,
+                message TEXT,
+                payload_json TEXT,
+                idem_key TEXT
+            );",
+        )?;
 
         if !Self::table_has_column(&connection, "tasks", "scope_id")? {
             connection.execute("ALTER TABLE tasks ADD COLUMN scope_id TEXT", [])?;
@@ -274,6 +324,18 @@ impl TaskStore {
         )?;
         Self::ensure_task_attempts_schema(&connection)?;
         Self::ensure_task_sessions_schema(&connection)?;
+        Self::ensure_task_events_schema(&connection)?;
+        connection.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_task_events_task_id
+                ON task_events (task_id, id);
+            CREATE INDEX IF NOT EXISTS idx_task_events_task_attempt_id
+                ON task_events (task_id, attempt, id);
+            CREATE INDEX IF NOT EXISTS idx_task_events_ts_ms
+                ON task_events (ts_ms);
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_task_events_task_idem_key
+                ON task_events (task_id, idem_key)
+                WHERE idem_key IS NOT NULL;",
+        )?;
 
         Ok(connection)
     }
@@ -358,6 +420,55 @@ impl TaskStore {
              WHERE started_epoch_ms <= 0",
             params![current_epoch_ms()],
         )?;
+        Ok(())
+    }
+
+    fn ensure_task_events_schema(connection: &Connection) -> Result<()> {
+        if !Self::table_has_column(connection, "task_events", "attempt")? {
+            connection.execute(
+                "ALTER TABLE task_events ADD COLUMN attempt INTEGER NOT NULL DEFAULT 0",
+                [],
+            )?;
+        }
+        if !Self::table_has_column(connection, "task_events", "ts_ms")? {
+            connection.execute(
+                "ALTER TABLE task_events ADD COLUMN ts_ms INTEGER NOT NULL DEFAULT 0",
+                [],
+            )?;
+        }
+        if !Self::table_has_column(connection, "task_events", "event_type")? {
+            connection.execute(
+                "ALTER TABLE task_events ADD COLUMN event_type TEXT NOT NULL DEFAULT ''",
+                [],
+            )?;
+        }
+        if !Self::table_has_column(connection, "task_events", "source")? {
+            connection.execute(
+                "ALTER TABLE task_events ADD COLUMN source TEXT NOT NULL DEFAULT ''",
+                [],
+            )?;
+        }
+        if !Self::table_has_column(connection, "task_events", "actor")? {
+            connection.execute("ALTER TABLE task_events ADD COLUMN actor TEXT", [])?;
+        }
+        if !Self::table_has_column(connection, "task_events", "session_id")? {
+            connection.execute("ALTER TABLE task_events ADD COLUMN session_id TEXT", [])?;
+        }
+        if !Self::table_has_column(connection, "task_events", "state_before")? {
+            connection.execute("ALTER TABLE task_events ADD COLUMN state_before TEXT", [])?;
+        }
+        if !Self::table_has_column(connection, "task_events", "state_after")? {
+            connection.execute("ALTER TABLE task_events ADD COLUMN state_after TEXT", [])?;
+        }
+        if !Self::table_has_column(connection, "task_events", "message")? {
+            connection.execute("ALTER TABLE task_events ADD COLUMN message TEXT", [])?;
+        }
+        if !Self::table_has_column(connection, "task_events", "payload_json")? {
+            connection.execute("ALTER TABLE task_events ADD COLUMN payload_json TEXT", [])?;
+        }
+        if !Self::table_has_column(connection, "task_events", "idem_key")? {
+            connection.execute("ALTER TABLE task_events ADD COLUMN idem_key TEXT", [])?;
+        }
         Ok(())
     }
 
@@ -468,6 +579,128 @@ impl TaskStore {
         })
     }
 
+    fn read_task_event_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<TaskEventRecord> {
+        let id: i64 = row.get(0)?;
+        let task_id: String = row.get(1)?;
+        let attempt_raw: i64 = row.get(2)?;
+        let ts_ms: i64 = row.get(3)?;
+        let event_type: String = row.get(4)?;
+        let source: String = row.get(5)?;
+        let actor: Option<String> = row.get(6)?;
+        let session_id: Option<String> = row.get(7)?;
+        let state_before: Option<String> = row.get(8)?;
+        let state_after: Option<String> = row.get(9)?;
+        let message: Option<String> = row.get(10)?;
+        let payload_json: Option<String> = row.get(11)?;
+        let idem_key: Option<String> = row.get(12)?;
+
+        let attempt = u32::try_from(attempt_raw)
+            .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(2, attempt_raw))?;
+
+        Ok(TaskEventRecord {
+            id,
+            task_id,
+            attempt,
+            ts_ms,
+            event_type,
+            source,
+            actor,
+            session_id,
+            state_before,
+            state_after,
+            message,
+            payload_json,
+            idem_key,
+        })
+    }
+
+    fn current_attempt_for_task_tx(tx: &rusqlite::Transaction<'_>, task_id: &str) -> Result<u32> {
+        let max_attempt_raw: i64 = tx.query_row(
+            "SELECT COALESCE(MAX(attempt_number), 0)
+             FROM task_attempts
+             WHERE task_id = ?1",
+            params![task_id],
+            |row| row.get(0),
+        )?;
+        let max_attempt = u32::try_from(max_attempt_raw).map_err(|_| {
+            anyhow!("attempt_number overflow for task {task_id}: {max_attempt_raw}")
+        })?;
+        Ok(max_attempt)
+    }
+
+    fn insert_task_event_tx(
+        tx: &rusqlite::Transaction<'_>,
+        draft: &TaskEventDraft,
+    ) -> Result<TaskEventRecord> {
+        let insert = tx.execute(
+            "INSERT INTO task_events (
+                task_id, attempt, ts_ms, event_type, source, actor, session_id,
+                state_before, state_after, message, payload_json, idem_key
+             ) VALUES (
+                ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12
+             )",
+            params![
+                draft.task_id,
+                i64::from(draft.attempt),
+                draft.ts_ms,
+                draft.event_type,
+                draft.source,
+                draft.actor,
+                draft.session_id,
+                draft.state_before,
+                draft.state_after,
+                draft.message,
+                draft.payload_json,
+                draft.idem_key
+            ],
+        );
+        match insert {
+            Ok(_) => {
+                let id = tx.last_insert_rowid();
+                Ok(tx.query_row(
+                    "SELECT id, task_id, attempt, ts_ms, event_type, source, actor, session_id, state_before, state_after, message, payload_json, idem_key
+                     FROM task_events
+                     WHERE id = ?1",
+                    params![id],
+                    |row| Self::read_task_event_row(row),
+                )?)
+            }
+            Err(error) => {
+                if let Some(idem_key) = draft.idem_key.as_deref()
+                    && matches!(
+                        &error,
+                        rusqlite::Error::SqliteFailure(info, _)
+                            if info.code == rusqlite::ErrorCode::ConstraintViolation
+                    )
+                    && let Some(existing) = tx
+                        .query_row(
+                            "SELECT id, task_id, attempt, ts_ms, event_type, source, actor, session_id, state_before, state_after, message, payload_json, idem_key
+                             FROM task_events
+                             WHERE task_id = ?1 AND idem_key = ?2
+                             LIMIT 1",
+                            params![draft.task_id, idem_key],
+                            |row| Self::read_task_event_row(row),
+                        )
+                        .optional()?
+                {
+                    if existing.event_type != draft.event_type || existing.source != draft.source {
+                        bail!(
+                            "task event idempotency key collision for task {} key {}: existing {}:{} vs incoming {}:{}",
+                            draft.task_id,
+                            idem_key,
+                            existing.source,
+                            existing.event_type,
+                            draft.source,
+                            draft.event_type
+                        );
+                    }
+                    return Ok(existing);
+                }
+                Err(error.into())
+            }
+        }
+    }
+
     pub fn upsert_task(&self, task: &TaskRecord) -> Result<()> {
         self.with_transaction(|tx| {
             let exists: Option<i64> = tx
@@ -535,17 +768,54 @@ impl TaskStore {
         self.with_transaction(move |tx| {
             let mut seen_ids = HashSet::with_capacity(snapshot.tasks.len());
             for task in &snapshot.tasks {
-                if !seen_ids.insert(task.id.as_str()) {
+                if !seen_ids.insert(task.id.clone()) {
                     bail!("duplicate task id in snapshot: {}", task.id);
                 }
             }
 
-            tx.execute("DELETE FROM tasks", [])?;
+            tx.execute(
+                "DELETE FROM task_events
+                 WHERE task_id NOT IN (SELECT id FROM tasks)",
+                [],
+            )?;
+            tx.execute(
+                "DELETE FROM task_attempts
+                 WHERE task_id NOT IN (SELECT id FROM tasks)",
+                [],
+            )?;
+            tx.execute(
+                "DELETE FROM task_sessions
+                 WHERE task_id NOT IN (SELECT id FROM tasks)",
+                [],
+            )?;
+
+            let mut existing_ids = HashSet::new();
+            {
+                let mut statement = tx.prepare("SELECT id FROM tasks")?;
+                let mut rows = statement.query([])?;
+                while let Some(row) = rows.next()? {
+                    existing_ids.insert(row.get::<_, String>(0)?);
+                }
+            }
+
+            for task_id in existing_ids.difference(&seen_ids) {
+                tx.execute("DELETE FROM task_events WHERE task_id = ?1", params![task_id])?;
+                tx.execute("DELETE FROM task_attempts WHERE task_id = ?1", params![task_id])?;
+                tx.execute("DELETE FROM task_sessions WHERE task_id = ?1", params![task_id])?;
+                tx.execute("DELETE FROM tasks WHERE id = ?1", params![task_id])?;
+            }
 
             for task in snapshot.tasks {
                 tx.execute(
                     "INSERT INTO tasks (id, assigned_worker, scope_id, state, retry_count, retry_budget, updated_epoch_ms)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                     ON CONFLICT(id) DO UPDATE SET
+                        assigned_worker = excluded.assigned_worker,
+                        scope_id = excluded.scope_id,
+                        state = excluded.state,
+                        retry_count = excluded.retry_count,
+                        retry_budget = excluded.retry_budget,
+                        updated_epoch_ms = excluded.updated_epoch_ms",
                     params![
                         task.id,
                         task.assigned_worker,
@@ -557,6 +827,22 @@ impl TaskStore {
                     ],
                 )?;
             }
+
+            tx.execute(
+                "DELETE FROM task_events
+                 WHERE task_id NOT IN (SELECT id FROM tasks)",
+                [],
+            )?;
+            tx.execute(
+                "DELETE FROM task_attempts
+                 WHERE task_id NOT IN (SELECT id FROM tasks)",
+                [],
+            )?;
+            tx.execute(
+                "DELETE FROM task_sessions
+                 WHERE task_id NOT IN (SELECT id FROM tasks)",
+                [],
+            )?;
             Ok(())
         })
     }
@@ -581,6 +867,8 @@ impl TaskStore {
                 );
             }
 
+            let previous_state = task.state;
+            let state_before = previous_state.as_db_str().to_string();
             task.state = next_state;
             task.updated_epoch_ms = current_epoch_ms();
             tx.execute(
@@ -589,6 +877,30 @@ impl TaskStore {
                      updated_epoch_ms = ?2
                  WHERE id = ?3",
                 params![task.state.as_db_str(), task.updated_epoch_ms, id],
+            )?;
+            let current_attempt = Self::current_attempt_for_task_tx(tx, id)?;
+            let attempt = match (previous_state, next_state) {
+                (TaskRuntimeState::Queued, TaskRuntimeState::Preparing) => {
+                    current_attempt.saturating_add(1)
+                }
+                _ => current_attempt,
+            };
+            let _ = Self::insert_task_event_tx(
+                tx,
+                &TaskEventDraft {
+                    task_id: id.to_string(),
+                    attempt,
+                    ts_ms: task.updated_epoch_ms,
+                    event_type: "state_transition".to_string(),
+                    source: "task_store".to_string(),
+                    actor: None,
+                    session_id: None,
+                    state_before: Some(state_before),
+                    state_after: Some(next_state.as_db_str().to_string()),
+                    message: None,
+                    payload_json: None,
+                    idem_key: None,
+                },
             )?;
             Ok(task.clone())
         })
@@ -618,6 +930,7 @@ impl TaskStore {
                 );
             }
 
+            let old_retry_count = task.retry_count;
             task.retry_count += 1;
             task.updated_epoch_ms = current_epoch_ms();
             tx.execute(
@@ -626,6 +939,27 @@ impl TaskStore {
                      updated_epoch_ms = ?2
                  WHERE id = ?3",
                 params![task.retry_count, task.updated_epoch_ms, id],
+            )?;
+            let attempt = Self::current_attempt_for_task_tx(tx, id)?;
+            let _ = Self::insert_task_event_tx(
+                tx,
+                &TaskEventDraft {
+                    task_id: id.to_string(),
+                    attempt,
+                    ts_ms: task.updated_epoch_ms,
+                    event_type: "retry_incremented".to_string(),
+                    source: "task_store".to_string(),
+                    actor: None,
+                    session_id: None,
+                    state_before: None,
+                    state_after: None,
+                    message: Some(format!(
+                        "retry_count {} -> {}",
+                        old_retry_count, task.retry_count
+                    )),
+                    payload_json: None,
+                    idem_key: None,
+                },
             )?;
             Ok(task.clone())
         })
@@ -729,6 +1063,9 @@ impl TaskStore {
             }
 
             for task_id in &to_delete {
+                tx.execute("DELETE FROM task_events WHERE task_id = ?1", params![task_id])?;
+                tx.execute("DELETE FROM task_attempts WHERE task_id = ?1", params![task_id])?;
+                tx.execute("DELETE FROM task_sessions WHERE task_id = ?1", params![task_id])?;
                 tx.execute("DELETE FROM tasks WHERE id = ?1", params![task_id])?;
             }
 
@@ -770,6 +1107,23 @@ impl TaskStore {
                 params![session_id, task_id, next_attempt, runner_mode, started_epoch_ms],
             )?;
             let id = tx.last_insert_rowid();
+            let _ = Self::insert_task_event_tx(
+                tx,
+                &TaskEventDraft {
+                    task_id: task_id.to_string(),
+                    attempt: next_attempt,
+                    ts_ms: started_epoch_ms,
+                    event_type: "attempt_registered".to_string(),
+                    source: "task_store".to_string(),
+                    actor: None,
+                    session_id: Some(session_id.to_string()),
+                    state_before: None,
+                    state_after: None,
+                    message: Some(format!("runner_mode={runner_mode}")),
+                    payload_json: None,
+                    idem_key: Some(format!("attempt_registered:{session_id}")),
+                },
+            )?;
             Ok(TaskAttemptRecord {
                 id,
                 task_id: task_id.to_string(),
@@ -800,6 +1154,44 @@ impl TaskStore {
                  WHERE session_id = ?3",
                 params![terminal_state, ended_epoch_ms, session_id],
             )?;
+            let session_meta: Option<(String, i64, Option<String>, Option<i64>)> = tx
+                .query_row(
+                    "SELECT task_id, attempt_number, terminal_state, ended_epoch_ms
+                     FROM task_sessions
+                     WHERE session_id = ?1
+                     LIMIT 1",
+                    params![session_id],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                )
+                .optional()?;
+            if let Some((
+                task_id,
+                attempt_raw,
+                Some(effective_terminal_state),
+                effective_ended_epoch_ms,
+            )) = session_meta
+            {
+                let attempt = u32::try_from(attempt_raw).map_err(|_| {
+                    anyhow!("invalid attempt_number in task_sessions: {attempt_raw}")
+                })?;
+                let _ = Self::insert_task_event_tx(
+                    tx,
+                    &TaskEventDraft {
+                        task_id,
+                        attempt,
+                        ts_ms: effective_ended_epoch_ms.unwrap_or(ended_epoch_ms),
+                        event_type: "session_finalized".to_string(),
+                        source: "task_store".to_string(),
+                        actor: None,
+                        session_id: Some(session_id.to_string()),
+                        state_before: None,
+                        state_after: Some(effective_terminal_state),
+                        message: None,
+                        payload_json: None,
+                        idem_key: Some(format!("session_finalized:{session_id}")),
+                    },
+                )?;
+            }
             Ok(())
         })
     }
@@ -835,6 +1227,45 @@ impl TaskStore {
                 sessions.push(Self::read_task_session_row(row)?);
             }
             Ok(sessions)
+        })
+    }
+
+    pub fn append_task_event(&self, draft: &TaskEventDraft) -> Result<TaskEventRecord> {
+        self.with_transaction(|tx| Self::insert_task_event_tx(tx, draft))
+    }
+
+    pub fn list_task_events(
+        &self,
+        task_id: &str,
+        attempt: Option<u32>,
+    ) -> Result<Vec<TaskEventRecord>> {
+        self.with_connection(|connection| {
+            let mut events = Vec::new();
+            if let Some(attempt) = attempt {
+                let mut statement = connection.prepare(
+                    "SELECT id, task_id, attempt, ts_ms, event_type, source, actor, session_id, state_before, state_after, message, payload_json, idem_key
+                     FROM task_events
+                     WHERE task_id = ?1 AND attempt = ?2
+                     ORDER BY id ASC",
+                )?;
+                let mut rows = statement.query(params![task_id, i64::from(attempt)])?;
+                while let Some(row) = rows.next()? {
+                    events.push(Self::read_task_event_row(row)?);
+                }
+                return Ok(events);
+            }
+
+            let mut statement = connection.prepare(
+                "SELECT id, task_id, attempt, ts_ms, event_type, source, actor, session_id, state_before, state_after, message, payload_json, idem_key
+                 FROM task_events
+                 WHERE task_id = ?1
+                 ORDER BY id ASC",
+            )?;
+            let mut rows = statement.query(params![task_id])?;
+            while let Some(row) = rows.next()? {
+                events.push(Self::read_task_event_row(row)?);
+            }
+            Ok(events)
         })
     }
 }

@@ -24,7 +24,7 @@ use tracing::{info, warn};
 
 use agentrail_core::{Phase, PhaseStatus, Plan, Step, StepStatus};
 use agentrail_runner::{AgentRunner, ProcessRunner, TaskHandle, TaskSpec, TaskStatus, TmuxRunner};
-use agentrail_store::{TaskRecord, TaskRuntimeState, TaskStore, TaskStoreSnapshot};
+use agentrail_store::{TaskEventDraft, TaskRecord, TaskRuntimeState, TaskStore, TaskStoreSnapshot};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RuntimeRunnerMode {
@@ -76,6 +76,7 @@ impl CleanupRetentionMode {
 struct RuntimeTaskSession {
     session_id: String,
     runner_mode: RuntimeRunnerMode,
+    attempt_number: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -155,6 +156,7 @@ struct RuntimeState {
     store: TaskStore,
     sessions: HashMap<String, RuntimeTaskSession>,
     delivery_events: Vec<DeliveryEvent>,
+    pending_delivery_task_events: Vec<TaskEventDraft>,
     next_delivery_cursor: u64,
     delivery_subscriptions: HashMap<String, DeliverySubscription>,
     last_event_signature_by_task: HashMap<String, DeliveryEventSignature>,
@@ -285,6 +287,7 @@ fn runtime_state() -> &'static Mutex<RuntimeState> {
             store: TaskStore::connect(config.dsn),
             sessions: HashMap::new(),
             delivery_events: Vec::new(),
+            pending_delivery_task_events: Vec::new(),
             next_delivery_cursor: 1,
             delivery_subscriptions: HashMap::new(),
             last_event_signature_by_task: HashMap::new(),
@@ -427,15 +430,49 @@ fn emit_delivery_event(
     }
 
     let cursor = runtime.next_delivery_cursor;
+    let timestamp = delivery_timestamp_ms();
+    let event_session_id = session_id.clone();
+    let attempt = new_attempt_number
+        .or(old_attempt_number)
+        .or_else(|| {
+            runtime
+                .sessions
+                .get(task_id)
+                .map(|session| session.attempt_number)
+        })
+        .unwrap_or(0);
+    let payload = json!({
+        "event_cursor": cursor,
+        "runtime_state": runtime_state,
+        "state": state,
+        "old_attempt_number": old_attempt_number,
+        "new_attempt_number": new_attempt_number
+    })
+    .to_string();
+    runtime.pending_delivery_task_events.push(TaskEventDraft {
+        task_id: task_id.to_string(),
+        attempt,
+        ts_ms: i64::try_from(timestamp).unwrap_or(i64::MAX),
+        event_type: event_type.to_string(),
+        source: "mcp_delivery".to_string(),
+        actor: None,
+        session_id: event_session_id.clone(),
+        state_before: None,
+        state_after: Some(runtime_state.to_string()),
+        message: Some(format!("delivery event `{event_type}`")),
+        payload_json: Some(payload),
+        idem_key: None,
+    });
+    flush_pending_delivery_task_events(runtime);
     runtime.next_delivery_cursor = runtime.next_delivery_cursor.saturating_add(1);
     runtime.delivery_events.push(DeliveryEvent {
         cursor,
         task_id: task_id.to_string(),
         event_type: event_type.to_string(),
-        timestamp: delivery_timestamp_ms(),
+        timestamp,
         state: state.to_string(),
         runtime_state: runtime_state.to_string(),
-        session_id,
+        session_id: event_session_id,
         old_attempt_number,
         new_attempt_number,
     });
@@ -444,11 +481,29 @@ fn emit_delivery_event(
         .insert(task_id.to_string(), signature);
 }
 
+fn flush_pending_delivery_task_events(runtime: &mut RuntimeState) {
+    while let Some(draft) = runtime.pending_delivery_task_events.first().cloned() {
+        if let Err(error) = runtime.store.append_task_event(&draft) {
+            warn!(
+                operation = "task_event_persist",
+                task_id = draft.task_id,
+                event_type = draft.event_type,
+                error = %error,
+                "failed to persist task event from delivery runtime"
+            );
+            break;
+        }
+        runtime.pending_delivery_task_events.remove(0);
+    }
+}
+
 fn emit_delivery_status_events(
     task_id: &str,
     state: &str,
     runtime_state: &str,
     session_id: Option<String>,
+    old_attempt_number: Option<u32>,
+    new_attempt_number: Option<u32>,
 ) -> Result<()> {
     let mut runtime = runtime_state_mutex()?;
     let observation = DeliveryStatusObservation {
@@ -469,8 +524,8 @@ fn emit_delivery_status_events(
             state,
             runtime_state,
             session_id.clone(),
-            None,
-            None,
+            old_attempt_number,
+            new_attempt_number,
         );
         runtime
             .last_status_observation_by_task
@@ -485,8 +540,8 @@ fn emit_delivery_status_events(
             state,
             runtime_state,
             session_id,
-            None,
-            None,
+            old_attempt_number,
+            new_attempt_number,
         );
     }
 
@@ -1093,6 +1148,10 @@ fn register_running_session(
         .lock()
         .map_err(|_| anyhow::anyhow!("runtime state lock poisoned"))?;
     let existing = runtime.store.get_task(task_id)?;
+    let attempt =
+        runtime
+            .store
+            .register_task_attempt(task_id, &session_id, runner_mode.as_str())?;
     if let Some(task) = existing
         && task.state == TaskRuntimeState::Preparing
     {
@@ -1105,12 +1164,9 @@ fn register_running_session(
         RuntimeTaskSession {
             session_id: session_id.clone(),
             runner_mode,
+            attempt_number: attempt.attempt_number,
         },
     );
-    let attempt =
-        runtime
-            .store
-            .register_task_attempt(task_id, &session_id, runner_mode.as_str())?;
     let task = runtime
         .store
         .get_task(task_id)?
@@ -1325,6 +1381,8 @@ async fn task_runtime_status(task_id: &str, tail: usize) -> Result<Value> {
         &status.state,
         &runtime_state,
         Some(session.session_id.clone()),
+        Some(session.attempt_number),
+        None,
     )?;
     let steer_observation = {
         let runtime = runtime_state_mutex()?;
@@ -1527,7 +1585,15 @@ async fn delivery_stop_runtime(args: Value) -> Result<Value> {
 
     if active_or_session {
         let session_id = session.as_ref().map(|active| active.session_id.clone());
-        emit_delivery_status_events(&task_id, "stopped", &runtime_state, session_id)?;
+        let attempt = session.as_ref().map(|active| active.attempt_number);
+        emit_delivery_status_events(
+            &task_id,
+            "stopped",
+            &runtime_state,
+            session_id,
+            attempt,
+            None,
+        )?;
     }
 
     Ok(json!({
@@ -2081,6 +2147,7 @@ fn collect_startup_recovery_candidates() -> Result<Vec<StartupRecoveryCandidate>
                     .map(|runner_mode| RuntimeTaskSession {
                         session_id: session.session_id,
                         runner_mode,
+                        attempt_number: session.attempt_number,
                     })
             });
 
@@ -2098,6 +2165,7 @@ fn emit_recovery_event(
     event_type: &str,
     runtime_state: &str,
     session_id: Option<String>,
+    attempt_number: Option<u32>,
 ) -> Result<()> {
     let mut runtime = runtime_state_mutex()?;
     emit_delivery_event(
@@ -2107,7 +2175,7 @@ fn emit_recovery_event(
         "recovery",
         runtime_state,
         session_id,
-        None,
+        attempt_number,
         None,
     );
     Ok(())
@@ -2148,6 +2216,7 @@ async fn reconcile_runtime_startup_once() -> Result<()> {
                     "recovery_missing_session",
                     &runtime_state,
                     None,
+                    None,
                 )?;
                 info!(
                     operation = "runtime_recovery",
@@ -2183,6 +2252,7 @@ async fn reconcile_runtime_startup_once() -> Result<()> {
                         "recovery_attached",
                         &runtime_state,
                         Some(session.session_id.clone()),
+                        Some(session.attempt_number),
                     )?;
                     info!(
                         operation = "runtime_recovery",
@@ -2220,6 +2290,7 @@ async fn reconcile_runtime_startup_once() -> Result<()> {
                         "recovery_terminal_observed",
                         &runtime_state,
                         Some(session.session_id.clone()),
+                        Some(session.attempt_number),
                     )?;
                     info!(
                         operation = "runtime_recovery",
@@ -2242,6 +2313,7 @@ async fn reconcile_runtime_startup_once() -> Result<()> {
                         "recovery_missing_session",
                         &runtime_state,
                         Some(session.session_id.clone()),
+                        Some(session.attempt_number),
                     )?;
                     info!(
                         operation = "runtime_recovery",
@@ -3599,7 +3671,7 @@ mod tests {
     fn record_delivery_steer_sent_updates_observation_and_emits_event() {
         let task_id = unique_test_task_id("steer-observation");
         {
-            let runtime = runtime_state().lock().expect("runtime lock");
+            let mut runtime = runtime_state().lock().expect("runtime lock");
             runtime
                 .store
                 .upsert_task(&TaskRecord::new(task_id.clone(), "worker-a", 2))
@@ -3612,6 +3684,14 @@ mod tests {
                 .store
                 .transition(&task_id, TaskRuntimeState::Running)
                 .expect("preparing -> running");
+            runtime.sessions.insert(
+                task_id.clone(),
+                RuntimeTaskSession {
+                    session_id: "tmux-session-1".to_string(),
+                    runner_mode: RuntimeRunnerMode::Tmux,
+                    attempt_number: 3,
+                },
+            );
         }
 
         let sent_at = record_delivery_steer_sent(
@@ -3638,6 +3718,17 @@ mod tests {
                 && event.event_type == "steer_sent"
                 && event.session_id.as_deref() == Some("tmux-session-1")
         }));
+        let persisted = runtime
+            .store
+            .list_task_events(&task_id, None)
+            .expect("task events should be readable");
+        let persisted_steer_sent = persisted
+            .iter()
+            .filter(|event| event.event_type == "steer_sent" && event.source == "mcp_delivery")
+            .collect::<Vec<_>>();
+        assert_eq!(persisted_steer_sent.len(), 1);
+        assert_eq!(persisted_steer_sent[0].attempt, 3);
+        assert!(persisted_steer_sent[0].idem_key.is_none());
     }
 
     #[test]
@@ -3705,6 +3796,47 @@ mod tests {
         );
     }
 
+    #[test]
+    fn emit_delivery_event_attempt_precedence_prefers_new_attempt_number() {
+        let task_id = unique_test_task_id("delivery-attempt-precedence");
+        {
+            let mut runtime = runtime_state().lock().expect("runtime lock");
+            runtime
+                .store
+                .upsert_task(&TaskRecord::new(task_id.clone(), "worker-a", 2))
+                .expect("seed task");
+            runtime.sessions.insert(
+                task_id.clone(),
+                RuntimeTaskSession {
+                    session_id: "attempt-session-1".to_string(),
+                    runner_mode: RuntimeRunnerMode::Process,
+                    attempt_number: 3,
+                },
+            );
+            emit_delivery_event(
+                &mut runtime,
+                &task_id,
+                "retry_started",
+                "running",
+                "running",
+                Some("attempt-session-1".to_string()),
+                Some(2),
+                Some(4),
+            );
+        }
+
+        let runtime = runtime_state().lock().expect("runtime lock");
+        let persisted = runtime
+            .store
+            .list_task_events(&task_id, None)
+            .expect("task events should be readable");
+        let retry_started = persisted
+            .iter()
+            .find(|event| event.event_type == "retry_started" && event.source == "mcp_delivery")
+            .expect("expected retry_started event");
+        assert_eq!(retry_started.attempt, 4);
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn poll_runtime_once_reports_task_failures_and_cleans_missing_sessions() {
         let task_id = unique_test_task_id("poll-missing-session");
@@ -3719,6 +3851,7 @@ mod tests {
                 RuntimeTaskSession {
                     session_id: "process-missing-session".to_string(),
                     runner_mode: RuntimeRunnerMode::Process,
+                    attempt_number: 0,
                 },
             );
         }
@@ -3863,6 +3996,18 @@ mod tests {
         assert!(runtime.delivery_events.iter().any(|event| {
             event.task_id == task_id && event.event_type == "recovery_missing_session"
         }));
+        let persisted = runtime
+            .store
+            .list_task_events(&task_id, None)
+            .expect("task events should be readable");
+        assert!(
+            persisted.iter().any(|event| {
+                event.event_type == "recovery_missing_session"
+                    && event.source == "mcp_delivery"
+                    && event.attempt == 1
+            }),
+            "recovery event should keep attempt number from recovered session"
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
