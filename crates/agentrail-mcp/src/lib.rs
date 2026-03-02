@@ -3643,7 +3643,9 @@ fn delivery_timeline(args: Value) -> Result<Value> {
     let runtime = runtime_state_mutex()?;
     let events = runtime.store.list_task_events(&task_id, None)?;
     let latest_cursor = events.last().map(task_event_id_u64).unwrap_or(0);
-    if let Some(cursor) = requested_cursor && latest_cursor > 0 {
+    if let Some(cursor) = requested_cursor
+        && latest_cursor > 0
+    {
         validate_delivery_cursor_bounds("delivery_timeline", "cursor", cursor, latest_cursor)?;
     }
 
@@ -3661,9 +3663,9 @@ fn delivery_timeline(args: Value) -> Result<Value> {
             break;
         }
     }
-    let has_more = events
-        .iter()
-        .any(|event| task_event_id_u64(event) > next_cursor && task_event_id_u64(event) > start_cursor);
+    let has_more = events.iter().any(|event| {
+        task_event_id_u64(event) > next_cursor && task_event_id_u64(event) > start_cursor
+    });
 
     Ok(json!({
         "tool": "delivery_timeline",
@@ -3710,7 +3712,10 @@ fn delivery_explain_failure(args: Value) -> Result<Value> {
                 | TaskRuntimeState::NeedsAttention
         )
     });
-    let latest_failure_event = events.iter().rev().find(|event| event_is_failure_signal(event));
+    let latest_failure_event = events
+        .iter()
+        .rev()
+        .find(|event| event_is_failure_signal(event));
     let latest_event_id = events.last().map(task_event_id_u64).unwrap_or(0);
     let transitions = events
         .iter()
@@ -3733,9 +3738,7 @@ fn delivery_explain_failure(args: Value) -> Result<Value> {
     } else if let Some(event) = latest_failure_event {
         format!(
             "task failed with runtime_state={runtime_state}; latest failure signal event_type={} source={} event_id={}",
-            event.event_type,
-            event.source,
-            event.id
+            event.event_type, event.source, event.id
         )
     } else {
         format!(

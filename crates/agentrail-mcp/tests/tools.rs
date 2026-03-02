@@ -2348,7 +2348,10 @@ fn delivery_timeline_and_explain_failure_return_stable_payloads_for_unknown_task
     assert_eq!(timeline["next_cursor"], json!(0));
     assert_eq!(timeline["has_more"], json!(false));
     assert_eq!(
-        timeline["events"].as_array().expect("events should be array").len(),
+        timeline["events"]
+            .as_array()
+            .expect("events should be array")
+            .len(),
         0
     );
 
