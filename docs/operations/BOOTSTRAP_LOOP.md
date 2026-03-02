@@ -79,6 +79,10 @@ This wrapper preserves the default path and only falls back to REST PATCH when G
 `projectCards` deprecation GraphQL error.
 Prerequisites: `gh` and `jq` installed, and `remote.origin.url` points to a GitHub repository.
 
+For PR merge in multi-worktree sessions, use `scripts/gh-pr-merge-safe.sh` instead of raw
+`gh pr merge --delete-branch`. It retries without `--delete-branch` only when local branch
+cleanup fails because `main` is checked out in another worktree.
+
 Behavior of `codex-guarded-exec.sh`:
 - If the worker fails to mutate the workspace before timeout, the guard exits with code `124`.
 - This creates a deterministic failure signal so orchestrator can stop/retry instead of waiting indefinitely.
