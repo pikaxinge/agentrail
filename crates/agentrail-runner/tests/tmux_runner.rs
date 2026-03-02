@@ -279,6 +279,55 @@ async fn steer_pause_resume_stop_and_status_work_best_effort() {
 }
 
 #[tokio::test]
+async fn steer_sends_enough_submit_pulses_for_confirming_prompts() {
+    if skip_if_no_tmux() {
+        return;
+    }
+
+    let tmux_runner = runner();
+    let tmp = tempdir().expect("tempdir");
+    let handle = tmux_runner
+        .start(TaskSpec {
+            id: "task-steer-double-enter".to_string(),
+            command: "bash".to_string(),
+            args: vec![
+                "-lc".to_string(),
+                "while read line; do read confirm || break; echo got2:$line; done".to_string(),
+            ],
+            workdir: workdir_string(tmp.path()),
+        })
+        .await
+        .expect("start should succeed");
+
+    tmux_runner
+        .steer(&handle.session_id, "needs-two-enter")
+        .await
+        .expect("steer should succeed");
+
+    let mut saw_steer_line = false;
+    for _ in 0..40 {
+        let logs = tmux_runner
+            .logs(&handle.session_id, 80)
+            .await
+            .expect("logs should succeed");
+        if logs.contains("got2:needs-two-enter") {
+            saw_steer_line = true;
+            break;
+        }
+        sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        saw_steer_line,
+        "steer input should execute even when target prompt needs a confirm enter"
+    );
+
+    tmux_runner
+        .stop(&handle.session_id)
+        .await
+        .expect("stop should succeed");
+}
+
+#[tokio::test]
 async fn interactive_stdout_tty_command_starts_successfully() {
     if skip_if_no_tmux() {
         return;

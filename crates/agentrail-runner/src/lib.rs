@@ -131,6 +131,8 @@ static SESSION_COUNTER: AtomicU64 = AtomicU64::new(1);
 const MAX_LOG_LINES: usize = 2000;
 const MAX_TERMINAL_SESSIONS: usize = 256;
 const TMUX_LOG_DIR: &str = ".agentrail-tmux-logs";
+const TMUX_STEER_SUBMIT_PULSES: usize = 2;
+const TMUX_STEER_SUBMIT_PULSE_DELAY_MS: u64 = 60;
 
 fn unique_tmux_session_id(sequence: u64) -> String {
     let ts_nanos = SystemTime::now()
@@ -1042,10 +1044,19 @@ impl AgentRunner for TmuxRunner {
             return Err(anyhow!("tmux send-keys failed: {}", stderr.trim()));
         }
 
-        let output = run_tmux(&["send-keys", "-t", &target, "C-m"])?;
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(anyhow!("tmux send-keys enter failed: {}", stderr.trim()));
+        // Some interactive UIs intermittently require an extra submit pulse
+        // before they actually execute injected text. Emit two enter pulses
+        // with a short gap; an extra empty submit is benign for line-oriented
+        // shells and materially improves steer reliability for prompt UIs.
+        for pulse in 0..TMUX_STEER_SUBMIT_PULSES {
+            let output = run_tmux(&["send-keys", "-t", &target, "C-m"])?;
+            if !output.status.success() {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                return Err(anyhow!("tmux send-keys enter failed: {}", stderr.trim()));
+            }
+            if pulse + 1 < TMUX_STEER_SUBMIT_PULSES {
+                tokio::time::sleep(Duration::from_millis(TMUX_STEER_SUBMIT_PULSE_DELAY_MS)).await;
+            }
         }
 
         Ok(())
