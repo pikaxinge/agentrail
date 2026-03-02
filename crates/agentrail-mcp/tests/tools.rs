@@ -857,6 +857,7 @@ fn delivery_submit_status_and_report_are_available() {
         normalized_keys,
         vec![
             "assigned_worker",
+            "last_output_at",
             "last_steer_apply_hint",
             "last_steer_observed_at",
             "last_steer_sent_at",
@@ -868,6 +869,8 @@ fn delivery_submit_status_and_report_are_available() {
             "runtime_state",
             "session_id",
             "span_id",
+            "stall_duration_ms",
+            "stall_reason",
             "state",
             "task_id",
             "timestamps",
@@ -917,6 +920,18 @@ fn delivery_submit_status_and_report_are_available() {
     assert!(status["normalized"]["last_steer_sent_at"].is_null());
     assert!(status["normalized"]["last_steer_observed_at"].is_null());
     assert!(status["normalized"]["last_steer_apply_hint"].is_null());
+    assert_eq!(
+        status["normalized"]["last_output_at"],
+        status["orchestration"]["last_output_at"]
+    );
+    assert_eq!(
+        status["normalized"]["stall_duration_ms"],
+        status["orchestration"]["stall_duration_ms"]
+    );
+    assert_eq!(
+        status["normalized"]["stall_reason"],
+        status["orchestration"]["stall_reason"]
+    );
     assert!(status["normalized"]["timestamps"]["updated_at"].is_number());
     assert_eq!(status["normalized"]["logs"]["tail"], 5);
     assert!(status["normalized"]["logs"]["truncated"].is_boolean());
@@ -925,6 +940,66 @@ fn delivery_submit_status_and_report_are_available() {
     assert_eq!(report["tool"], "delivery_report");
     assert!(report["summary"]["total"].is_number());
     assert!(report["tasks"].is_array());
+    let task_row = report["tasks"]
+        .as_array()
+        .expect("tasks should be array")
+        .iter()
+        .find(|row| row["task_id"] == status["task_id"])
+        .expect("report should include submitted task");
+    assert!(task_row.get("last_output_at").is_some());
+    assert!(task_row.get("stall_duration_ms").is_some());
+    assert!(task_row.get("stall_reason").is_some());
+}
+
+#[test]
+fn delivery_status_reports_no_output_freshness_after_stagnant_polls() {
+    let tmp = tempdir().expect("tempdir");
+    let task_id = unique_task_id("task-delivery-stall-no-output");
+
+    let _submit = handle_tool_call(
+        "delivery_submit",
+        json!({
+            "task_id": task_id,
+            "worker_id": "worker-a",
+            "runner_mode": "process",
+            "command": "bash",
+            "args": ["-lc", "echo once && sleep 5"],
+            "workdir": tmp.path().display().to_string()
+        }),
+    )
+    .expect("delivery_submit should succeed");
+    let _ = wait_for_runtime_state(&task_id, "running");
+
+    let mut latest = json!({});
+    for _ in 0..5 {
+        latest = handle_tool_call(
+            "delivery_status",
+            json!({
+                "task_id": task_id,
+                "tail": 32
+            }),
+        )
+        .expect("delivery_status should succeed");
+        thread::sleep(Duration::from_millis(20));
+    }
+
+    assert_eq!(latest["runtime_state"], "running");
+    assert_eq!(latest["normalized"]["stall_reason"], "no_output_freshness");
+    assert!(
+        latest["normalized"]["last_output_at"].is_null()
+            || latest["normalized"]["last_output_at"].is_number()
+    );
+    assert!(latest["normalized"]["stall_duration_ms"].is_number());
+
+    let _ = handle_tool_call(
+        "delivery_stop",
+        json!({
+            "task_id": task_id,
+            "reason": "stall-test-cleanup"
+        }),
+    )
+    .expect("cleanup delivery_stop should succeed");
+    let _ = wait_for_runtime_state(&task_id, "failed_retryable");
 }
 
 #[test]
@@ -1326,6 +1401,9 @@ fn delivery_status_normalized_envelope_uses_deterministic_nulls_when_runtime_dat
     assert!(status["normalized"]["last_steer_sent_at"].is_null());
     assert!(status["normalized"]["last_steer_observed_at"].is_null());
     assert!(status["normalized"]["last_steer_apply_hint"].is_null());
+    assert!(status["normalized"]["last_output_at"].is_null());
+    assert!(status["normalized"]["stall_duration_ms"].is_null());
+    assert!(status["normalized"]["stall_reason"].is_null());
     assert!(status["normalized"]["timestamps"]["updated_at"].is_number());
     assert_eq!(status["normalized"]["logs"]["tail"], 9);
     assert_eq!(status["normalized"]["logs"]["truncated"], false);
