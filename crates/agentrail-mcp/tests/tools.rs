@@ -1,4 +1,6 @@
 use std::{
+    fs,
+    path::{Path, PathBuf},
     thread,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -6,6 +8,8 @@ use std::{
 use agentrail_mcp::handle_tool_call;
 use agentrail_store::TaskStore;
 use serde_json::json;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use tempfile::tempdir;
 
 fn unique_task_id(prefix: &str) -> String {
@@ -116,6 +120,124 @@ fn runtime_store_dsn() -> String {
         .ok()
         .filter(|value| !value.trim().is_empty())
         .unwrap_or_else(|| "sqlite://.agentrail/runtime.db".to_string())
+}
+
+fn write_fake_app_server_script(
+    root: &Path,
+    script_name: &str,
+    completion_status: Option<&str>,
+) -> (PathBuf, PathBuf) {
+    let script_path = root.join(script_name);
+    let log_path = root.join(format!("{script_name}.requests.log"));
+    let escaped_log_path = log_path.display().to_string().replace('\'', "'\"'\"'");
+    let completion_literal = completion_status.unwrap_or("");
+    let emit_completion_payload = if completion_status.is_some() {
+        "printf '{\"method\":\"turn/completed\",\"params\":{\"turn\":{\"id\":\"%s\",\"status\":\"%s\"}}}\\n' \"$turn_id\" \"$COMPLETE_STATUS\""
+    } else {
+        ":"
+    };
+    let script = format!(
+        r#"#!/usr/bin/env bash
+set -euo pipefail
+
+LOG_PATH='{escaped_log_path}'
+COMPLETE_STATUS='{completion_literal}'
+turn_seq=0
+
+next_turn_id() {{
+  turn_seq=$((turn_seq + 1))
+  printf 'turn-%s' "$turn_seq"
+}}
+
+while IFS= read -r line; do
+  printf '%s\n' "$line" >> "$LOG_PATH"
+  id="$(printf '%s\n' "$line" | sed -n 's/.*"id":[[:space:]]*\([0-9][0-9]*\).*/\1/p' | head -n 1)"
+
+  if [[ "$line" == *'"method":"initialize"'* ]]; then
+    printf '{{"id":%s,"result":{{"userAgent":"fake-app-server/1.0"}}}}\n' "$id"
+  elif [[ "$line" == *'"method":"initialized"'* ]]; then
+    :
+  elif [[ "$line" == *'"method":"thread/start"'* ]]; then
+    printf '{{"id":%s,"result":{{"thread":{{"id":"thread-test"}}}}}}\n' "$id"
+  elif [[ "$line" == *'"method":"turn/start"'* ]]; then
+    turn_id="$(next_turn_id)"
+    printf '{{"id":%s,"result":{{"turn":{{"id":"%s"}}}}}}\n' "$id" "$turn_id"
+    {emit_completion_payload}
+  elif [[ "$line" == *'"method":"turn/steer"'* ]]; then
+    turn_id="$(next_turn_id)"
+    printf '{{"id":%s,"result":{{"turn":{{"id":"%s"}}}}}}\n' "$id" "$turn_id"
+    {emit_completion_payload}
+  elif [[ "$line" == *'"method":"turn/interrupt"'* ]]; then
+    printf '{{"id":%s,"result":{{"accepted":true}}}}\n' "$id"
+    printf '{{"method":"turn/completed","params":{{"turn":{{"id":"turn-interrupted","status":"interrupted"}}}}}}\n'
+  elif [[ -n "$id" ]]; then
+    printf '{{"id":%s,"result":{{}}}}\n' "$id"
+  fi
+done
+"#
+    );
+    fs::write(&script_path, script).expect("write fake app server script");
+    #[cfg(unix)]
+    {
+        let mut permissions = fs::metadata(&script_path)
+            .expect("metadata for fake app server script")
+            .permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&script_path, permissions)
+            .expect("set executable bit for fake app server script");
+    }
+    (script_path, log_path)
+}
+
+fn write_fake_app_server_with_server_request_script(
+    root: &Path,
+    script_name: &str,
+) -> (PathBuf, PathBuf) {
+    let script_path = root.join(script_name);
+    let log_path = root.join(format!("{script_name}.requests.log"));
+    let escaped_log_path = log_path.display().to_string().replace('\'', "'\"'\"'");
+    let script = format!(
+        r#"#!/usr/bin/env bash
+set -euo pipefail
+
+LOG_PATH='{escaped_log_path}'
+sent_server_request=0
+
+while IFS= read -r line; do
+  printf '%s\n' "$line" >> "$LOG_PATH"
+  id="$(printf '%s\n' "$line" | sed -n 's/.*"id":[[:space:]]*\([0-9][0-9]*\).*/\1/p' | head -n 1)"
+
+  if [[ "$line" == *'"method":"initialize"'* ]]; then
+    printf '{{"id":%s,"result":{{"userAgent":"fake-app-server/1.0"}}}}\n' "$id"
+  elif [[ "$line" == *'"method":"initialized"'* ]]; then
+    :
+  elif [[ "$line" == *'"method":"thread/start"'* ]]; then
+    printf '{{"id":%s,"result":{{"thread":{{"id":"thread-test"}}}}}}\n' "$id"
+  elif [[ "$line" == *'"method":"turn/start"'* ]]; then
+    printf '{{"id":%s,"result":{{"turn":{{"id":"turn-1"}}}}}}\n' "$id"
+    if [[ "$sent_server_request" -eq 0 ]]; then
+      sent_server_request=1
+      printf '{{"id":777,"method":"approval/request","params":{{"reason":"test-server-request"}}}}\n'
+    fi
+  elif [[ "$line" == *'"method":"turn/interrupt"'* ]]; then
+    printf '{{"id":%s,"result":{{"accepted":true}}}}\n' "$id"
+  elif [[ -n "$id" ]]; then
+    printf '{{"id":%s,"result":{{}}}}\n' "$id"
+  fi
+done
+"#
+    );
+    fs::write(&script_path, script).expect("write fake app server script with server request");
+    #[cfg(unix)]
+    {
+        let mut permissions = fs::metadata(&script_path)
+            .expect("metadata for fake app server script")
+            .permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&script_path, permissions)
+            .expect("set executable bit for fake app server script");
+    }
+    (script_path, log_path)
 }
 
 #[test]
@@ -674,7 +796,7 @@ fn delivery_submit_rejects_steer_required_with_process_runner() {
 
     assert!(
         err.to_string()
-            .contains("steer_required=true requires runner_mode=tmux"),
+            .contains("steer_required=true requires runner_mode=tmux or runner_mode=app_server"),
         "expected runner_mode validation error, got: {err}"
     );
 }
@@ -757,6 +879,264 @@ fn delivery_submit_rejects_steer_required_for_guarded_exec_wrapper() {
         err.to_string()
             .contains("rejects non-steerable codex exec command shape"),
         "expected non-steerable guarded exec validation error, got: {err}"
+    );
+}
+
+#[test]
+fn delivery_submit_defaults_runner_mode_to_process_when_omitted() {
+    let tmp = tempdir().expect("tempdir");
+    let task_id = unique_task_id("task-delivery-default-runner");
+
+    let submit = handle_tool_call(
+        "delivery_submit",
+        json!({
+            "task_id": task_id,
+            "worker_id": "worker-a",
+            "command": "bash",
+            "args": ["-lc", "echo default-runner"],
+            "workdir": tmp.path().display().to_string()
+        }),
+    )
+    .expect("delivery_submit should succeed with default runner");
+
+    assert_eq!(submit["orchestration"]["runner_mode"], "process");
+}
+
+#[test]
+fn delivery_submit_allows_steer_required_for_app_server_without_interactive_command() {
+    let tmp = tempdir().expect("tempdir");
+    let (script_path, _request_log_path) =
+        write_fake_app_server_script(tmp.path(), "fake-app-server-steer-required.sh", None);
+    let task_id = unique_task_id("task-delivery-app-server-steer-required");
+
+    let submit = handle_tool_call(
+        "delivery_submit",
+        json!({
+            "task_id": task_id,
+            "worker_id": "worker-a",
+            "runner_mode": "app_server",
+            "steer_required": true,
+            "command": script_path.display().to_string(),
+            "args": [],
+            "workdir": tmp.path().display().to_string()
+        }),
+    )
+    .expect("delivery_submit should allow app_server steer_required without interactive_command");
+    assert_eq!(submit["orchestration"]["runner_mode"], "app_server");
+
+    let _ = handle_tool_call(
+        "delivery_stop",
+        json!({
+            "task_id": task_id,
+            "reason": "cleanup"
+        }),
+    )
+    .expect("delivery_stop cleanup should succeed");
+}
+
+#[test]
+fn delivery_status_maps_app_server_completed_turn_to_ready_to_merge() {
+    let tmp = tempdir().expect("tempdir");
+    let (script_path, _request_log_path) = write_fake_app_server_script(
+        tmp.path(),
+        "fake-app-server-completed.sh",
+        Some("completed"),
+    );
+    let task_id = unique_task_id("task-delivery-app-server-completed");
+
+    let _submit = handle_tool_call(
+        "delivery_submit",
+        json!({
+            "task_id": task_id,
+            "worker_id": "worker-a",
+            "runner_mode": "app_server",
+            "command": script_path.display().to_string(),
+            "args": [],
+            "workdir": tmp.path().display().to_string()
+        }),
+    )
+    .expect("delivery_submit should succeed");
+
+    let status = wait_for_runtime_state(&task_id, "ready_to_merge");
+    assert_eq!(status["runtime_state"], "ready_to_merge");
+}
+
+#[test]
+fn delivery_status_maps_app_server_failed_turn_to_failed_retryable() {
+    let tmp = tempdir().expect("tempdir");
+    let (script_path, _request_log_path) =
+        write_fake_app_server_script(tmp.path(), "fake-app-server-failed.sh", Some("failed"));
+    let task_id = unique_task_id("task-delivery-app-server-failed");
+
+    let _submit = handle_tool_call(
+        "delivery_submit",
+        json!({
+            "task_id": task_id,
+            "worker_id": "worker-a",
+            "runner_mode": "app_server",
+            "command": script_path.display().to_string(),
+            "args": [],
+            "workdir": tmp.path().display().to_string()
+        }),
+    )
+    .expect("delivery_submit should succeed");
+
+    let status = wait_for_runtime_state(&task_id, "failed_retryable");
+    assert_eq!(status["runtime_state"], "failed_retryable");
+}
+
+#[test]
+fn delivery_submit_app_server_runner_maps_submit_steer_stop_over_stdio_jsonrpc() {
+    let tmp = tempdir().expect("tempdir");
+    let (script_path, request_log_path) =
+        write_fake_app_server_script(tmp.path(), "fake-app-server.sh", None);
+    let task_id = unique_task_id("task-delivery-app-server-lifecycle");
+
+    let submit = handle_tool_call(
+        "delivery_submit",
+        json!({
+            "task_id": task_id,
+            "worker_id": "worker-a",
+            "runner_mode": "app_server",
+            "command": script_path.display().to_string(),
+            "args": [],
+            "workdir": tmp.path().display().to_string()
+        }),
+    )
+    .expect("delivery_submit should succeed for app_server runner");
+
+    assert_eq!(submit["tool"], "delivery_submit");
+    assert_eq!(submit["orchestration"]["runner_mode"], "app_server");
+    assert_eq!(submit["orchestration"]["status"], "accepted");
+
+    let steer = handle_tool_call(
+        "delivery_steer",
+        json!({
+            "task_id": task_id,
+            "instruction": "diagnostic-echo"
+        }),
+    )
+    .expect("delivery_steer should succeed for app_server runner");
+    assert_eq!(steer["tool"], "delivery_steer");
+    assert_eq!(steer["status"], "sent");
+
+    let stop = handle_tool_call(
+        "delivery_stop",
+        json!({
+            "task_id": task_id,
+            "reason": "test-stop"
+        }),
+    )
+    .expect("delivery_stop should succeed for app_server runner");
+    assert_eq!(stop["tool"], "delivery_stop");
+    assert_eq!(stop["status"], "stopped");
+
+    let status = handle_tool_call(
+        "delivery_status",
+        json!({
+            "task_id": task_id,
+            "tail": 20
+        }),
+    )
+    .expect("delivery_status should succeed after stop");
+    assert_eq!(status["tool"], "delivery_status");
+    assert_eq!(status["runtime_state"], "failed_retryable");
+
+    let request_log =
+        fs::read_to_string(&request_log_path).expect("fake app server request log should exist");
+    let requests = request_log
+        .lines()
+        .map(|line| {
+            serde_json::from_str::<serde_json::Value>(line).expect("line should be valid json")
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        requests
+            .iter()
+            .any(|request| request["method"] == "initialize"),
+        "request log should include initialize call: {request_log}"
+    );
+    assert!(
+        requests
+            .iter()
+            .any(|request| request["method"] == "initialized"),
+        "request log should include initialized notification: {request_log}"
+    );
+    assert!(
+        requests
+            .iter()
+            .any(|request| request["method"] == "thread/start"),
+        "request log should include thread/start call: {request_log}"
+    );
+    let turn_start = requests
+        .iter()
+        .find(|request| request["method"] == "turn/start")
+        .expect("request log should include turn/start");
+    assert_eq!(turn_start["params"]["threadId"], "thread-test");
+    assert_eq!(
+        turn_start["params"]["input"][0]["text"],
+        format!("start task {task_id}")
+    );
+
+    let turn_steer = requests
+        .iter()
+        .find(|request| request["method"] == "turn/steer")
+        .expect("request log should include turn/steer");
+    assert_eq!(turn_steer["params"]["threadId"], "thread-test");
+    assert_eq!(turn_steer["params"]["input"][0]["text"], "diagnostic-echo");
+    assert!(turn_steer["params"]["expectedTurnId"].is_string());
+
+    let turn_interrupt = requests
+        .iter()
+        .find(|request| request["method"] == "turn/interrupt")
+        .expect("request log should include turn/interrupt");
+    assert_eq!(turn_interrupt["params"]["threadId"], "thread-test");
+    assert!(turn_interrupt["params"]["turnId"].is_string());
+}
+
+#[test]
+fn delivery_submit_app_server_replies_error_to_server_initiated_request() {
+    let tmp = tempdir().expect("tempdir");
+    let (script_path, request_log_path) = write_fake_app_server_with_server_request_script(
+        tmp.path(),
+        "fake-app-server-server-request.sh",
+    );
+    let task_id = unique_task_id("task-delivery-app-server-server-request");
+
+    let submit = handle_tool_call(
+        "delivery_submit",
+        json!({
+            "task_id": task_id,
+            "worker_id": "worker-a",
+            "runner_mode": "app_server",
+            "command": script_path.display().to_string(),
+            "args": [],
+            "workdir": tmp.path().display().to_string()
+        }),
+    )
+    .expect("delivery_submit should succeed for app_server runner");
+    assert_eq!(submit["orchestration"]["status"], "accepted");
+
+    thread::sleep(Duration::from_millis(150));
+
+    let _stop = handle_tool_call(
+        "delivery_stop",
+        json!({
+            "task_id": task_id,
+            "reason": "cleanup"
+        }),
+    )
+    .expect("delivery_stop should succeed");
+
+    let request_log =
+        fs::read_to_string(&request_log_path).expect("fake app server request log should exist");
+    assert!(
+        request_log.contains("\"id\":777"),
+        "client should respond to server-initiated request id 777: {request_log}"
+    );
+    assert!(
+        request_log.contains("unsupported app_server server request method"),
+        "client should return deterministic unsupported-method error for server request: {request_log}"
     );
 }
 

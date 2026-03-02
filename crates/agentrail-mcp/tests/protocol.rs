@@ -185,6 +185,10 @@ fn tools_list_includes_delivery_stop_and_cleanup_schemas() {
         .find(|t| t["name"] == "delivery_submit")
         .expect("delivery_submit descriptor should exist");
     assert_eq!(
+        submit["inputSchema"]["properties"]["runner_mode"]["enum"],
+        json!(["process", "tmux", "app_server"])
+    );
+    assert_eq!(
         submit["inputSchema"]["properties"]["steer_required"]["type"],
         json!("boolean")
     );
@@ -216,6 +220,15 @@ fn tools_list_includes_delivery_stop_and_cleanup_schemas() {
     assert_eq!(
         report["inputSchema"]["properties"]["cursor"]["type"],
         json!("string")
+    );
+
+    let orchestrate_start = tools
+        .iter()
+        .find(|t| t["name"] == "orchestrate_start")
+        .expect("orchestrate_start descriptor should exist");
+    assert_eq!(
+        orchestrate_start["inputSchema"]["properties"]["runner_mode"]["enum"],
+        json!(["process", "tmux", "app_server"])
     );
 }
 

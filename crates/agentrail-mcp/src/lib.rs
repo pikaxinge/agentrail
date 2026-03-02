@@ -7,19 +7,19 @@ use axum::{
     routing::{get, post},
 };
 use serde_json::{Value, json};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{
-    Mutex, OnceLock,
-    atomic::{AtomicU64, Ordering},
+    Arc, Mutex, OnceLock,
+    atomic::{AtomicBool, AtomicU64, Ordering},
 };
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWriteExt, BufReader, BufWriter};
 use tokio::process::{Child, ChildStdin, Command};
-use tokio::sync::mpsc;
+use tokio::sync::{Mutex as AsyncMutex, mpsc, oneshot};
 use tracing::{info, warn};
 
 use agentrail_core::{Phase, PhaseStatus, Plan, Step, StepStatus};
@@ -30,6 +30,7 @@ use agentrail_store::{TaskEventDraft, TaskRecord, TaskRuntimeState, TaskStore, T
 enum RuntimeRunnerMode {
     Process,
     Tmux,
+    AppServer,
 }
 
 impl RuntimeRunnerMode {
@@ -37,6 +38,7 @@ impl RuntimeRunnerMode {
         match raw.unwrap_or("process") {
             "process" => Ok(Self::Process),
             "tmux" => Ok(Self::Tmux),
+            "app_server" => Ok(Self::AppServer),
             other => anyhow::bail!("unsupported runner_mode: {other}"),
         }
     }
@@ -45,6 +47,7 @@ impl RuntimeRunnerMode {
         match self {
             Self::Process => "process",
             Self::Tmux => "tmux",
+            Self::AppServer => "app_server",
         }
     }
 }
@@ -172,11 +175,60 @@ struct RuntimeCleanupTarget {
     session: Option<RuntimeTaskSession>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AppServerSessionState {
+    Running,
+    Completed,
+    Failed,
+    Stopped,
+}
+
+impl AppServerSessionState {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Running => "running",
+            Self::Completed => "completed",
+            Self::Failed => "failed",
+            Self::Stopped => "stopped",
+        }
+    }
+
+    fn is_terminal(self) -> bool {
+        !matches!(self, Self::Running)
+    }
+}
+
+struct AppServerSession {
+    task_id: String,
+    logs: Arc<AsyncMutex<VecDeque<String>>>,
+    inner: AsyncMutex<AppServerSessionInner>,
+    writer: AsyncMutex<Option<ChildStdin>>,
+    sequence: u64,
+    terminal: AtomicBool,
+}
+
+struct AppServerSessionInner {
+    state: AppServerSessionState,
+    child: Option<Child>,
+    next_request_id: u64,
+    pending: HashMap<u64, oneshot::Sender<Value>>,
+    thread_id: Option<String>,
+    active_turn_id: Option<String>,
+    pending_terminal_state: Option<AppServerSessionState>,
+}
+
 static RUNTIME_STATE: OnceLock<Mutex<RuntimeState>> = OnceLock::new();
 static DELIVERY_SUBSCRIBER_SEQ: AtomicU64 = AtomicU64::new(1);
+static APP_SERVER_SESSIONS: OnceLock<Mutex<HashMap<String, Arc<AppServerSession>>>> =
+    OnceLock::new();
+static APP_SERVER_SESSION_SEQ: AtomicU64 = AtomicU64::new(1);
 
 const DEFAULT_RUNTIME_STORE_DSN: &str = "sqlite://.agentrail/runtime.db";
 const STEER_ECHO_PROBE_MAX_CHARS: usize = 96;
+const APP_SERVER_MAX_LOG_LINES: usize = 2_000;
+const APP_SERVER_MAX_TERMINAL_SESSIONS: usize = 256;
+const APP_SERVER_RPC_TIMEOUT_MS: u64 = 5_000;
+const APP_SERVER_TURN_RPC_TIMEOUT_MS: u64 = 30_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RuntimeStoreSource {
@@ -842,14 +894,22 @@ fn decode_report_cursor(raw: &str) -> Result<ReportCursor> {
     })
 }
 
+fn fallback_tool_runtime() -> &'static tokio::runtime::Runtime {
+    static FALLBACK_RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
+    FALLBACK_RUNTIME.get_or_init(|| {
+        tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .worker_threads(2)
+            .build()
+            .expect("fallback tool runtime should initialize")
+    })
+}
+
 fn block_on_result<T>(future: impl Future<Output = Result<T>>) -> Result<T> {
     if let Ok(handle) = tokio::runtime::Handle::try_current() {
         return tokio::task::block_in_place(|| handle.block_on(future));
     }
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()?;
-    rt.block_on(future)
+    fallback_tool_runtime().block_on(future)
 }
 
 fn resolve_start_command_and_args(args: &Value) -> Result<(String, Vec<String>)> {
@@ -897,8 +957,17 @@ fn validate_delivery_submit_preflight(args: &Value) -> Result<()> {
     }
 
     let runner_mode = RuntimeRunnerMode::parse(args.get("runner_mode").and_then(Value::as_str))?;
-    if runner_mode != RuntimeRunnerMode::Tmux {
-        anyhow::bail!("invalid delivery_submit: steer_required=true requires runner_mode=tmux");
+    if !matches!(
+        runner_mode,
+        RuntimeRunnerMode::Tmux | RuntimeRunnerMode::AppServer
+    ) {
+        anyhow::bail!(
+            "invalid delivery_submit: steer_required=true requires runner_mode=tmux or runner_mode=app_server"
+        );
+    }
+
+    if runner_mode == RuntimeRunnerMode::AppServer {
+        return Ok(());
     }
 
     let interactive_command = optional_bool(args, "interactive_command", false)?;
@@ -923,10 +992,676 @@ fn validate_delivery_submit_preflight(args: &Value) -> Result<()> {
     Ok(())
 }
 
+fn app_server_sessions() -> &'static Mutex<HashMap<String, Arc<AppServerSession>>> {
+    APP_SERVER_SESSIONS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn unique_app_server_session_id(sequence: u64) -> String {
+    let ts_nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    let pid = std::process::id();
+    format!("app-server-{pid}-{ts_nanos}-{sequence}")
+}
+
+fn get_app_server_session(session_id: &str) -> Result<Arc<AppServerSession>> {
+    let sessions = app_server_sessions()
+        .lock()
+        .map_err(|_| anyhow::anyhow!("app_server session registry lock poisoned"))?;
+    sessions
+        .get(session_id)
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("session not found: {session_id}"))
+}
+
+async fn append_app_server_log_line(logs: &Arc<AsyncMutex<VecDeque<String>>>, line: String) {
+    let mut guard = logs.lock().await;
+    guard.push_back(line);
+    while guard.len() > APP_SERVER_MAX_LOG_LINES {
+        guard.pop_front();
+    }
+}
+
+fn cleanup_terminal_app_server_sessions() -> Result<()> {
+    let mut sessions = app_server_sessions()
+        .lock()
+        .map_err(|_| anyhow::anyhow!("app_server session registry lock poisoned"))?;
+    let terminal_count = sessions
+        .values()
+        .filter(|session| session.terminal.load(Ordering::Relaxed))
+        .count();
+    if terminal_count <= APP_SERVER_MAX_TERMINAL_SESSIONS {
+        return Ok(());
+    }
+
+    let mut terminal_ids: Vec<(u64, String)> = sessions
+        .iter()
+        .filter(|(_, session)| session.terminal.load(Ordering::Relaxed))
+        .map(|(session_id, session)| (session.sequence, session_id.clone()))
+        .collect();
+    terminal_ids.sort_by_key(|(sequence, _)| *sequence);
+
+    for (_, session_id) in terminal_ids
+        .into_iter()
+        .take(terminal_count.saturating_sub(APP_SERVER_MAX_TERMINAL_SESSIONS))
+    {
+        sessions.remove(&session_id);
+    }
+
+    Ok(())
+}
+
+async fn app_server_mark_terminal(
+    session: &Arc<AppServerSession>,
+    terminal_state: AppServerSessionState,
+) -> Result<()> {
+    let (child, pending) = {
+        let mut inner = session.inner.lock().await;
+        inner.state = terminal_state;
+        inner.pending_terminal_state = None;
+        inner.active_turn_id = None;
+        (inner.child.take(), std::mem::take(&mut inner.pending))
+    };
+    {
+        let mut writer = session.writer.lock().await;
+        *writer = None;
+    }
+
+    for (_, sender) in pending {
+        let _ = sender.send(json!({
+            "error": {
+                "message": format!("app_server session transitioned to {}", terminal_state.as_str())
+            }
+        }));
+    }
+
+    if let Some(mut child) = child {
+        let _ = child.start_kill();
+        let _ = child.wait().await;
+    }
+
+    session.terminal.store(true, Ordering::Relaxed);
+    cleanup_terminal_app_server_sessions()?;
+    Ok(())
+}
+
+async fn app_server_refresh_state(
+    session: &Arc<AppServerSession>,
+) -> Result<AppServerSessionState> {
+    let mut inner = session.inner.lock().await;
+    let mut transitioned_terminal = false;
+    if inner.state == AppServerSessionState::Running {
+        if let Some(child) = inner.child.as_mut() {
+            if let Some(status) = child.try_wait()? {
+                inner.state = if status.success() {
+                    AppServerSessionState::Completed
+                } else {
+                    AppServerSessionState::Failed
+                };
+                inner.child = None;
+                transitioned_terminal = true;
+            }
+        } else {
+            inner.state = AppServerSessionState::Failed;
+            transitioned_terminal = true;
+        }
+    }
+    let state = inner.state;
+    drop(inner);
+
+    if transitioned_terminal {
+        app_server_mark_terminal(session, state).await?;
+    } else if state.is_terminal() {
+        {
+            let mut writer = session.writer.lock().await;
+            *writer = None;
+        }
+        session.terminal.store(true, Ordering::Relaxed);
+        cleanup_terminal_app_server_sessions()?;
+    }
+
+    Ok(state)
+}
+
+fn extract_jsonrpc_id(value: &Value) -> Option<u64> {
+    value
+        .get("id")
+        .and_then(Value::as_u64)
+        .or_else(|| value.get("id").and_then(Value::as_str)?.parse::<u64>().ok())
+}
+
+fn app_server_rpc_timeout_ms(method: &str) -> u64 {
+    let parse_env_timeout = |name: &str, default_value: u64| -> u64 {
+        std::env::var(name)
+            .ok()
+            .and_then(|value| value.trim().parse::<u64>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(default_value)
+    };
+
+    if method.starts_with("turn/") {
+        parse_env_timeout(
+            "AGENTRAIL_APP_SERVER_TURN_RPC_TIMEOUT_MS",
+            APP_SERVER_TURN_RPC_TIMEOUT_MS,
+        )
+    } else {
+        parse_env_timeout(
+            "AGENTRAIL_APP_SERVER_RPC_TIMEOUT_MS",
+            APP_SERVER_RPC_TIMEOUT_MS,
+        )
+    }
+}
+
+fn extract_thread_id(result: &Value) -> Option<String> {
+    result
+        .get("thread")
+        .and_then(Value::as_object)
+        .and_then(|thread| thread.get("id"))
+        .and_then(Value::as_str)
+        .map(ToString::to_string)
+        .or_else(|| {
+            result
+                .get("threadId")
+                .and_then(Value::as_str)
+                .map(ToString::to_string)
+        })
+}
+
+fn extract_turn_id(value: &Value) -> Option<String> {
+    value
+        .get("turn")
+        .and_then(Value::as_object)
+        .and_then(|turn| turn.get("id"))
+        .and_then(Value::as_str)
+        .map(ToString::to_string)
+        .or_else(|| {
+            value
+                .get("turnId")
+                .and_then(Value::as_str)
+                .map(ToString::to_string)
+        })
+        .or_else(|| {
+            value
+                .get("id")
+                .and_then(Value::as_str)
+                .map(ToString::to_string)
+        })
+}
+
+fn terminal_state_from_turn_completion(notification: &Value) -> AppServerSessionState {
+    let status = notification
+        .get("params")
+        .and_then(|params| params.get("turn"))
+        .and_then(|turn| turn.get("status"))
+        .and_then(Value::as_str)
+        .unwrap_or("completed")
+        .to_ascii_lowercase();
+    match status.as_str() {
+        "completed" => AppServerSessionState::Completed,
+        "interrupted" => AppServerSessionState::Stopped,
+        "failed" | "error" => AppServerSessionState::Failed,
+        _ => AppServerSessionState::Completed,
+    }
+}
+
+fn app_server_turn_start_params(thread_id: &str, instruction: &str) -> Value {
+    json!({
+        "threadId": thread_id,
+        "input": [
+            {
+                "type": "text",
+                "text": instruction
+            }
+        ]
+    })
+}
+
+fn app_server_turn_steer_params(thread_id: &str, turn_id: &str, instruction: &str) -> Value {
+    json!({
+        "threadId": thread_id,
+        "expectedTurnId": turn_id,
+        "input": [
+            {
+                "type": "text",
+                "text": instruction
+            }
+        ]
+    })
+}
+
+async fn app_server_rpc_notify(
+    session: &Arc<AppServerSession>,
+    method: &str,
+    params: Value,
+) -> Result<()> {
+    {
+        let inner = session.inner.lock().await;
+        if inner.state != AppServerSessionState::Running {
+            anyhow::bail!("app_server session is not running");
+        }
+    }
+
+    let mut writer = session.writer.lock().await;
+    let Some(stdin) = writer.as_mut() else {
+        anyhow::bail!("app_server stdin is unavailable");
+    };
+    let request = json!({
+        "method": method,
+        "params": params
+    });
+    let payload = serde_json::to_string(&request)?;
+    stdin.write_all(payload.as_bytes()).await?;
+    stdin.write_all(b"\n").await?;
+    stdin.flush().await?;
+    Ok(())
+}
+
+async fn app_server_reply_server_request_error(
+    session: &Arc<AppServerSession>,
+    id: u64,
+    method: &str,
+) -> Result<()> {
+    let mut writer = session.writer.lock().await;
+    let Some(stdin) = writer.as_mut() else {
+        return Ok(());
+    };
+    let response = json!({
+        "id": id,
+        "error": {
+            "code": -32601,
+            "message": format!("unsupported app_server server request method: {method}")
+        }
+    });
+    let payload = serde_json::to_string(&response)?;
+    stdin.write_all(payload.as_bytes()).await?;
+    stdin.write_all(b"\n").await?;
+    stdin.flush().await?;
+    Ok(())
+}
+
+async fn app_server_handle_json_line(session: &Arc<AppServerSession>, line: &str) {
+    let parsed: Value = match serde_json::from_str(line) {
+        Ok(value) => value,
+        Err(error) => {
+            append_app_server_log_line(
+                &session.logs,
+                format!("[app_server_adapter] invalid json line: {error}"),
+            )
+            .await;
+            return;
+        }
+    };
+
+    if let Some(id) = extract_jsonrpc_id(&parsed) {
+        let request_method = parsed
+            .get("method")
+            .and_then(Value::as_str)
+            .map(ToString::to_string);
+        let (sender, deferred_terminal_state) = {
+            let mut inner = session.inner.lock().await;
+            let sender = inner.pending.remove(&id);
+            if let Some(turn_id) = parsed
+                .get("result")
+                .and_then(extract_turn_id)
+                .or_else(|| parsed.get("params").and_then(extract_turn_id))
+            {
+                inner.active_turn_id = Some(turn_id);
+            }
+            let deferred_terminal_state = if inner.pending.is_empty() {
+                inner.pending_terminal_state.take()
+            } else {
+                None
+            };
+            (sender, deferred_terminal_state)
+        };
+        if let Some(sender) = sender {
+            let _ = sender.send(parsed);
+        } else if let Some(method) = request_method.as_deref() {
+            let _ = app_server_reply_server_request_error(session, id, method).await;
+        }
+        if let Some(terminal_state) = deferred_terminal_state {
+            let _ = app_server_mark_terminal(session, terminal_state).await;
+        }
+        return;
+    }
+
+    let Some(method) = parsed.get("method").and_then(Value::as_str) else {
+        return;
+    };
+
+    match method {
+        "turn/started" => {
+            if let Some(turn_id) = parsed.get("params").and_then(extract_turn_id) {
+                let mut inner = session.inner.lock().await;
+                inner.active_turn_id = Some(turn_id);
+            }
+        }
+        "turn/completed" | "turn/failed" | "turn/error" => {
+            let terminal_state = if method == "turn/completed" {
+                terminal_state_from_turn_completion(&parsed)
+            } else {
+                AppServerSessionState::Failed
+            };
+            let should_finalize_now = {
+                let mut inner = session.inner.lock().await;
+                if let Some(turn_id) = parsed.get("params").and_then(extract_turn_id) {
+                    inner.active_turn_id = Some(turn_id);
+                }
+                if inner.pending.is_empty() {
+                    true
+                } else {
+                    inner.pending_terminal_state = Some(terminal_state);
+                    false
+                }
+            };
+            if should_finalize_now {
+                let _ = app_server_mark_terminal(session, terminal_state).await;
+            }
+        }
+        _ => {}
+    }
+}
+
+fn spawn_app_server_reader<R>(session: Arc<AppServerSession>, reader: R, parse_jsonrpc: bool)
+where
+    R: AsyncRead + Unpin + Send + 'static,
+{
+    tokio::spawn(async move {
+        let mut lines = BufReader::new(reader).lines();
+        loop {
+            match lines.next_line().await {
+                Ok(Some(line)) => {
+                    append_app_server_log_line(&session.logs, line.clone()).await;
+                    if parse_jsonrpc {
+                        app_server_handle_json_line(&session, &line).await;
+                    }
+                }
+                Ok(None) => break,
+                Err(error) => {
+                    append_app_server_log_line(
+                        &session.logs,
+                        format!("[app_server_adapter] stream read error: {error}"),
+                    )
+                    .await;
+                    break;
+                }
+            }
+        }
+    });
+}
+
+async fn app_server_rpc_request(
+    session: &Arc<AppServerSession>,
+    method: &str,
+    params: Value,
+) -> Result<Value> {
+    let (request_id, rx) = {
+        let mut inner = session.inner.lock().await;
+        if inner.state != AppServerSessionState::Running {
+            anyhow::bail!("app_server session is not running");
+        }
+        let request_id = inner.next_request_id;
+        inner.next_request_id = inner.next_request_id.saturating_add(1);
+        let (tx, rx) = oneshot::channel();
+        inner.pending.insert(request_id, tx);
+        (request_id, rx)
+    };
+
+    let request = json!({
+        "id": request_id,
+        "method": method,
+        "params": params
+    });
+    let payload = serde_json::to_string(&request)?;
+    {
+        let mut writer = session.writer.lock().await;
+        let Some(stdin) = writer.as_mut() else {
+            let mut inner = session.inner.lock().await;
+            inner.pending.remove(&request_id);
+            anyhow::bail!("app_server stdin is unavailable");
+        };
+        if let Err(error) = stdin.write_all(payload.as_bytes()).await {
+            let mut inner = session.inner.lock().await;
+            inner.pending.remove(&request_id);
+            return Err(error.into());
+        }
+        if let Err(error) = stdin.write_all(b"\n").await {
+            let mut inner = session.inner.lock().await;
+            inner.pending.remove(&request_id);
+            return Err(error.into());
+        }
+        if let Err(error) = stdin.flush().await {
+            let mut inner = session.inner.lock().await;
+            inner.pending.remove(&request_id);
+            return Err(error.into());
+        }
+    }
+
+    let timeout_ms = app_server_rpc_timeout_ms(method);
+    let response = match tokio::time::timeout(Duration::from_millis(timeout_ms), rx).await {
+        Ok(Ok(response)) => response,
+        Ok(Err(_)) => {
+            anyhow::bail!("app_server request {method} failed: session closed before response")
+        }
+        Err(_) => {
+            let mut inner = session.inner.lock().await;
+            inner.pending.remove(&request_id);
+            anyhow::bail!("app_server request {method} timed out")
+        }
+    };
+
+    if let Some(error) = response.get("error") {
+        anyhow::bail!("app_server request {method} returned error: {error}");
+    }
+
+    Ok(response.get("result").cloned().unwrap_or(Value::Null))
+}
+
+async fn app_server_start(spec: TaskSpec) -> Result<TaskHandle> {
+    fs::create_dir_all(&spec.workdir)?;
+    let mut command = Command::new(&spec.command);
+    command
+        .args(&spec.args)
+        .current_dir(&spec.workdir)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    let mut child = command.spawn()?;
+    let stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("app_server process stdin unavailable"))?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("app_server process stdout unavailable"))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("app_server process stderr unavailable"))?;
+
+    let sequence = APP_SERVER_SESSION_SEQ.fetch_add(1, Ordering::Relaxed);
+    let session_id = unique_app_server_session_id(sequence);
+    let session = Arc::new(AppServerSession {
+        task_id: spec.id.clone(),
+        logs: Arc::new(AsyncMutex::new(VecDeque::new())),
+        inner: AsyncMutex::new(AppServerSessionInner {
+            state: AppServerSessionState::Running,
+            child: Some(child),
+            next_request_id: 1,
+            pending: HashMap::new(),
+            thread_id: None,
+            active_turn_id: None,
+            pending_terminal_state: None,
+        }),
+        writer: AsyncMutex::new(Some(stdin)),
+        sequence,
+        terminal: AtomicBool::new(false),
+    });
+
+    {
+        let mut sessions = app_server_sessions()
+            .lock()
+            .map_err(|_| anyhow::anyhow!("app_server session registry lock poisoned"))?;
+        sessions.insert(session_id.clone(), Arc::clone(&session));
+    }
+
+    spawn_app_server_reader(Arc::clone(&session), stdout, true);
+    spawn_app_server_reader(Arc::clone(&session), stderr, false);
+
+    if let Err(error) = async {
+        let _ = app_server_rpc_request(
+            &session,
+            "initialize",
+            json!({
+                "clientInfo": {
+                    "name": "agentrail-mcp",
+                    "version": "0.1.0"
+                }
+            }),
+        )
+        .await?;
+        app_server_rpc_notify(&session, "initialized", json!({})).await?;
+
+        let thread = app_server_rpc_request(
+            &session,
+            "thread/start",
+            json!({
+                "cwd": spec.workdir
+            }),
+        )
+        .await?;
+        let thread_id = extract_thread_id(&thread)
+            .ok_or_else(|| anyhow::anyhow!("app_server thread/start response missing thread id"))?;
+        {
+            let mut inner = session.inner.lock().await;
+            inner.thread_id = Some(thread_id.clone());
+        }
+
+        let startup_instruction = format!("start task {}", spec.id);
+        let turn = app_server_rpc_request(
+            &session,
+            "turn/start",
+            app_server_turn_start_params(&thread_id, &startup_instruction),
+        )
+        .await?;
+        let turn_id = extract_turn_id(&turn)
+            .ok_or_else(|| anyhow::anyhow!("app_server turn/start response missing turn id"))?;
+        {
+            let mut inner = session.inner.lock().await;
+            inner.active_turn_id = Some(turn_id);
+        }
+
+        Result::<()>::Ok(())
+    }
+    .await
+    {
+        {
+            let mut sessions = app_server_sessions()
+                .lock()
+                .map_err(|_| anyhow::anyhow!("app_server session registry lock poisoned"))?;
+            sessions.remove(&session_id);
+        }
+        let _ = app_server_mark_terminal(&session, AppServerSessionState::Failed).await;
+        return Err(error);
+    }
+
+    Ok(TaskHandle {
+        id: spec.id,
+        session_id,
+    })
+}
+
+async fn app_server_status(session_id: &str) -> Result<TaskStatus> {
+    let session = get_app_server_session(session_id)?;
+    let state = app_server_refresh_state(&session).await?;
+    Ok(TaskStatus {
+        id: session.task_id.clone(),
+        state: state.as_str().to_string(),
+    })
+}
+
+async fn app_server_steer(session_id: &str, instruction: &str) -> Result<()> {
+    let session = get_app_server_session(session_id)?;
+    let state = app_server_refresh_state(&session).await?;
+    if state != AppServerSessionState::Running {
+        anyhow::bail!("session is not running: {session_id}");
+    }
+
+    let (thread_id, turn_id) = {
+        let inner = session.inner.lock().await;
+        let thread_id = inner.thread_id.clone().ok_or_else(|| {
+            anyhow::anyhow!("app_server thread id missing for session {session_id}")
+        })?;
+        let turn_id = inner.active_turn_id.clone().ok_or_else(|| {
+            anyhow::anyhow!("app_server active turn id missing for session {session_id}")
+        })?;
+        (thread_id, turn_id)
+    };
+    let turn = app_server_rpc_request(
+        &session,
+        "turn/steer",
+        app_server_turn_steer_params(&thread_id, &turn_id, instruction),
+    )
+    .await?;
+    if let Some(next_turn_id) = extract_turn_id(&turn) {
+        let mut inner = session.inner.lock().await;
+        inner.active_turn_id = Some(next_turn_id);
+    }
+    Ok(())
+}
+
+async fn app_server_logs(session_id: &str, tail: usize) -> Result<String> {
+    let session = get_app_server_session(session_id)?;
+    let _ = app_server_refresh_state(&session).await?;
+    let logs = session.logs.lock().await;
+    if tail == 0 || tail >= logs.len() {
+        return Ok(logs
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>()
+            .join("\n"));
+    }
+    Ok(logs
+        .iter()
+        .skip(logs.len().saturating_sub(tail))
+        .map(String::as_str)
+        .collect::<Vec<_>>()
+        .join("\n"))
+}
+
+async fn app_server_stop(session_id: &str) -> Result<()> {
+    let session = get_app_server_session(session_id)?;
+    let state = app_server_refresh_state(&session).await?;
+    if state.is_terminal() {
+        return Ok(());
+    }
+
+    let (thread_id, turn_id) = {
+        let inner = session.inner.lock().await;
+        (inner.thread_id.clone(), inner.active_turn_id.clone())
+    };
+    if let (Some(thread_id), Some(turn_id)) = (thread_id, turn_id) {
+        let _ = app_server_rpc_request(
+            &session,
+            "turn/interrupt",
+            json!({
+                "threadId": thread_id,
+                "turnId": turn_id
+            }),
+        )
+        .await;
+    }
+    app_server_mark_terminal(&session, AppServerSessionState::Stopped).await
+}
+
 async fn runner_start(mode: RuntimeRunnerMode, spec: TaskSpec) -> Result<TaskHandle> {
     match mode {
         RuntimeRunnerMode::Process => ProcessRunner.start(spec).await,
         RuntimeRunnerMode::Tmux => TmuxRunner.start(spec).await,
+        RuntimeRunnerMode::AppServer => app_server_start(spec).await,
     }
 }
 
@@ -934,6 +1669,7 @@ async fn runner_status(mode: RuntimeRunnerMode, session_id: &str) -> Result<Task
     match mode {
         RuntimeRunnerMode::Process => ProcessRunner.status(session_id).await,
         RuntimeRunnerMode::Tmux => TmuxRunner.status(session_id).await,
+        RuntimeRunnerMode::AppServer => app_server_status(session_id).await,
     }
 }
 
@@ -941,6 +1677,7 @@ async fn runner_steer(mode: RuntimeRunnerMode, session_id: &str, instruction: &s
     match mode {
         RuntimeRunnerMode::Process => ProcessRunner.steer(session_id, instruction).await,
         RuntimeRunnerMode::Tmux => TmuxRunner.steer(session_id, instruction).await,
+        RuntimeRunnerMode::AppServer => app_server_steer(session_id, instruction).await,
     }
 }
 
@@ -948,6 +1685,7 @@ async fn runner_logs(mode: RuntimeRunnerMode, session_id: &str, tail: usize) -> 
     match mode {
         RuntimeRunnerMode::Process => ProcessRunner.logs(session_id, tail).await,
         RuntimeRunnerMode::Tmux => TmuxRunner.logs(session_id, tail).await,
+        RuntimeRunnerMode::AppServer => app_server_logs(session_id, tail).await,
     }
 }
 
@@ -955,6 +1693,7 @@ async fn runner_stop(mode: RuntimeRunnerMode, session_id: &str) -> Result<()> {
     match mode {
         RuntimeRunnerMode::Process => ProcessRunner.stop(session_id).await,
         RuntimeRunnerMode::Tmux => TmuxRunner.stop(session_id).await,
+        RuntimeRunnerMode::AppServer => app_server_stop(session_id).await,
     }
 }
 
@@ -2945,7 +3684,7 @@ fn mcp_tools_descriptor() -> Value {
                     "task_id": {"type":"string"},
                     "scope_id": {"type":"string"},
                     "worker_id": {"type":"string"},
-                    "runner_mode": {"type":"string", "enum": ["process", "tmux"]},
+                    "runner_mode": {"type":"string", "enum": ["process", "tmux", "app_server"]},
                     "command": {"type":"string"},
                     "args": {
                         "type":"array",
@@ -2991,7 +3730,7 @@ fn mcp_tools_descriptor() -> Value {
                     "task_id": {"type":"string"},
                     "scope_id": {"type":"string"},
                     "worker_id": {"type":"string"},
-                    "runner_mode": {"type":"string", "enum": ["process", "tmux"]},
+                    "runner_mode": {"type":"string", "enum": ["process", "tmux", "app_server"]},
                     "steer_required": {"type":"boolean"},
                     "interactive_command": {"type":"boolean"},
                     "command": {"type":"string"},
