@@ -109,6 +109,11 @@ phases:
   - `interactive_command`: compatibility field retained for legacy clients (currently ignored by preflight).
   - `idempotency_key`: dedupe repeated submit intents.
 
+Idempotency behavior:
+- replay occurs only when both `(task_id, idempotency_key)` and request fingerprint match.
+- fingerprint currently binds `runner_mode`, command shape (`command` + `args`), `workdir`, and `app_server_request_policy`.
+- if key matches but fingerprint differs, tool returns deterministic error containing `idempotency_key_conflict`.
+
 Preflight behavior:
 - `steer_required=true` requires `runner_mode=app_server`.
 - `runner_mode=process` rejects `codex exec` and `codex-guarded-exec` command shapes (to avoid nondeterministic skill-intake loops), regardless of `steer_required`.

@@ -606,6 +606,268 @@ fn delivery_submit_retry_idempotency_key_deduplicates_duplicate_requests() {
 }
 
 #[test]
+fn delivery_submit_retry_idempotency_key_conflicts_on_command_shape_change() {
+    let tmp = tempdir().expect("tempdir");
+    let task_id = unique_task_id("task-retry-idempotency-command-conflict");
+
+    let _ = handle_tool_call(
+        "delivery_submit",
+        json!({
+            "task_id": task_id,
+            "worker_id": "worker-a",
+            "runner_mode": "process",
+            "retry_budget": 3,
+            "command": "bash",
+            "args": ["-lc", "sleep 5"],
+            "workdir": tmp.path().display().to_string()
+        }),
+    )
+    .expect("initial submit should succeed");
+    let _ = wait_for_runtime_state(&task_id, "running");
+
+    let _ = handle_tool_call(
+        "delivery_stop",
+        json!({
+            "task_id": task_id,
+            "reason": "enter-retryable"
+        }),
+    )
+    .expect("stop should succeed");
+    let _ = wait_for_runtime_state(&task_id, "failed_retryable");
+
+    let _first_retry = handle_tool_call(
+        "delivery_submit",
+        json!({
+            "task_id": task_id,
+            "worker_id": "worker-a",
+            "runner_mode": "process",
+            "idempotency_key": "retry-key-command-conflict",
+            "command": "bash",
+            "args": ["-lc", "sleep 5"],
+            "workdir": tmp.path().display().to_string()
+        }),
+    )
+    .expect("first retry submit should succeed");
+
+    let err = handle_tool_call(
+        "delivery_submit",
+        json!({
+            "task_id": task_id,
+            "worker_id": "worker-a",
+            "runner_mode": "process",
+            "idempotency_key": "retry-key-command-conflict",
+            "command": "bash",
+            "args": ["-lc", "sleep 6"],
+            "workdir": tmp.path().display().to_string()
+        }),
+    )
+    .expect_err("idempotency key reuse with changed command shape should fail deterministically");
+
+    assert!(
+        err.to_string().contains("idempotency_key_conflict"),
+        "expected idempotency_key_conflict error, got: {err}"
+    );
+}
+
+#[test]
+fn delivery_submit_retry_idempotency_key_conflicts_on_runner_mode_change() {
+    let tmp = tempdir().expect("tempdir");
+    let task_id = unique_task_id("task-retry-idempotency-runner-mode-conflict");
+
+    let _ = handle_tool_call(
+        "delivery_submit",
+        json!({
+            "task_id": task_id,
+            "worker_id": "worker-a",
+            "runner_mode": "process",
+            "retry_budget": 3,
+            "command": "bash",
+            "args": ["-lc", "sleep 5"],
+            "workdir": tmp.path().display().to_string()
+        }),
+    )
+    .expect("initial submit should succeed");
+    let _ = wait_for_runtime_state(&task_id, "running");
+
+    let _ = handle_tool_call(
+        "delivery_stop",
+        json!({
+            "task_id": task_id,
+            "reason": "enter-retryable"
+        }),
+    )
+    .expect("stop should succeed");
+    let _ = wait_for_runtime_state(&task_id, "failed_retryable");
+
+    let _first_retry = handle_tool_call(
+        "delivery_submit",
+        json!({
+            "task_id": task_id,
+            "worker_id": "worker-a",
+            "runner_mode": "process",
+            "idempotency_key": "retry-key-runner-mode-conflict",
+            "command": "bash",
+            "args": ["-lc", "sleep 5"],
+            "workdir": tmp.path().display().to_string()
+        }),
+    )
+    .expect("first retry submit should succeed");
+
+    let err = handle_tool_call(
+        "delivery_submit",
+        json!({
+            "task_id": task_id,
+            "worker_id": "worker-a",
+            "runner_mode": "app_server",
+            "idempotency_key": "retry-key-runner-mode-conflict",
+            "command": "bash",
+            "args": ["-lc", "sleep 5"],
+            "workdir": tmp.path().display().to_string()
+        }),
+    )
+    .expect_err("idempotency key reuse with changed runner_mode should fail deterministically");
+
+    assert!(
+        err.to_string().contains("idempotency_key_conflict"),
+        "expected idempotency_key_conflict error, got: {err}"
+    );
+}
+
+#[test]
+fn delivery_submit_retry_idempotency_key_conflicts_on_workdir_change() {
+    let tmp = tempdir().expect("tempdir");
+    let tmp_alt = tempdir().expect("tempdir alt");
+    let task_id = unique_task_id("task-retry-idempotency-workdir-conflict");
+
+    let _ = handle_tool_call(
+        "delivery_submit",
+        json!({
+            "task_id": task_id,
+            "worker_id": "worker-a",
+            "runner_mode": "process",
+            "retry_budget": 3,
+            "command": "bash",
+            "args": ["-lc", "sleep 5"],
+            "workdir": tmp.path().display().to_string()
+        }),
+    )
+    .expect("initial submit should succeed");
+    let _ = wait_for_runtime_state(&task_id, "running");
+
+    let _ = handle_tool_call(
+        "delivery_stop",
+        json!({
+            "task_id": task_id,
+            "reason": "enter-retryable"
+        }),
+    )
+    .expect("stop should succeed");
+    let _ = wait_for_runtime_state(&task_id, "failed_retryable");
+
+    let _first_retry = handle_tool_call(
+        "delivery_submit",
+        json!({
+            "task_id": task_id,
+            "worker_id": "worker-a",
+            "runner_mode": "process",
+            "idempotency_key": "retry-key-workdir-conflict",
+            "command": "bash",
+            "args": ["-lc", "sleep 5"],
+            "workdir": tmp.path().display().to_string()
+        }),
+    )
+    .expect("first retry submit should succeed");
+
+    let err = handle_tool_call(
+        "delivery_submit",
+        json!({
+            "task_id": task_id,
+            "worker_id": "worker-a",
+            "runner_mode": "process",
+            "idempotency_key": "retry-key-workdir-conflict",
+            "command": "bash",
+            "args": ["-lc", "sleep 5"],
+            "workdir": tmp_alt.path().display().to_string()
+        }),
+    )
+    .expect_err("idempotency key reuse with changed workdir should fail deterministically");
+
+    assert!(
+        err.to_string().contains("idempotency_key_conflict"),
+        "expected idempotency_key_conflict error, got: {err}"
+    );
+}
+
+#[test]
+fn delivery_submit_retry_idempotency_key_conflicts_on_app_server_policy_change() {
+    let tmp = tempdir().expect("tempdir");
+    let task_id = unique_task_id("task-retry-idempotency-policy-conflict");
+    let (script_path, _request_log_path) =
+        write_fake_app_server_script(tmp.path(), "fake-app-server-idempotency-policy.sh", None);
+
+    let _ = handle_tool_call(
+        "delivery_submit",
+        json!({
+            "task_id": task_id,
+            "worker_id": "worker-a",
+            "runner_mode": "app_server",
+            "retry_budget": 3,
+            "app_server_request_policy": "allow_safe_subset",
+            "command": script_path.display().to_string(),
+            "args": [],
+            "workdir": tmp.path().display().to_string()
+        }),
+    )
+    .expect("initial submit should succeed");
+    let _ = wait_for_runtime_state(&task_id, "running");
+
+    let _ = handle_tool_call(
+        "delivery_stop",
+        json!({
+            "task_id": task_id,
+            "reason": "enter-retryable"
+        }),
+    )
+    .expect("stop should succeed");
+    let _ = wait_for_runtime_state(&task_id, "failed_retryable");
+
+    let _first_retry = handle_tool_call(
+        "delivery_submit",
+        json!({
+            "task_id": task_id,
+            "worker_id": "worker-a",
+            "runner_mode": "app_server",
+            "idempotency_key": "retry-key-policy-conflict",
+            "app_server_request_policy": "allow_safe_subset",
+            "command": script_path.display().to_string(),
+            "args": [],
+            "workdir": tmp.path().display().to_string()
+        }),
+    )
+    .expect("first retry submit should succeed");
+
+    let err = handle_tool_call(
+        "delivery_submit",
+        json!({
+            "task_id": task_id,
+            "worker_id": "worker-a",
+            "runner_mode": "app_server",
+            "idempotency_key": "retry-key-policy-conflict",
+            "app_server_request_policy": "delegate_fail_open",
+            "command": script_path.display().to_string(),
+            "args": [],
+            "workdir": tmp.path().display().to_string()
+        }),
+    )
+    .expect_err("idempotency key reuse with changed app_server_request_policy should fail");
+
+    assert!(
+        err.to_string().contains("idempotency_key_conflict"),
+        "expected idempotency_key_conflict error, got: {err}"
+    );
+}
+
+#[test]
 fn delivery_retry_events_include_old_and_new_attempt_numbers() {
     let tmp = tempdir().expect("tempdir");
     let task_id = unique_task_id("task-retry-attempt-audit");
