@@ -203,6 +203,12 @@ struct DeliverySubscription {
     task_id: Option<String>,
 }
 
+#[derive(Debug, Clone)]
+struct RetryIdempotencyReplay {
+    request_fingerprint: String,
+    response: Value,
+}
+
 #[derive(Debug)]
 struct RuntimeState {
     store: TaskStore,
@@ -215,7 +221,7 @@ struct RuntimeState {
     last_status_observation_by_task: HashMap<String, DeliveryStatusObservation>,
     last_steer_observation_by_task: HashMap<String, DeliverySteerObservation>,
     output_freshness_by_task: HashMap<String, OutputFreshnessObservation>,
-    retry_idempotency_replays: HashMap<String, Value>,
+    retry_idempotency_replays: HashMap<String, RetryIdempotencyReplay>,
 }
 
 #[derive(Debug, Clone)]
@@ -510,7 +516,27 @@ fn retry_idempotency_cache_key(task_id: &str, idempotency_key: &str) -> String {
     format!("{task_id}\u{001f}{idempotency_key}")
 }
 
-fn lookup_retry_idempotency_replay(task_id: &str, idempotency_key: &str) -> Result<Option<Value>> {
+fn retry_idempotency_request_fingerprint(
+    runner_mode: RuntimeRunnerMode,
+    command: &str,
+    command_args: &[String],
+    workdir: &str,
+    app_server_request_policy: AppServerServerRequestPolicy,
+) -> String {
+    json!({
+        "runner_mode": runner_mode.as_str(),
+        "command": command,
+        "args": command_args,
+        "workdir": workdir,
+        "app_server_request_policy": app_server_request_policy.as_str()
+    })
+    .to_string()
+}
+
+fn lookup_retry_idempotency_replay(
+    task_id: &str,
+    idempotency_key: &str,
+) -> Result<Option<RetryIdempotencyReplay>> {
     let runtime = runtime_state_mutex()?;
     let key = retry_idempotency_cache_key(task_id, idempotency_key);
     Ok(runtime.retry_idempotency_replays.get(&key).cloned())
@@ -519,13 +545,18 @@ fn lookup_retry_idempotency_replay(task_id: &str, idempotency_key: &str) -> Resu
 fn store_retry_idempotency_replay(
     task_id: &str,
     idempotency_key: &str,
+    request_fingerprint: &str,
     replay: &Value,
 ) -> Result<()> {
     let mut runtime = runtime_state_mutex()?;
     let key = retry_idempotency_cache_key(task_id, idempotency_key);
-    runtime
-        .retry_idempotency_replays
-        .insert(key, replay.clone());
+    runtime.retry_idempotency_replays.insert(
+        key,
+        RetryIdempotencyReplay {
+            request_fingerprint: request_fingerprint.to_string(),
+            response: replay.clone(),
+        },
+    );
     Ok(())
 }
 
@@ -2515,13 +2546,27 @@ async fn orchestrate_start_runtime(args: Value) -> Result<Value> {
     let app_server_request_policy = app_server_request_policy_from_args(&args, runner_mode)?;
     let (command, command_args) = resolve_start_command_and_args(&args)?;
     let workdir = optional_string(&args, "workdir").unwrap_or_else(|| ".".to_string());
+    let request_fingerprint = retry_idempotency_request_fingerprint(
+        runner_mode,
+        &command,
+        &command_args,
+        &workdir,
+        app_server_request_policy,
+    );
 
     if let Some(idempotency_key) = idempotency_key.as_deref()
         && let Some(replay) = lookup_retry_idempotency_replay(&task_id, idempotency_key)?
     {
-        let mut replay = replay;
-        replay["idempotent_replay"] = json!(true);
-        return Ok(replay);
+        if replay.request_fingerprint != request_fingerprint {
+            anyhow::bail!(
+                "idempotency_key_conflict: task_id={} idempotency_key={} request_fingerprint_mismatch",
+                task_id,
+                idempotency_key
+            );
+        }
+        let mut replay_response = replay.response;
+        replay_response["idempotent_replay"] = json!(true);
+        return Ok(replay_response);
     }
 
     let retry_context = ensure_task_preparing(
@@ -2613,7 +2658,7 @@ async fn orchestrate_start_runtime(args: Value) -> Result<Value> {
     if retry_context.is_some()
         && let Some(idempotency_key) = idempotency_key.as_deref()
     {
-        store_retry_idempotency_replay(&task_id, idempotency_key, &response)?;
+        store_retry_idempotency_replay(&task_id, idempotency_key, &request_fingerprint, &response)?;
     }
 
     Ok(response)
