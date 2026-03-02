@@ -884,29 +884,17 @@ fn maybe_record_delivery_steer_progress(
             unchanged_poll_count,
         },
     );
-    if let Some(task) = runtime.store.get_task(task_id)?
-        && task.state == TaskRuntimeState::Running
-    {
-        let _ = runtime
-            .store
-            .transition(task_id, TaskRuntimeState::NeedsAttention);
-    }
-    let next_runtime_state = runtime
-        .store
-        .get_task(task_id)?
-        .map(|task| runtime_state_label(task.state).to_string())
-        .unwrap_or_else(|| runtime_state.to_string());
     emit_delivery_event(
         &mut runtime,
         task_id,
         "steer_stalled",
         state,
-        &next_runtime_state,
+        runtime_state,
         Some(session_id.to_string()),
         None,
         None,
     );
-    Ok(Some(next_runtime_state))
+    Ok(None)
 }
 
 fn runtime_state_from_label(label: &str) -> Result<TaskRuntimeState> {
@@ -2551,6 +2539,8 @@ async fn task_runtime_status(task_id: &str, tail: usize) -> Result<Value> {
                     "retry_budget": record.retry_budget,
                     "last_steer_sent_at": steer_observation.as_ref().map(|observation| observation.sent_at),
                     "last_steer_observed_at": steer_observation.as_ref().and_then(|observation| observation.observed_at),
+                    "last_steer_applied_at": steer_observation.as_ref().and_then(|observation| observation.execution_confirmed_at),
+                    "last_steer_stalled_at": steer_observation.as_ref().and_then(|observation| observation.stalled_at),
                     "last_steer_apply_hint": steer_observation.as_ref().map(|observation| observation.apply_hint.clone())
                 }));
             }
@@ -2615,6 +2605,8 @@ async fn task_runtime_status(task_id: &str, tail: usize) -> Result<Value> {
                     "retry_budget": latest.retry_budget,
                     "last_steer_sent_at": steer_observation.as_ref().map(|observation| observation.sent_at),
                     "last_steer_observed_at": steer_observation.as_ref().and_then(|observation| observation.observed_at),
+                    "last_steer_applied_at": steer_observation.as_ref().and_then(|observation| observation.execution_confirmed_at),
+                    "last_steer_stalled_at": steer_observation.as_ref().and_then(|observation| observation.stalled_at),
                     "last_steer_apply_hint": steer_observation.as_ref().map(|observation| observation.apply_hint.clone())
                 }));
             }
@@ -5171,6 +5163,7 @@ mod tests {
 
     #[test]
     fn maybe_record_delivery_steer_progress_marks_applied_when_logs_change() {
+        let _runtime_guard = begin_runtime_test();
         let task_id = unique_test_task_id("steer-progress-applied");
         {
             let runtime = runtime_state().lock().expect("runtime lock");
@@ -5226,6 +5219,7 @@ mod tests {
 
     #[test]
     fn maybe_record_delivery_steer_progress_marks_stalled_after_poll_threshold() {
+        let _runtime_guard = begin_runtime_test();
         let task_id = unique_test_task_id("steer-progress-stalled");
         {
             let runtime = runtime_state().lock().expect("runtime lock");
@@ -5267,10 +5261,9 @@ mod tests {
             )
             .expect("steer progress should be checked");
         }
-        assert_eq!(
-            updated_runtime_state.as_deref(),
-            Some("needs_attention"),
-            "expected stalled steer to move runtime state into needs_attention"
+        assert!(
+            updated_runtime_state.is_none(),
+            "stalled steer should not mutate runtime state directly"
         );
 
         let runtime = runtime_state().lock().expect("runtime lock");
@@ -5285,7 +5278,7 @@ mod tests {
             .get_task(&task_id)
             .expect("task read should succeed")
             .expect("task should exist");
-        assert_eq!(task.state, TaskRuntimeState::NeedsAttention);
+        assert_eq!(task.state, TaskRuntimeState::Running);
         assert_eq!(
             runtime
                 .delivery_events
@@ -5294,6 +5287,47 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn task_runtime_status_session_not_found_includes_new_steer_fields() {
+        let _runtime_guard = begin_runtime_test();
+        let task_id = unique_test_task_id("status-session-not-found-steer-fields");
+        {
+            let mut runtime = runtime_state().lock().expect("runtime lock");
+            runtime
+                .store
+                .upsert_task(&TaskRecord::new(task_id.clone(), "worker-a", 1))
+                .expect("seed task");
+            runtime
+                .store
+                .transition(&task_id, TaskRuntimeState::Preparing)
+                .expect("queued -> preparing");
+            runtime
+                .store
+                .transition(&task_id, TaskRuntimeState::Running)
+                .expect("preparing -> running");
+            runtime.sessions.insert(
+                task_id.clone(),
+                RuntimeTaskSession {
+                    session_id: "missing-process-session".to_string(),
+                    runner_mode: RuntimeRunnerMode::Process,
+                    attempt_number: 1,
+                    trace_id: "trace:status-missing-session".to_string(),
+                    span_id: "span:status-missing-session:1".to_string(),
+                    parent_span_id: None,
+                },
+            );
+        }
+
+        let status = task_runtime_status(&task_id, 20)
+            .await
+            .expect("status should handle missing session");
+        assert_eq!(status["state"], "unknown");
+        assert!(status.get("last_steer_applied_at").is_some());
+        assert!(status.get("last_steer_stalled_at").is_some());
+        assert!(status["last_steer_applied_at"].is_null());
+        assert!(status["last_steer_stalled_at"].is_null());
     }
 
     #[test]
