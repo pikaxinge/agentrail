@@ -106,7 +106,7 @@ phases:
   - `runner_mode`: `process` or `app_server`.
   - `app_server_request_policy` (app_server only): `deny_all` (default), `allow_safe_subset`, `delegate_fail_open` (disabled by default).
   - `steer_required`: when `true`, submission must satisfy steer preflight rules.
-  - `interactive_command`: compatibility field retained for legacy clients (currently ignored by preflight).
+  - `interactive_command`: deprecated compatibility field. Runtime ignores behavior, but when provided `delivery_submit` emits deterministic warning: `interactive_command is deprecated and ignored; use runner_mode=app_server + steer_required for steerable sessions`.
   - `idempotency_key`: dedupe repeated submit intents.
 
 Idempotency behavior:
