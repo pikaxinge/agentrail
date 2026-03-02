@@ -141,6 +141,7 @@ struct DeliverySteerObservation {
     sent_at: u64,
     observed_at: Option<u64>,
     apply_hint: String,
+    echo_probe: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -173,6 +174,7 @@ static RUNTIME_STATE: OnceLock<Mutex<RuntimeState>> = OnceLock::new();
 static DELIVERY_SUBSCRIBER_SEQ: AtomicU64 = AtomicU64::new(1);
 
 const DEFAULT_RUNTIME_STORE_DSN: &str = "sqlite://.agentrail/runtime.db";
+const STEER_ECHO_PROBE_MAX_CHARS: usize = 96;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RuntimeStoreSource {
@@ -314,6 +316,25 @@ fn delivery_timestamp_ms() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64
+}
+
+fn compact_whitespace(input: &str) -> String {
+    input.chars().filter(|ch| !ch.is_whitespace()).collect()
+}
+
+fn steer_echo_probe(instruction: &str) -> Option<String> {
+    let compact = compact_whitespace(instruction);
+    if compact.is_empty() {
+        return None;
+    }
+    Some(compact.chars().take(STEER_ECHO_PROBE_MAX_CHARS).collect())
+}
+
+fn steer_echo_observed(logs: &str, probe: &str) -> bool {
+    if probe.is_empty() {
+        return false;
+    }
+    compact_whitespace(logs).contains(probe)
 }
 
 fn next_subscriber_id() -> String {
@@ -472,8 +493,9 @@ fn emit_delivery_status_events(
     Ok(())
 }
 
-fn record_delivery_steer_sent(task_id: &str, session_id: &str) -> Result<u64> {
+fn record_delivery_steer_sent(task_id: &str, session_id: &str, instruction: &str) -> Result<u64> {
     let sent_at = delivery_timestamp_ms();
+    let echo_probe = steer_echo_probe(instruction);
     let mut runtime = runtime_state_mutex()?;
     let (state, runtime_state) = if let Some(task) = runtime.store.get_task(task_id)? {
         let state = runtime_state_label(task.state).to_string();
@@ -498,6 +520,7 @@ fn record_delivery_steer_sent(task_id: &str, session_id: &str) -> Result<u64> {
             sent_at,
             observed_at: None,
             apply_hint: "transport_sent".to_string(),
+            echo_probe,
         },
     );
 
@@ -509,12 +532,19 @@ fn maybe_record_delivery_steer_observed(
     session_id: &str,
     state: &str,
     runtime_state: &str,
+    logs: &str,
 ) -> Result<()> {
     let mut runtime = runtime_state_mutex()?;
     let Some(existing) = runtime.last_steer_observation_by_task.get(task_id).cloned() else {
         return Ok(());
     };
     if existing.observed_at.is_some() {
+        return Ok(());
+    }
+    let Some(echo_probe) = existing.echo_probe.as_deref() else {
+        return Ok(());
+    };
+    if !steer_echo_observed(logs, echo_probe) {
         return Ok(());
     }
 
@@ -524,7 +554,8 @@ fn maybe_record_delivery_steer_observed(
         DeliverySteerObservation {
             sent_at: existing.sent_at,
             observed_at: Some(observed_at),
-            apply_hint: "session_alive_after_steer".to_string(),
+            apply_hint: "instruction_echoed_in_logs".to_string(),
+            echo_probe: existing.echo_probe,
         },
     );
     emit_delivery_event(
@@ -1287,6 +1318,7 @@ async fn task_runtime_status(task_id: &str, tail: usize) -> Result<Value> {
         &session.session_id,
         &status.state,
         &runtime_state,
+        &logs,
     )?;
     emit_delivery_status_events(
         task_id,
@@ -1343,7 +1375,7 @@ async fn orchestrate_steer_runtime(args: Value) -> Result<Value> {
     };
 
     runner_steer(session.runner_mode, &session.session_id, &instruction).await?;
-    let steer_sent_at = record_delivery_steer_sent(&task_id, &session.session_id)?;
+    let steer_sent_at = record_delivery_steer_sent(&task_id, &session.session_id, &instruction)?;
 
     info!(
         operation = "mcp_tool_call",
@@ -3582,8 +3614,12 @@ mod tests {
                 .expect("preparing -> running");
         }
 
-        let sent_at =
-            record_delivery_steer_sent(&task_id, "tmux-session-1").expect("record steer sent");
+        let sent_at = record_delivery_steer_sent(
+            &task_id,
+            "tmux-session-1",
+            "Proceed now to RED artifact creation",
+        )
+        .expect("record steer sent");
 
         let runtime = runtime_state().lock().expect("runtime lock");
         let observation = runtime
@@ -3593,6 +3629,10 @@ mod tests {
         assert_eq!(observation.sent_at, sent_at);
         assert!(observation.observed_at.is_none());
         assert_eq!(observation.apply_hint, "transport_sent");
+        assert!(
+            observation.echo_probe.is_some(),
+            "echo probe should be captured from instruction"
+        );
         assert!(runtime.delivery_events.iter().any(|event| {
             event.task_id == task_id
                 && event.event_type == "steer_sent"
@@ -3619,11 +3659,33 @@ mod tests {
                 .expect("preparing -> running");
         }
 
-        let _ = record_delivery_steer_sent(&task_id, "tmux-session-2").expect("record steer sent");
-        maybe_record_delivery_steer_observed(&task_id, "tmux-session-2", "running", "running")
-            .expect("record steer observed");
-        maybe_record_delivery_steer_observed(&task_id, "tmux-session-2", "running", "running")
-            .expect("idempotent observed update");
+        let instruction = "Proceed now to RED artifact creation";
+        let _ = record_delivery_steer_sent(&task_id, "tmux-session-2", instruction)
+            .expect("record steer sent");
+        maybe_record_delivery_steer_observed(
+            &task_id,
+            "tmux-session-2",
+            "running",
+            "running",
+            "no matching logs yet",
+        )
+        .expect("non-matching logs should be ignored");
+        maybe_record_delivery_steer_observed(
+            &task_id,
+            "tmux-session-2",
+            "running",
+            "running",
+            "Proceed now to RED artifact creation",
+        )
+        .expect("record steer observed");
+        maybe_record_delivery_steer_observed(
+            &task_id,
+            "tmux-session-2",
+            "running",
+            "running",
+            "Proceed now to RED artifact creation",
+        )
+        .expect("idempotent observed update");
 
         let runtime = runtime_state().lock().expect("runtime lock");
         let observation = runtime
@@ -3631,7 +3693,7 @@ mod tests {
             .get(&task_id)
             .expect("steer observation should be present");
         assert!(observation.observed_at.is_some());
-        assert_eq!(observation.apply_hint, "session_alive_after_steer");
+        assert_eq!(observation.apply_hint, "instruction_echoed_in_logs");
         assert_eq!(
             runtime
                 .delivery_events
