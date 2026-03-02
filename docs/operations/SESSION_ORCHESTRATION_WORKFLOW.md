@@ -25,6 +25,8 @@ This runbook defines how a session-level orchestrator executes development tasks
     - `cargo check --workspace --all-targets --locked`
     - `cargo test --workspace --all-targets --locked`
 13. Push integration branch and open/update PR.
+    - For title/body updates, use `scripts/gh-pr-edit-safe.sh` to avoid `gh pr edit` GraphQL `projectCards` deprecation failures.
+    - Wrapper prerequisites: `gh` + `jq`, and a GitHub `remote.origin.url`; fallback only supports `--title`, `--body`, `--body-file`.
 14. Keep PR branch strict-up-to-date with `main` and resolve review comments.
 15. Merge only after branch protection requirements are satisfied.
 16. Post-merge cleanup:
