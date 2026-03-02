@@ -23,7 +23,19 @@ if ! command -v sccache >/dev/null 2>&1; then
 fi
 
 # Resume paused sccache processes (STAT contains T).
-paused_pids="$(ps -C sccache -o pid=,stat= 2>/dev/null | awk '$2 ~ /T/ {print $1}' | tr '\n' ' ')"
+# `ps -C` returns exit code 1 when no process matches; treat only that case as empty result.
+paused_probe_raw=""
+if paused_probe_raw="$(ps -C sccache -o pid=,stat= 2>/dev/null)"; then
+  :
+else
+  paused_probe_status=$?
+  if [[ "${paused_probe_status}" -ne 1 ]]; then
+    echo "[sccache-guard] ERROR: ps probe failed with status ${paused_probe_status}" >&2
+    exit 125
+  fi
+  paused_probe_raw=""
+fi
+paused_pids="$(printf '%s\n' "${paused_probe_raw}" | awk '$2 ~ /T/ {print $1}' | tr '\n' ' ')"
 if [[ -n "${paused_pids}" ]]; then
   echo "[sccache-guard] resuming paused sccache pids: ${paused_pids}"
   kill -CONT ${paused_pids} 2>/dev/null || true
