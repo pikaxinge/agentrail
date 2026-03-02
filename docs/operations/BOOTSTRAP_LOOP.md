@@ -16,17 +16,36 @@ This document defines the self-improving loop for session orchestration.
 - `break-glass`: a manual intervention allowed only to unblock delivery. Must generate a friction issue.
 
 ## Loop
-1. Receive task and acceptance criteria.
-2. Execute orchestration run using MCP tools first.
-3. Validate result (`fmt`, `check`, `test`, PR gates).
+1. Receive one issue and acceptance criteria.
+2. Run DoD triage on latest `main` before coding:
+   - inspect issue scope, relevant code paths, tests, and related recent changes.
+   - if defect is already clear from code/behavior evidence, proceed directly.
+   - if diagnosis is uncertain, run a minimal reproduction workflow.
+3. Execute orchestration run using MCP tools first.
+   - if defect is confirmed, run implementation -> test -> PR flow.
+   - if defect is not confirmed after triage/repro, search for existing fix evidence (PR/commit/code path), comment issue with evidence, close issue, and record decision.
+4. Validate result (`fmt`, `check`, `test`, PR gates).
    - run `scripts/revive-sccache.sh` before compile/test steps to avoid wrapper deadlocks.
-4. Run post-run reflection:
+5. Run post-run reflection:
    - what blocked smooth execution
    - which steps required break-glass actions
    - where MCP surface was missing or insufficient
-5. Open friction issues from reflection findings.
-6. Prioritize and implement friction issues through the same orchestration flow.
-7. Repeat until bootstrap thresholds are met.
+6. Open friction issues from reflection findings.
+7. Open functional-improvement issues when user-facing workflow or MCP usability can be smoother.
+8. Prioritize and implement friction issues through the same orchestration flow.
+9. Repeat until bootstrap thresholds are met.
+
+## Two-Step Review Contract (required)
+1. DoD review loop during execution:
+   - implement a small slice
+   - run required checks
+   - review against DoD
+   - fix and repeat until CI/review requirements are green
+2. Final agent self-review before close:
+   - verify code and behavior correctness
+   - review orchestration smoothness
+   - review MCP user clarity (tool discoverability, semantics, error clarity, docs clarity)
+   - produce friction/functional issues when needed and record them in retro/handoff
 
 ## Metrics
 - `non_mcp_actions`: count of non-MCP actions in one run. Target: `0`.
@@ -66,3 +85,19 @@ scripts/codex-guarded-exec.sh \
 Behavior:
 - If the worker fails to mutate the workspace before timeout, the guard exits with code `124`.
 - This creates a deterministic failure signal so orchestrator can stop/retry instead of waiting indefinitely.
+
+## Stall Detection & Evidence Chain
+For tmux-backed coding rounds, do not declare stall from a single signal.
+
+Required evidence set:
+- tmux target exists (session/window/pane reachable)
+- pane liveness (`pane_dead`)
+- current command (`pane_current_command`)
+- output freshness (pane output changes over time)
+- runner log artifacts (for example `.agentrail-tmux-logs` when configured)
+- latest `delivery_status` snapshot
+
+If stall is confirmed by combined evidence:
+1. `delivery_stop`
+2. re-submit with narrowed instruction
+3. record stall evidence in run summary and open friction issue when systemic
