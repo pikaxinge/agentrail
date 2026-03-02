@@ -284,8 +284,7 @@ static APP_SERVER_TASK_REQUEST_POLICIES: OnceLock<
 static APP_SERVER_SESSION_SEQ: AtomicU64 = AtomicU64::new(1);
 
 const DEFAULT_RUNTIME_STORE_DSN: &str = "sqlite://.agentrail/runtime.db";
-const DELIVERY_INTERACTIVE_COMMAND_DEPRECATION_WARNING: &str =
-    "interactive_command is deprecated and ignored; use runner_mode=app_server + steer_required for steerable sessions";
+const DELIVERY_INTERACTIVE_COMMAND_DEPRECATION_WARNING: &str = "interactive_command is deprecated and ignored; use runner_mode=app_server + steer_required for steerable sessions";
 const STEER_ECHO_PROBE_MAX_CHARS: usize = 96;
 const APP_SERVER_MAX_LOG_LINES: usize = 2_000;
 const APP_SERVER_MAX_TERMINAL_SESSIONS: usize = 256;
@@ -4951,8 +4950,7 @@ pub fn handle_tool_call_with_allowed_root(
                 "orchestration": orchestration
             });
             if interactive_command_present {
-                response["warnings"] =
-                    json!([DELIVERY_INTERACTIVE_COMMAND_DEPRECATION_WARNING]);
+                response["warnings"] = json!([DELIVERY_INTERACTIVE_COMMAND_DEPRECATION_WARNING]);
             }
             Ok(response)
         }
