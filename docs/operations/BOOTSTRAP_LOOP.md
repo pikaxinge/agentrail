@@ -74,6 +74,11 @@ To avoid autonomous no-action loops:
 
 `scripts/codex-guarded-exec.sh` is still useful for direct shell fallback flows (outside `delivery_submit`) when you need local fail-fast no-mutation guarding.
 
+For PR title/body updates in merge gate automation, use `scripts/gh-pr-edit-safe.sh` instead of raw `gh pr edit`.
+This wrapper preserves the default path and only falls back to REST PATCH when GitHub CLI returns the known
+`projectCards` deprecation GraphQL error.
+Prerequisites: `gh` and `jq` installed, and `remote.origin.url` points to a GitHub repository.
+
 Behavior of `codex-guarded-exec.sh`:
 - If the worker fails to mutate the workspace before timeout, the guard exits with code `124`.
 - This creates a deterministic failure signal so orchestrator can stop/retry instead of waiting indefinitely.
