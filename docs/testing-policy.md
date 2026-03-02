@@ -29,6 +29,8 @@ scripts/revive-sccache.sh
 ```
 
 If `sccache` is unavailable, continue with normal cargo execution.
+The guard resumes paused `sccache` processes, cleans orphan `sccache ... rustc`
+wrappers left by interrupted runs, and restarts the daemon when unresponsive.
 
 ## Minimum Verification Matrix
 

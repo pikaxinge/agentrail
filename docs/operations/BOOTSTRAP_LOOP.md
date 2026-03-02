@@ -25,7 +25,7 @@ This document defines the self-improving loop for session orchestration.
    - if defect is confirmed, run implementation -> test -> PR flow.
    - if defect is not confirmed after triage/repro, search for existing fix evidence (PR/commit/code path), comment issue with evidence, close issue, and record decision.
 4. Validate result (`fmt`, `check`, `test`, PR gates).
-   - run `scripts/revive-sccache.sh` before compile/test steps to avoid wrapper deadlocks.
+   - run `scripts/revive-sccache.sh` before compile/test steps to recover paused or orphaned wrapper processes.
 5. Run post-run reflection:
    - what blocked smooth execution
    - which steps required break-glass actions
