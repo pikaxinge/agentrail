@@ -79,14 +79,13 @@ Behavior of `codex-guarded-exec.sh`:
 - This creates a deterministic failure signal so orchestrator can stop/retry instead of waiting indefinitely.
 
 ## Stall Detection & Evidence Chain
-For tmux-backed coding rounds, do not declare stall from a single signal.
+For app_server-backed coding rounds, do not declare stall from a single signal.
 
 Required evidence set:
-- tmux target exists (session/window/pane reachable)
-- pane liveness (`pane_dead`)
-- current command (`pane_current_command`)
-- output freshness (pane output changes over time)
-- runner log artifacts (for example `.agentrail-tmux-logs` when configured)
+- delivery session exists and is reachable (`session_id` present)
+- runner state remains live (`running`) across polls
+- output freshness (log output changes over time)
+- app_server adapter log artifacts from `delivery_status`/`delivery_report`
 - latest `delivery_status` snapshot
 
 If stall is confirmed by combined evidence:

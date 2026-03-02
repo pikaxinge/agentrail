@@ -10,7 +10,7 @@ use tracing::{error, info};
 #[serde(rename_all = "snake_case")]
 pub enum RunnerMode {
     Process,
-    Tmux,
+    AppServer,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -337,7 +337,7 @@ mod tests {
                 id: "b".to_string(),
                 deps: vec!["a".to_string()],
                 priority: 10,
-                runner_mode: RunnerMode::Tmux,
+                runner_mode: RunnerMode::AppServer,
                 retry_budget: 3,
             },
             TaskNode {
@@ -373,7 +373,7 @@ mod tests {
                 id: "b".to_string(),
                 deps: vec!["a".to_string()],
                 priority: 10,
-                runner_mode: RunnerMode::Tmux,
+                runner_mode: RunnerMode::AppServer,
                 retry_budget: 3,
             },
         ];
@@ -401,7 +401,7 @@ mod tests {
                 id: "b".to_string(),
                 deps: vec!["a".to_string()],
                 priority: 10,
-                runner_mode: RunnerMode::Tmux,
+                runner_mode: RunnerMode::AppServer,
                 retry_budget: 3,
             },
         ];
@@ -550,8 +550,8 @@ mod tests {
         );
 
         assert_eq!(
-            serde_json::from_value::<RunnerMode>(json!("tmux")).unwrap(),
-            RunnerMode::Tmux
+            serde_json::from_value::<RunnerMode>(json!("app_server")).unwrap(),
+            RunnerMode::AppServer
         );
         assert_eq!(
             serde_json::from_value::<ExecutionState>(json!("failed_terminal")).unwrap(),
@@ -565,7 +565,7 @@ mod tests {
             id: "task-a".to_string(),
             deps: vec!["dep-1".to_string(), "dep-2".to_string()],
             priority: 9,
-            runner_mode: RunnerMode::Tmux,
+            runner_mode: RunnerMode::AppServer,
             retry_budget: 2,
         };
 
@@ -576,7 +576,7 @@ mod tests {
                 "id": "task-a",
                 "deps": ["dep-1", "dep-2"],
                 "priority": 9,
-                "runner_mode": "tmux",
+                "runner_mode": "app_server",
                 "retry_budget": 2
             })
         );
@@ -594,7 +594,7 @@ mod tests {
                     "id": "task-a",
                     "deps": ["dep-1", "dep-2"],
                     "priority": 9,
-                    "runner_mode": "tmux",
+                    "runner_mode": "app_server",
                     "retry_budget": 2
                 }]
             })

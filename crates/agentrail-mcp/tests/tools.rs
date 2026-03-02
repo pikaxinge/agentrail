@@ -294,6 +294,30 @@ fn orchestrate_start_starts_real_process_and_exposes_session() {
 }
 
 #[test]
+fn orchestrate_start_rejects_tmux_runner_mode_after_removal() {
+    let tmp = tempdir().expect("tempdir");
+    let task_id = unique_task_id("task-start-tmux-unsupported");
+
+    let err = handle_tool_call(
+        "orchestrate_start",
+        json!({
+            "task_id": task_id,
+            "worker_id": "worker-a",
+            "runner_mode": "tmux",
+            "command": "bash",
+            "args": ["-lc", "echo should-not-run"],
+            "workdir": tmp.path().display().to_string()
+        }),
+    )
+    .expect_err("orchestrate_start should reject removed tmux runner mode");
+
+    assert!(
+        err.to_string().contains("unsupported runner_mode: tmux"),
+        "expected unsupported tmux runner mode validation error, got: {err}"
+    );
+}
+
+#[test]
 fn orchestrate_status_returns_runtime_backed_state() {
     let tmp = tempdir().expect("tempdir");
     let task_id = unique_task_id("task-status");
@@ -1058,15 +1082,15 @@ fn delivery_submit_rejects_steer_required_with_process_runner() {
 
     assert!(
         err.to_string()
-            .contains("steer_required=true requires runner_mode=tmux or runner_mode=app_server"),
+            .contains("steer_required=true requires runner_mode=app_server"),
         "expected runner_mode validation error, got: {err}"
     );
 }
 
 #[test]
-fn delivery_submit_rejects_steer_required_without_interactive_command() {
+fn delivery_submit_rejects_tmux_runner_mode_after_removal() {
     let tmp = tempdir().expect("tempdir");
-    let task_id = unique_task_id("task-delivery-steer-required-noninteractive");
+    let task_id = unique_task_id("task-delivery-runner-mode-tmux-unsupported");
 
     let err = handle_tool_call(
         "delivery_submit",
@@ -1074,73 +1098,41 @@ fn delivery_submit_rejects_steer_required_without_interactive_command() {
             "task_id": task_id,
             "worker_id": "worker-a",
             "runner_mode": "tmux",
-            "steer_required": true,
-            "interactive_command": false,
             "command": "bash",
             "args": ["-lc", "echo should-not-run"],
             "workdir": tmp.path().display().to_string()
         }),
     )
-    .expect_err("delivery_submit should reject steer_required without interactive_command");
+    .expect_err("delivery_submit should reject removed tmux runner mode");
 
     assert!(
-        err.to_string()
-            .contains("steer_required=true requires interactive_command=true"),
-        "expected interactive_command validation error, got: {err}"
+        err.to_string().contains("unsupported runner_mode: tmux"),
+        "expected unsupported tmux runner mode validation error, got: {err}"
     );
 }
 
 #[test]
-fn delivery_submit_rejects_steer_required_for_codex_exec_shape() {
+fn delivery_submit_rejects_codex_exec_shape_in_process_mode() {
     let tmp = tempdir().expect("tempdir");
-    let task_id = unique_task_id("task-delivery-steer-required-codex-exec");
+    let task_id = unique_task_id("task-delivery-codex-exec-shape-process");
 
     let err = handle_tool_call(
         "delivery_submit",
         json!({
             "task_id": task_id,
             "worker_id": "worker-a",
-            "runner_mode": "tmux",
-            "steer_required": true,
-            "interactive_command": true,
+            "runner_mode": "process",
             "command": "codex",
             "args": ["exec", "echo should-not-run"],
             "workdir": tmp.path().display().to_string()
         }),
     )
-    .expect_err("delivery_submit should reject codex exec command shape");
+    .expect_err("delivery_submit should reject codex exec command shape for process mode");
 
     assert!(
         err.to_string()
-            .contains("rejects non-steerable codex exec command shape"),
-        "expected non-steerable codex exec validation error, got: {err}"
-    );
-}
-
-#[test]
-fn delivery_submit_rejects_steer_required_for_guarded_exec_wrapper() {
-    let tmp = tempdir().expect("tempdir");
-    let task_id = unique_task_id("task-delivery-steer-required-guarded-exec");
-
-    let err = handle_tool_call(
-        "delivery_submit",
-        json!({
-            "task_id": task_id,
-            "worker_id": "worker-a",
-            "runner_mode": "tmux",
-            "steer_required": true,
-            "interactive_command": true,
-            "command": "scripts/codex-guarded-exec.sh",
-            "args": ["--workdir", tmp.path().display().to_string(), "--timeout-sec", "300", "--", "-C", tmp.path().display().to_string(), "echo should-not-run"],
-            "workdir": tmp.path().display().to_string()
-        }),
-    )
-    .expect_err("delivery_submit should reject codex guarded exec wrapper shape");
-
-    assert!(
-        err.to_string()
-            .contains("rejects non-steerable codex exec command shape"),
-        "expected non-steerable guarded exec validation error, got: {err}"
+            .contains("runner_mode=process rejects codex exec/guarded-exec command shape"),
+        "expected deterministic process-mode codex exec rejection, got: {err}"
     );
 }
 

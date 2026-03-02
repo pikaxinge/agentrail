@@ -186,7 +186,7 @@ fn tools_list_includes_delivery_stop_and_cleanup_schemas() {
         .expect("delivery_submit descriptor should exist");
     assert_eq!(
         submit["inputSchema"]["properties"]["runner_mode"]["enum"],
-        json!(["process", "tmux", "app_server"])
+        json!(["process", "app_server"])
     );
     assert_eq!(
         submit["inputSchema"]["properties"]["steer_required"]["type"],
@@ -236,7 +236,7 @@ fn tools_list_includes_delivery_stop_and_cleanup_schemas() {
         .expect("orchestrate_start descriptor should exist");
     assert_eq!(
         orchestrate_start["inputSchema"]["properties"]["runner_mode"]["enum"],
-        json!(["process", "tmux", "app_server"])
+        json!(["process", "app_server"])
     );
     assert_eq!(
         orchestrate_start["inputSchema"]["properties"]["trace_id"]["type"],

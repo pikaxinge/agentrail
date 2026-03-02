@@ -103,17 +103,17 @@ phases:
 - Starts a tracked delivery task.
 - Required input: `task_id`.
 - Important options:
-  - `runner_mode`: `process`, `tmux`, or `app_server`.
+  - `runner_mode`: `process` or `app_server`.
   - `app_server_request_policy` (app_server only): `deny_all` (default), `allow_safe_subset`, `delegate_fail_open` (disabled by default).
   - `steer_required`: when `true`, submission must satisfy steer preflight rules.
-  - `interactive_command`: when `true`, indicates session is steerable.
+  - `interactive_command`: compatibility field retained for legacy clients (currently ignored by preflight).
   - `idempotency_key`: dedupe repeated submit intents.
 
 Preflight behavior:
-- `steer_required=true` rejects non-steerable command shapes.
-- `runner_mode=process` rejects `codex exec` and `codex-guarded-exec` command shapes (to avoid nondeterministic skill-intake loops).
+- `steer_required=true` requires `runner_mode=app_server`.
+- `runner_mode=process` rejects `codex exec` and `codex-guarded-exec` command shapes (to avoid nondeterministic skill-intake loops), regardless of `steer_required`.
 - `app_server_request_policy` is valid only with `runner_mode=app_server`.
-- Use `runner_mode=tmux` or `runner_mode=app_server` for steer-required rounds.
+- Use `runner_mode=app_server` for steer-required rounds.
 
 App Server server-request handling:
 - approval-style server requests return deterministic decision values:
@@ -133,7 +133,7 @@ App Server server-request handling:
   - `stall_reason`
 - `stall_reason` enum values:
   - `no_output_freshness`
-  - `session_or_pane_missing`
+  - `session_or_pane_missing` (compatibility label; now means runtime session missing/unreachable)
   - `runner_state_stale_or_inconsistent`
   - `unknown`
 
@@ -196,7 +196,7 @@ App Server server-request handling:
 5. Orchestrator refreshes `plan_status` and repeats until terminal.
 
 ## Runner Capability Notes
-- `TmuxRunner`: designed for long-lived steerable sessions.
+- `AppServer` runner: long-lived steerable sessions over stdio JSON-RPC.
 - `ProcessRunner`: deterministic one-shot process lifecycle; steer semantics are limited.
 
 ## Known Gaps and Boundaries
