@@ -110,6 +110,14 @@ fn current_epoch_ms() -> i64 {
         .as_millis() as i64
 }
 
+fn default_trace_id(task_id: &str) -> String {
+    format!("trace:{task_id}")
+}
+
+fn default_span_id(task_id: &str, attempt_number: u32) -> String {
+    format!("span:{task_id}:{attempt_number}")
+}
+
 fn default_updated_epoch_ms() -> i64 {
     current_epoch_ms()
 }
@@ -157,6 +165,9 @@ pub struct TaskAttemptRecord {
     pub attempt_number: u32,
     pub session_id: String,
     pub runner_mode: String,
+    pub trace_id: String,
+    pub span_id: String,
+    pub parent_span_id: Option<String>,
     pub started_epoch_ms: i64,
     pub terminal_state: Option<String>,
     pub ended_epoch_ms: Option<i64>,
@@ -168,6 +179,9 @@ pub struct TaskSessionRecord {
     pub task_id: String,
     pub attempt_number: u32,
     pub runner_mode: String,
+    pub trace_id: String,
+    pub span_id: String,
+    pub parent_span_id: Option<String>,
     pub started_epoch_ms: i64,
     pub terminal_state: Option<String>,
     pub ended_epoch_ms: Option<i64>,
@@ -267,6 +281,9 @@ impl TaskStore {
                 attempt_number INTEGER NOT NULL,
                 session_id TEXT NOT NULL,
                 runner_mode TEXT NOT NULL,
+                trace_id TEXT NOT NULL DEFAULT '',
+                span_id TEXT NOT NULL DEFAULT '',
+                parent_span_id TEXT,
                 started_epoch_ms INTEGER NOT NULL DEFAULT 0,
                 terminal_state TEXT,
                 ended_epoch_ms INTEGER
@@ -282,6 +299,9 @@ impl TaskStore {
                 task_id TEXT NOT NULL,
                 attempt_number INTEGER NOT NULL,
                 runner_mode TEXT NOT NULL,
+                trace_id TEXT NOT NULL DEFAULT '',
+                span_id TEXT NOT NULL DEFAULT '',
+                parent_span_id TEXT,
                 started_epoch_ms INTEGER NOT NULL DEFAULT 0,
                 terminal_state TEXT,
                 ended_epoch_ms INTEGER
@@ -368,6 +388,24 @@ impl TaskStore {
     }
 
     fn ensure_task_attempts_schema(connection: &Connection) -> Result<()> {
+        if !Self::table_has_column(connection, "task_attempts", "trace_id")? {
+            connection.execute(
+                "ALTER TABLE task_attempts ADD COLUMN trace_id TEXT NOT NULL DEFAULT ''",
+                [],
+            )?;
+        }
+        if !Self::table_has_column(connection, "task_attempts", "span_id")? {
+            connection.execute(
+                "ALTER TABLE task_attempts ADD COLUMN span_id TEXT NOT NULL DEFAULT ''",
+                [],
+            )?;
+        }
+        if !Self::table_has_column(connection, "task_attempts", "parent_span_id")? {
+            connection.execute(
+                "ALTER TABLE task_attempts ADD COLUMN parent_span_id TEXT",
+                [],
+            )?;
+        }
         if !Self::table_has_column(connection, "task_attempts", "started_epoch_ms")? {
             connection.execute(
                 "ALTER TABLE task_attempts ADD COLUMN started_epoch_ms INTEGER NOT NULL DEFAULT 0",
@@ -392,10 +430,51 @@ impl TaskStore {
              WHERE started_epoch_ms <= 0",
             params![current_epoch_ms()],
         )?;
+        connection.execute(
+            "UPDATE task_attempts
+             SET trace_id = 'trace:' || task_id
+             WHERE trace_id IS NULL OR trace_id = ''",
+            [],
+        )?;
+        connection.execute(
+            "UPDATE task_attempts
+             SET span_id = 'span:' || task_id || ':' || attempt_number
+             WHERE span_id IS NULL OR span_id = ''",
+            [],
+        )?;
+        connection.execute(
+            "UPDATE task_attempts
+             SET parent_span_id = (
+                 SELECT previous.span_id
+                 FROM task_attempts AS previous
+                 WHERE previous.task_id = task_attempts.task_id
+                   AND previous.attempt_number = task_attempts.attempt_number - 1
+             )
+             WHERE parent_span_id IS NULL",
+            [],
+        )?;
         Ok(())
     }
 
     fn ensure_task_sessions_schema(connection: &Connection) -> Result<()> {
+        if !Self::table_has_column(connection, "task_sessions", "trace_id")? {
+            connection.execute(
+                "ALTER TABLE task_sessions ADD COLUMN trace_id TEXT NOT NULL DEFAULT ''",
+                [],
+            )?;
+        }
+        if !Self::table_has_column(connection, "task_sessions", "span_id")? {
+            connection.execute(
+                "ALTER TABLE task_sessions ADD COLUMN span_id TEXT NOT NULL DEFAULT ''",
+                [],
+            )?;
+        }
+        if !Self::table_has_column(connection, "task_sessions", "parent_span_id")? {
+            connection.execute(
+                "ALTER TABLE task_sessions ADD COLUMN parent_span_id TEXT",
+                [],
+            )?;
+        }
         if !Self::table_has_column(connection, "task_sessions", "started_epoch_ms")? {
             connection.execute(
                 "ALTER TABLE task_sessions ADD COLUMN started_epoch_ms INTEGER NOT NULL DEFAULT 0",
@@ -419,6 +498,48 @@ impl TaskStore {
              SET started_epoch_ms = ?1
              WHERE started_epoch_ms <= 0",
             params![current_epoch_ms()],
+        )?;
+        connection.execute(
+            "UPDATE task_sessions
+             SET trace_id = COALESCE(
+                 (
+                     SELECT attempts.trace_id
+                     FROM task_attempts AS attempts
+                     WHERE attempts.task_id = task_sessions.task_id
+                       AND attempts.attempt_number = task_sessions.attempt_number
+                     LIMIT 1
+                 ),
+                 'trace:' || task_sessions.task_id
+             )
+             WHERE trace_id IS NULL OR trace_id = ''",
+            [],
+        )?;
+        connection.execute(
+            "UPDATE task_sessions
+             SET span_id = COALESCE(
+                 (
+                     SELECT attempts.span_id
+                     FROM task_attempts AS attempts
+                     WHERE attempts.task_id = task_sessions.task_id
+                       AND attempts.attempt_number = task_sessions.attempt_number
+                     LIMIT 1
+                 ),
+                 'span:' || task_sessions.task_id || ':' || task_sessions.attempt_number
+             )
+             WHERE span_id IS NULL OR span_id = ''",
+            [],
+        )?;
+        connection.execute(
+            "UPDATE task_sessions
+             SET parent_span_id = (
+                 SELECT attempts.parent_span_id
+                 FROM task_attempts AS attempts
+                 WHERE attempts.task_id = task_sessions.task_id
+                   AND attempts.attempt_number = task_sessions.attempt_number
+                 LIMIT 1
+             )
+             WHERE parent_span_id IS NULL",
+            [],
         )?;
         Ok(())
     }
@@ -535,9 +656,12 @@ impl TaskStore {
         let attempt_number_raw: i64 = row.get(2)?;
         let session_id: String = row.get(3)?;
         let runner_mode: String = row.get(4)?;
-        let started_epoch_ms: i64 = row.get(5)?;
-        let terminal_state: Option<String> = row.get(6)?;
-        let ended_epoch_ms: Option<i64> = row.get(7)?;
+        let trace_id: String = row.get(5)?;
+        let span_id: String = row.get(6)?;
+        let parent_span_id: Option<String> = row.get(7)?;
+        let started_epoch_ms: i64 = row.get(8)?;
+        let terminal_state: Option<String> = row.get(9)?;
+        let ended_epoch_ms: Option<i64> = row.get(10)?;
         let attempt_number = u32::try_from(attempt_number_raw).map_err(|_| {
             anyhow!("invalid attempt_number in store for task {task_id}: {attempt_number_raw}")
         })?;
@@ -548,6 +672,9 @@ impl TaskStore {
             attempt_number,
             session_id,
             runner_mode,
+            trace_id,
+            span_id,
+            parent_span_id,
             started_epoch_ms,
             terminal_state,
             ended_epoch_ms,
@@ -559,9 +686,12 @@ impl TaskStore {
         let task_id: String = row.get(1)?;
         let attempt_number_raw: i64 = row.get(2)?;
         let runner_mode: String = row.get(3)?;
-        let started_epoch_ms: i64 = row.get(4)?;
-        let terminal_state: Option<String> = row.get(5)?;
-        let ended_epoch_ms: Option<i64> = row.get(6)?;
+        let trace_id: String = row.get(4)?;
+        let span_id: String = row.get(5)?;
+        let parent_span_id: Option<String> = row.get(6)?;
+        let started_epoch_ms: i64 = row.get(7)?;
+        let terminal_state: Option<String> = row.get(8)?;
+        let ended_epoch_ms: Option<i64> = row.get(9)?;
         let attempt_number = u32::try_from(attempt_number_raw).map_err(|_| {
             anyhow!(
                 "invalid attempt_number in session store for task {task_id}: {attempt_number_raw}"
@@ -573,6 +703,9 @@ impl TaskStore {
             task_id,
             attempt_number,
             runner_mode,
+            trace_id,
+            span_id,
+            parent_span_id,
             started_epoch_ms,
             terminal_state,
             ended_epoch_ms,
@@ -626,6 +759,23 @@ impl TaskStore {
             anyhow!("attempt_number overflow for task {task_id}: {max_attempt_raw}")
         })?;
         Ok(max_attempt)
+    }
+
+    fn latest_trace_context_for_task_tx(
+        tx: &rusqlite::Transaction<'_>,
+        task_id: &str,
+    ) -> Result<Option<(String, String)>> {
+        tx.query_row(
+            "SELECT trace_id, span_id
+             FROM task_attempts
+             WHERE task_id = ?1
+             ORDER BY attempt_number DESC
+             LIMIT 1",
+            params![task_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+        .map_err(Into::into)
     }
 
     fn insert_task_event_tx(
@@ -1079,34 +1229,82 @@ impl TaskStore {
         session_id: &str,
         runner_mode: &str,
     ) -> Result<TaskAttemptRecord> {
+        self.register_task_attempt_with_trace(task_id, session_id, runner_mode, None, None)
+    }
+
+    pub fn register_task_attempt_with_trace(
+        &self,
+        task_id: &str,
+        session_id: &str,
+        runner_mode: &str,
+        trace_id: Option<&str>,
+        parent_span_id: Option<&str>,
+    ) -> Result<TaskAttemptRecord> {
         self.with_transaction(|tx| {
-            let next_attempt_raw: i64 = tx.query_row(
-                "SELECT COALESCE(MAX(attempt_number), 0) + 1
-                 FROM task_attempts
-                 WHERE task_id = ?1",
-                params![task_id],
-                |row| row.get(0),
-            )?;
-            let next_attempt = u32::try_from(next_attempt_raw).map_err(|_| {
-                anyhow!("attempt_number overflow for task {task_id}: {next_attempt_raw}")
-            })?;
+            let current_attempt = Self::current_attempt_for_task_tx(tx, task_id)?;
+            let next_attempt = current_attempt
+                .checked_add(1)
+                .ok_or_else(|| anyhow!("attempt_number overflow for task {task_id}"))?;
+            let previous_trace = Self::latest_trace_context_for_task_tx(tx, task_id)?;
+            let explicit_trace_id = trace_id.map(ToString::to_string);
+            let trace_id = explicit_trace_id
+                .clone()
+                .or_else(|| previous_trace.as_ref().map(|(trace, _)| trace.clone()))
+                .unwrap_or_else(|| default_trace_id(task_id));
+            let span_id = default_span_id(task_id, next_attempt);
+            let parent_span_id = parent_span_id.map(ToString::to_string).or_else(|| {
+                previous_trace
+                    .as_ref()
+                    .and_then(|(previous_trace_id, previous_span_id)| {
+                        if previous_trace_id == &trace_id {
+                            Some(previous_span_id.clone())
+                        } else {
+                            None
+                        }
+                    })
+            });
             let started_epoch_ms = current_epoch_ms();
             tx.execute(
-                "INSERT INTO task_attempts (task_id, attempt_number, session_id, runner_mode, started_epoch_ms)
-                 VALUES (?1, ?2, ?3, ?4, ?5)",
-                params![task_id, next_attempt, session_id, runner_mode, started_epoch_ms],
+                "INSERT INTO task_attempts (
+                    task_id, attempt_number, session_id, runner_mode,
+                    trace_id, span_id, parent_span_id, started_epoch_ms
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                params![
+                    task_id,
+                    next_attempt,
+                    session_id,
+                    runner_mode,
+                    trace_id,
+                    span_id,
+                    parent_span_id,
+                    started_epoch_ms
+                ],
             )?;
+            let id = tx.last_insert_rowid();
             tx.execute(
-                "INSERT INTO task_sessions (session_id, task_id, attempt_number, runner_mode, started_epoch_ms)
-                 VALUES (?1, ?2, ?3, ?4, ?5)
+                "INSERT INTO task_sessions (
+                    session_id, task_id, attempt_number, runner_mode,
+                    trace_id, span_id, parent_span_id, started_epoch_ms
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
                  ON CONFLICT(session_id) DO UPDATE SET
                     task_id = excluded.task_id,
                     attempt_number = excluded.attempt_number,
                     runner_mode = excluded.runner_mode,
+                    trace_id = excluded.trace_id,
+                    span_id = excluded.span_id,
+                    parent_span_id = excluded.parent_span_id,
                     started_epoch_ms = excluded.started_epoch_ms",
-                params![session_id, task_id, next_attempt, runner_mode, started_epoch_ms],
+                params![
+                    session_id,
+                    task_id,
+                    next_attempt,
+                    runner_mode,
+                    trace_id,
+                    span_id,
+                    parent_span_id,
+                    started_epoch_ms
+                ],
             )?;
-            let id = tx.last_insert_rowid();
             let _ = Self::insert_task_event_tx(
                 tx,
                 &TaskEventDraft {
@@ -1130,6 +1328,9 @@ impl TaskStore {
                 attempt_number: next_attempt,
                 session_id: session_id.to_string(),
                 runner_mode: runner_mode.to_string(),
+                trace_id,
+                span_id,
+                parent_span_id,
                 started_epoch_ms,
                 terminal_state: None,
                 ended_epoch_ms: None,
@@ -1199,7 +1400,9 @@ impl TaskStore {
     pub fn list_task_attempts(&self, task_id: &str) -> Result<Vec<TaskAttemptRecord>> {
         self.with_connection(|connection| {
             let mut statement = connection.prepare(
-                "SELECT id, task_id, attempt_number, session_id, runner_mode, started_epoch_ms, terminal_state, ended_epoch_ms
+                "SELECT
+                    id, task_id, attempt_number, session_id, runner_mode,
+                    trace_id, span_id, parent_span_id, started_epoch_ms, terminal_state, ended_epoch_ms
                  FROM task_attempts
                  WHERE task_id = ?1
                  ORDER BY attempt_number ASC",
@@ -1216,7 +1419,9 @@ impl TaskStore {
     pub fn list_task_sessions(&self, task_id: &str) -> Result<Vec<TaskSessionRecord>> {
         self.with_connection(|connection| {
             let mut statement = connection.prepare(
-                "SELECT session_id, task_id, attempt_number, runner_mode, started_epoch_ms, terminal_state, ended_epoch_ms
+                "SELECT
+                    session_id, task_id, attempt_number, runner_mode,
+                    trace_id, span_id, parent_span_id, started_epoch_ms, terminal_state, ended_epoch_ms
                  FROM task_sessions
                  WHERE task_id = ?1
                  ORDER BY started_epoch_ms ASC, session_id ASC",
@@ -1227,6 +1432,28 @@ impl TaskStore {
                 sessions.push(Self::read_task_session_row(row)?);
             }
             Ok(sessions)
+        })
+    }
+
+    pub fn latest_trace_context_for_task(
+        &self,
+        task_id: &str,
+    ) -> Result<Option<TaskAttemptRecord>> {
+        self.with_connection(|connection| {
+            let mut statement = connection.prepare(
+                "SELECT
+                    id, task_id, attempt_number, session_id, runner_mode,
+                    trace_id, span_id, parent_span_id, started_epoch_ms, terminal_state, ended_epoch_ms
+                 FROM task_attempts
+                 WHERE task_id = ?1
+                 ORDER BY attempt_number DESC
+                 LIMIT 1",
+            )?;
+            let mut rows = statement.query(params![task_id])?;
+            match rows.next()? {
+                Some(row) => Ok(Some(Self::read_task_attempt_row(row)?)),
+                None => Ok(None),
+            }
         })
     }
 
