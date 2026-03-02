@@ -68,21 +68,13 @@ All conditions should hold for at least 5 consecutive tasks:
 - closure note describing what improved in the next run
 
 ## Guarded Worker Contract
-To avoid autonomous no-action loops, bootstrap rounds must use a guarded codex launcher.
+To avoid autonomous no-action loops:
+- `delivery_submit` must run Codex tasks with `runner_mode=app_server`.
+- `runner_mode=process` rejects `codex exec` and `codex-guarded-exec` command shapes.
 
-Recommended invocation inside `delivery_submit`:
+`scripts/codex-guarded-exec.sh` is still useful for direct shell fallback flows (outside `delivery_submit`) when you need local fail-fast no-mutation guarding.
 
-```bash
-scripts/codex-guarded-exec.sh \
-  --workdir /path/to/repo \
-  --timeout-sec 300 \
-  -- \
-  --dangerously-bypass-approvals-and-sandbox \
-  -C /path/to/repo \
-  "your implementation prompt"
-```
-
-Behavior:
+Behavior of `codex-guarded-exec.sh`:
 - If the worker fails to mutate the workspace before timeout, the guard exits with code `124`.
 - This creates a deterministic failure signal so orchestrator can stop/retry instead of waiting indefinitely.
 

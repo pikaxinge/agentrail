@@ -1286,12 +1286,24 @@ fn is_non_steerable_codex_exec_shape(command: &str, args: &[String]) -> bool {
 }
 
 fn validate_delivery_submit_preflight(args: &Value) -> Result<()> {
+    let runner_mode = RuntimeRunnerMode::parse(args.get("runner_mode").and_then(Value::as_str))?;
+    let command = optional_string(args, "command");
+    let command_args = optional_string_array(args, "args")?;
+    if runner_mode == RuntimeRunnerMode::Process
+        && command
+            .as_deref()
+            .is_some_and(|value| is_non_steerable_codex_exec_shape(value, &command_args))
+    {
+        anyhow::bail!(
+            "invalid delivery_submit: runner_mode=process rejects codex exec/guarded-exec command shape due nondeterministic skill-intake loops; use runner_mode=app_server"
+        );
+    }
+
     let steer_required = optional_bool(args, "steer_required", false)?;
     if !steer_required {
         return Ok(());
     }
 
-    let runner_mode = RuntimeRunnerMode::parse(args.get("runner_mode").and_then(Value::as_str))?;
     if !matches!(
         runner_mode,
         RuntimeRunnerMode::Tmux | RuntimeRunnerMode::AppServer
@@ -1312,12 +1324,11 @@ fn validate_delivery_submit_preflight(args: &Value) -> Result<()> {
         );
     }
 
-    let command = optional_string(args, "command").ok_or_else(|| {
+    let command = command.ok_or_else(|| {
         anyhow::anyhow!(
             "invalid delivery_submit: steer_required=true requires explicit interactive command"
         )
     })?;
-    let command_args = optional_string_array(args, "args")?;
     if is_non_steerable_codex_exec_shape(&command, &command_args) {
         anyhow::bail!(
             "invalid delivery_submit: steer_required=true rejects non-steerable codex exec command shape; use interactive codex session (no exec) or set steer_required=false"

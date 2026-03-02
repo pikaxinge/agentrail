@@ -35,7 +35,9 @@ This runbook defines how a session-level orchestrator executes development tasks
 ## MCP-Only Mode
 - For bootstrap hardening, execution should use MCP tool surfaces as the default control path.
 - Non-MCP actions (`shell`/direct file edits/manual git surgery) are break-glass actions and must be logged as friction events.
-- For autonomous codex workers, use `scripts/codex-guarded-exec.sh` to fail fast on no-edit loops.
+- For autonomous Codex workers under `delivery_submit`, use `runner_mode=app_server`.
+- `runner_mode=process` intentionally rejects `codex exec` / `codex-guarded-exec` command shapes.
+- `scripts/codex-guarded-exec.sh` remains a direct shell fallback helper for fail-fast no-mutation guarding.
 - Required MCP surfaces for orchestration loop:
   - planning: `plan_next`, `plan_claim`, `plan_complete`, `plan_status`, `plan_show`
   - runtime: `orchestrate_start`, `orchestrate_status`, `orchestrate_steer`

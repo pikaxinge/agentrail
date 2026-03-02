@@ -110,6 +110,7 @@ phases:
 
 Preflight behavior:
 - `steer_required=true` rejects non-steerable command shapes.
+- `runner_mode=process` rejects `codex exec` and `codex-guarded-exec` command shapes (to avoid nondeterministic skill-intake loops).
 - Use `runner_mode=tmux` or `runner_mode=app_server` for steer-required rounds.
 
 ### `delivery_status`

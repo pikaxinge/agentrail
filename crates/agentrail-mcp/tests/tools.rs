@@ -1115,6 +1115,31 @@ fn delivery_submit_rejects_steer_required_for_guarded_exec_wrapper() {
 }
 
 #[test]
+fn delivery_submit_rejects_process_runner_for_guarded_exec_wrapper() {
+    let tmp = tempdir().expect("tempdir");
+    let task_id = unique_task_id("task-delivery-process-guarded-exec-rejected");
+
+    let err = handle_tool_call(
+        "delivery_submit",
+        json!({
+            "task_id": task_id,
+            "worker_id": "worker-a",
+            "runner_mode": "process",
+            "command": "scripts/codex-guarded-exec.sh",
+            "args": ["--workdir", tmp.path().display().to_string(), "--timeout-sec", "300", "--", "-C", tmp.path().display().to_string(), "echo should-not-run"],
+            "workdir": tmp.path().display().to_string()
+        }),
+    )
+    .expect_err("delivery_submit should reject process-mode guarded exec wrapper");
+
+    assert!(
+        err.to_string()
+            .contains("runner_mode=process rejects codex exec/guarded-exec command shape"),
+        "expected deterministic process-mode guarded-exec rejection, got: {err}"
+    );
+}
+
+#[test]
 fn delivery_submit_defaults_runner_mode_to_process_when_omitted() {
     let tmp = tempdir().expect("tempdir");
     let task_id = unique_task_id("task-delivery-default-runner");
