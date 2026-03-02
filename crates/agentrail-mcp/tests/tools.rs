@@ -557,7 +557,7 @@ fn delivery_retry_events_include_old_and_new_attempt_numbers() {
     let task_id = unique_task_id("task-retry-attempt-audit");
     let (subscriber_id, _) = subscribe_events(&task_id);
 
-    let _ = handle_tool_call(
+    let first_submit = handle_tool_call(
         "delivery_submit",
         json!({
             "task_id": task_id,
@@ -569,6 +569,18 @@ fn delivery_retry_events_include_old_and_new_attempt_numbers() {
         }),
     )
     .expect("initial submit should succeed");
+    let first_trace_id = first_submit["orchestration"]["trace_id"]
+        .as_str()
+        .expect("first trace_id should be string")
+        .to_string();
+    let first_span_id = first_submit["orchestration"]["span_id"]
+        .as_str()
+        .expect("first span_id should be string")
+        .to_string();
+    assert!(
+        first_submit["orchestration"]["parent_span_id"].is_null(),
+        "first attempt should not have parent span"
+    );
     let _ = wait_for_runtime_state(&task_id, "running");
 
     let _ = handle_tool_call(
@@ -581,7 +593,7 @@ fn delivery_retry_events_include_old_and_new_attempt_numbers() {
     .expect("stop should succeed");
     let _ = wait_for_runtime_state(&task_id, "failed_retryable");
 
-    let _ = handle_tool_call(
+    let retry_submit = handle_tool_call(
         "delivery_submit",
         json!({
             "task_id": task_id,
@@ -594,6 +606,19 @@ fn delivery_retry_events_include_old_and_new_attempt_numbers() {
         }),
     )
     .expect("retry submit should succeed");
+    assert_eq!(
+        retry_submit["orchestration"]["trace_id"],
+        json!(first_trace_id)
+    );
+    assert_eq!(
+        retry_submit["orchestration"]["parent_span_id"],
+        json!(first_span_id)
+    );
+    assert_ne!(
+        retry_submit["orchestration"]["span_id"],
+        json!(first_span_id),
+        "retry should allocate a new span id"
+    );
 
     let next = next_events(&subscriber_id, &task_id, 128);
     let events = next["events"].as_array().expect("events should be array");
@@ -612,6 +637,119 @@ fn delivery_retry_events_include_old_and_new_attempt_numbers() {
         has_attempt_delta,
         "expected retry audit fields old_attempt_number/new_attempt_number in events: {events:?}"
     );
+    let retry_started = events
+        .iter()
+        .find(|event| event["event_type"] == "retry_started")
+        .expect("retry_started event should be present");
+    assert_eq!(retry_started["trace_id"], json!(first_trace_id));
+    assert_eq!(retry_started["parent_span_id"], json!(first_span_id));
+    assert!(retry_started["span_id"].is_string());
+}
+
+#[test]
+fn orchestrate_start_propagates_explicit_trace_context_to_status() {
+    let tmp = tempdir().expect("tempdir");
+    let task_id = unique_task_id("task-trace-explicit");
+
+    let started = handle_tool_call(
+        "orchestrate_start",
+        json!({
+            "task_id": task_id,
+            "worker_id": "worker-a",
+            "runner_mode": "process",
+            "trace_id": "trace:root-operation",
+            "parent_span_id": "span:root-operation:7",
+            "command": "bash",
+            "args": ["-lc", "sleep 5"],
+            "workdir": tmp.path().display().to_string()
+        }),
+    )
+    .expect("orchestrate_start should succeed");
+    assert_eq!(started["trace_id"], "trace:root-operation");
+    assert_eq!(started["parent_span_id"], "span:root-operation:7");
+    assert!(started["span_id"].is_string());
+
+    let status = wait_for_runtime_state(&task_id, "running");
+    assert_eq!(status["trace_id"], "trace:root-operation");
+    assert_eq!(status["parent_span_id"], "span:root-operation:7");
+    assert_eq!(status["span_id"], started["span_id"]);
+
+    let _ = handle_tool_call(
+        "delivery_stop",
+        json!({
+            "task_id": task_id,
+            "reason": "trace-context-test-cleanup"
+        }),
+    )
+    .expect("delivery_stop cleanup should succeed");
+    let _ = wait_for_runtime_state(&task_id, "failed_retryable");
+}
+
+#[test]
+fn delivery_submit_new_trace_without_parent_does_not_link_previous_span() {
+    let tmp = tempdir().expect("tempdir");
+    let task_id = unique_task_id("task-trace-new-root");
+
+    let first_submit = handle_tool_call(
+        "delivery_submit",
+        json!({
+            "task_id": task_id,
+            "worker_id": "worker-a",
+            "runner_mode": "process",
+            "command": "bash",
+            "args": ["-lc", "sleep 5"],
+            "workdir": tmp.path().display().to_string()
+        }),
+    )
+    .expect("initial submit should succeed");
+    let first_span_id = first_submit["orchestration"]["span_id"]
+        .as_str()
+        .expect("first span id should be a string")
+        .to_string();
+    let _ = wait_for_runtime_state(&task_id, "running");
+
+    let _ = handle_tool_call(
+        "delivery_stop",
+        json!({
+            "task_id": task_id,
+            "reason": "prepare-new-trace-retry"
+        }),
+    )
+    .expect("stop should succeed");
+    let _ = wait_for_runtime_state(&task_id, "failed_retryable");
+
+    let retry_submit = handle_tool_call(
+        "delivery_submit",
+        json!({
+            "task_id": task_id,
+            "worker_id": "worker-a",
+            "runner_mode": "process",
+            "trace_id": "trace:new-root",
+            "command": "bash",
+            "args": ["-lc", "sleep 5"],
+            "workdir": tmp.path().display().to_string()
+        }),
+    )
+    .expect("retry submit with explicit trace should succeed");
+    assert_eq!(retry_submit["orchestration"]["trace_id"], "trace:new-root");
+    assert!(
+        retry_submit["orchestration"]["parent_span_id"].is_null(),
+        "explicit new trace without parent must not auto-link to prior span"
+    );
+    assert_ne!(
+        retry_submit["orchestration"]["span_id"],
+        json!(first_span_id)
+    );
+
+    let _ = handle_tool_call(
+        "delivery_stop",
+        json!({
+            "task_id": task_id,
+            "reason": "cleanup-new-trace-retry"
+        }),
+    )
+    .expect("cleanup stop should succeed");
+    let _ = wait_for_runtime_state(&task_id, "failed_retryable");
 }
 
 #[test]
@@ -723,15 +861,18 @@ fn delivery_submit_status_and_report_are_available() {
             "last_steer_observed_at",
             "last_steer_sent_at",
             "logs",
+            "parent_span_id",
             "retry_budget",
             "retry_count",
             "runner_mode",
             "runtime_state",
             "session_id",
+            "span_id",
             "state",
             "task_id",
             "timestamps",
-            "tool"
+            "tool",
+            "trace_id"
         ]
     );
     assert_eq!(status["normalized"]["tool"], "delivery_status");
@@ -748,6 +889,18 @@ fn delivery_submit_status_and_report_are_available() {
     assert_eq!(
         status["normalized"]["session_id"],
         status["orchestration"]["session_id"]
+    );
+    assert_eq!(
+        status["normalized"]["trace_id"],
+        status["orchestration"]["trace_id"]
+    );
+    assert_eq!(
+        status["normalized"]["span_id"],
+        status["orchestration"]["span_id"]
+    );
+    assert_eq!(
+        status["normalized"]["parent_span_id"],
+        status["orchestration"]["parent_span_id"]
     );
     assert_eq!(
         status["normalized"]["assigned_worker"],
@@ -1164,6 +1317,9 @@ fn delivery_status_normalized_envelope_uses_deterministic_nulls_when_runtime_dat
     assert_eq!(status["normalized"]["runtime_state"], "unknown");
     assert!(status["normalized"]["runner_mode"].is_null());
     assert!(status["normalized"]["session_id"].is_null());
+    assert!(status["normalized"]["trace_id"].is_null());
+    assert!(status["normalized"]["span_id"].is_null());
+    assert!(status["normalized"]["parent_span_id"].is_null());
     assert!(status["normalized"]["assigned_worker"].is_null());
     assert!(status["normalized"]["retry_count"].is_null());
     assert!(status["normalized"]["retry_budget"].is_null());

@@ -196,6 +196,14 @@ fn tools_list_includes_delivery_stop_and_cleanup_schemas() {
         submit["inputSchema"]["properties"]["interactive_command"]["type"],
         json!("boolean")
     );
+    assert_eq!(
+        submit["inputSchema"]["properties"]["trace_id"]["type"],
+        json!("string")
+    );
+    assert_eq!(
+        submit["inputSchema"]["properties"]["parent_span_id"]["type"],
+        json!("string")
+    );
 
     let report = tools
         .iter()
@@ -229,6 +237,14 @@ fn tools_list_includes_delivery_stop_and_cleanup_schemas() {
     assert_eq!(
         orchestrate_start["inputSchema"]["properties"]["runner_mode"]["enum"],
         json!(["process", "tmux", "app_server"])
+    );
+    assert_eq!(
+        orchestrate_start["inputSchema"]["properties"]["trace_id"]["type"],
+        json!("string")
+    );
+    assert_eq!(
+        orchestrate_start["inputSchema"]["properties"]["parent_span_id"]["type"],
+        json!("string")
     );
 }
 

@@ -80,6 +80,9 @@ struct RuntimeTaskSession {
     session_id: String,
     runner_mode: RuntimeRunnerMode,
     attempt_number: u32,
+    trace_id: String,
+    span_id: String,
+    parent_span_id: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -92,6 +95,9 @@ struct RetryTransitionContext {
 struct StartRegistration {
     runtime_state: TaskRuntimeState,
     attempt_number: u32,
+    trace_id: String,
+    span_id: String,
+    parent_span_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -105,6 +111,9 @@ struct DeliveryEvent {
     session_id: Option<String>,
     old_attempt_number: Option<u32>,
     new_attempt_number: Option<u32>,
+    trace_id: Option<String>,
+    span_id: Option<String>,
+    parent_span_id: Option<String>,
 }
 
 impl DeliveryEvent {
@@ -118,7 +127,10 @@ impl DeliveryEvent {
             "runtime_state": self.runtime_state,
             "session_id": self.session_id,
             "old_attempt_number": self.old_attempt_number,
-            "new_attempt_number": self.new_attempt_number
+            "new_attempt_number": self.new_attempt_number,
+            "trace_id": self.trace_id,
+            "span_id": self.span_id,
+            "parent_span_id": self.parent_span_id
         })
     }
 }
@@ -131,6 +143,9 @@ struct DeliveryEventSignature {
     session_id: Option<String>,
     old_attempt_number: Option<u32>,
     new_attempt_number: Option<u32>,
+    trace_id: Option<String>,
+    span_id: Option<String>,
+    parent_span_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -138,6 +153,9 @@ struct DeliveryStatusObservation {
     state: String,
     runtime_state: String,
     session_id: Option<String>,
+    trace_id: Option<String>,
+    span_id: Option<String>,
+    parent_span_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -465,6 +483,26 @@ fn emit_delivery_event(
     old_attempt_number: Option<u32>,
     new_attempt_number: Option<u32>,
 ) {
+    let fallback_trace = runtime
+        .store
+        .latest_trace_context_for_task(task_id)
+        .ok()
+        .flatten();
+    let (trace_id, span_id, parent_span_id) = if let Some(session) = runtime.sessions.get(task_id) {
+        (
+            Some(session.trace_id.clone()),
+            Some(session.span_id.clone()),
+            session.parent_span_id.clone(),
+        )
+    } else if let Some(attempt) = fallback_trace {
+        (
+            Some(attempt.trace_id),
+            Some(attempt.span_id),
+            attempt.parent_span_id,
+        )
+    } else {
+        (None, None, None)
+    };
     let signature = DeliveryEventSignature {
         event_type: event_type.to_string(),
         state: state.to_string(),
@@ -472,6 +510,9 @@ fn emit_delivery_event(
         session_id: session_id.clone(),
         old_attempt_number,
         new_attempt_number,
+        trace_id: trace_id.clone(),
+        span_id: span_id.clone(),
+        parent_span_id: parent_span_id.clone(),
     };
     if runtime
         .last_event_signature_by_task
@@ -498,7 +539,10 @@ fn emit_delivery_event(
         "runtime_state": runtime_state,
         "state": state,
         "old_attempt_number": old_attempt_number,
-        "new_attempt_number": new_attempt_number
+        "new_attempt_number": new_attempt_number,
+        "trace_id": trace_id,
+        "span_id": span_id,
+        "parent_span_id": parent_span_id
     })
     .to_string();
     runtime.pending_delivery_task_events.push(TaskEventDraft {
@@ -527,6 +571,9 @@ fn emit_delivery_event(
         session_id: event_session_id,
         old_attempt_number,
         new_attempt_number,
+        trace_id: signature.trace_id.clone(),
+        span_id: signature.span_id.clone(),
+        parent_span_id: signature.parent_span_id.clone(),
     });
     runtime
         .last_event_signature_by_task
@@ -558,10 +605,29 @@ fn emit_delivery_status_events(
     new_attempt_number: Option<u32>,
 ) -> Result<()> {
     let mut runtime = runtime_state_mutex()?;
+    let fallback_trace = runtime.store.latest_trace_context_for_task(task_id)?;
+    let (trace_id, span_id, parent_span_id) = if let Some(session) = runtime.sessions.get(task_id) {
+        (
+            Some(session.trace_id.clone()),
+            Some(session.span_id.clone()),
+            session.parent_span_id.clone(),
+        )
+    } else if let Some(attempt) = fallback_trace {
+        (
+            Some(attempt.trace_id),
+            Some(attempt.span_id),
+            attempt.parent_span_id,
+        )
+    } else {
+        (None, None, None)
+    };
     let observation = DeliveryStatusObservation {
         state: state.to_string(),
         runtime_state: runtime_state.to_string(),
         session_id: session_id.clone(),
+        trace_id,
+        span_id,
+        parent_span_id,
     };
     let changed = runtime
         .last_status_observation_by_task
@@ -846,6 +912,9 @@ fn delivery_status_normalized_v1(orchestration: &Value, tail: u32) -> Value {
         "runtime_state": field("runtime_state"),
         "runner_mode": field("runner_mode"),
         "session_id": field("session_id"),
+        "trace_id": field("trace_id"),
+        "span_id": field("span_id"),
+        "parent_span_id": field("parent_span_id"),
         "assigned_worker": field("assigned_worker"),
         "retry_count": field("retry_count"),
         "retry_budget": field("retry_budget"),
@@ -1882,15 +1951,20 @@ fn register_running_session(
     task_id: &str,
     runner_mode: RuntimeRunnerMode,
     session_id: String,
+    trace_id: Option<String>,
+    parent_span_id: Option<String>,
 ) -> Result<StartRegistration> {
     let mut runtime = runtime_state()
         .lock()
         .map_err(|_| anyhow::anyhow!("runtime state lock poisoned"))?;
     let existing = runtime.store.get_task(task_id)?;
-    let attempt =
-        runtime
-            .store
-            .register_task_attempt(task_id, &session_id, runner_mode.as_str())?;
+    let attempt = runtime.store.register_task_attempt_with_trace(
+        task_id,
+        &session_id,
+        runner_mode.as_str(),
+        trace_id.as_deref(),
+        parent_span_id.as_deref(),
+    )?;
     if let Some(task) = existing
         && task.state == TaskRuntimeState::Preparing
     {
@@ -1904,6 +1978,9 @@ fn register_running_session(
             session_id: session_id.clone(),
             runner_mode,
             attempt_number: attempt.attempt_number,
+            trace_id: attempt.trace_id.clone(),
+            span_id: attempt.span_id.clone(),
+            parent_span_id: attempt.parent_span_id.clone(),
         },
     );
     let task = runtime
@@ -1913,6 +1990,9 @@ fn register_running_session(
     Ok(StartRegistration {
         runtime_state: task.state,
         attempt_number: attempt.attempt_number,
+        trace_id: attempt.trace_id,
+        span_id: attempt.span_id,
+        parent_span_id: attempt.parent_span_id,
     })
 }
 
@@ -1921,6 +2001,9 @@ async fn orchestrate_start_runtime(args: Value) -> Result<Value> {
     let worker_id = optional_string(&args, "worker_id").unwrap_or_else(|| "worker-default".into());
     let scope_id = optional_string(&args, "scope_id");
     let idempotency_key = optional_string(&args, "idempotency_key");
+    let trace_id = optional_string(&args, "trace_id").filter(|value| !value.trim().is_empty());
+    let parent_span_id =
+        optional_string(&args, "parent_span_id").filter(|value| !value.trim().is_empty());
     let retry_budget = optional_u32(&args, "retry_budget", 3)?;
     let runner_mode = RuntimeRunnerMode::parse(args.get("runner_mode").and_then(Value::as_str))?;
     let (command, command_args) = resolve_start_command_and_args(&args)?;
@@ -1957,7 +2040,13 @@ async fn orchestrate_start_runtime(args: Value) -> Result<Value> {
         }
     };
 
-    let registration = register_running_session(&task_id, runner_mode, handle.session_id.clone())?;
+    let registration = register_running_session(
+        &task_id,
+        runner_mode,
+        handle.session_id.clone(),
+        trace_id,
+        parent_span_id,
+    )?;
     let runtime_state = runtime_state_label(registration.runtime_state);
 
     if let Some(retry_context) = retry_context.as_ref() {
@@ -2001,6 +2090,9 @@ async fn orchestrate_start_runtime(args: Value) -> Result<Value> {
         "runner_mode": runner_mode.as_str(),
         "runtime_state": runtime_state,
         "attempt_number": registration.attempt_number,
+        "trace_id": registration.trace_id,
+        "span_id": registration.span_id,
+        "parent_span_id": registration.parent_span_id,
         "idempotent_replay": false
     });
 
@@ -2014,24 +2106,47 @@ async fn orchestrate_start_runtime(args: Value) -> Result<Value> {
 }
 
 async fn task_runtime_status(task_id: &str, tail: usize) -> Result<Value> {
-    let (session, record, steer_observation) = {
+    let (session, record, steer_observation, persisted_trace) = {
         let runtime = runtime_state_mutex()?;
         (
             runtime.sessions.get(task_id).cloned(),
             runtime.store.get_task(task_id)?,
             runtime.last_steer_observation_by_task.get(task_id).cloned(),
+            runtime.store.latest_trace_context_for_task(task_id)?,
         )
     };
+    let fallback_trace_id = persisted_trace
+        .as_ref()
+        .map(|attempt| attempt.trace_id.clone());
+    let fallback_span_id = persisted_trace
+        .as_ref()
+        .map(|attempt| attempt.span_id.clone());
+    let fallback_parent_span_id = persisted_trace.and_then(|attempt| attempt.parent_span_id);
 
     let Some(record) = record else {
         if session.is_some() {
             let _ = clear_runtime_session(task_id);
         }
+        let trace_id = session
+            .as_ref()
+            .map(|active| active.trace_id.clone())
+            .or(fallback_trace_id.clone());
+        let span_id = session
+            .as_ref()
+            .map(|active| active.span_id.clone())
+            .or(fallback_span_id.clone());
+        let parent_span_id = session
+            .as_ref()
+            .and_then(|active| active.parent_span_id.clone())
+            .or(fallback_parent_span_id.clone());
         return Ok(json!({
             "tool": "orchestrate_status",
             "task_id": task_id,
             "state": "unknown",
             "runtime_state": "unknown",
+            "trace_id": trace_id,
+            "span_id": span_id,
+            "parent_span_id": parent_span_id,
             "last_steer_sent_at": steer_observation.as_ref().map(|observation| observation.sent_at),
             "last_steer_observed_at": steer_observation.as_ref().and_then(|observation| observation.observed_at),
             "last_steer_apply_hint": steer_observation.as_ref().map(|observation| observation.apply_hint.clone())
@@ -2051,6 +2166,9 @@ async fn task_runtime_status(task_id: &str, tail: usize) -> Result<Value> {
             "task_id": task_id,
             "state": runtime_state_label(record.state),
             "runtime_state": runtime_state_label(record.state),
+            "trace_id": fallback_trace_id.clone(),
+            "span_id": fallback_span_id.clone(),
+            "parent_span_id": fallback_parent_span_id.clone(),
             "assigned_worker": record.assigned_worker,
             "retry_count": record.retry_count,
             "retry_budget": record.retry_budget,
@@ -2066,6 +2184,9 @@ async fn task_runtime_status(task_id: &str, tail: usize) -> Result<Value> {
             "task_id": task_id,
             "state": runtime_state_label(record.state),
             "runtime_state": runtime_state_label(record.state),
+            "trace_id": fallback_trace_id.clone(),
+            "span_id": fallback_span_id.clone(),
+            "parent_span_id": fallback_parent_span_id.clone(),
             "retry_count": record.retry_count,
             "retry_budget": record.retry_budget,
             "last_steer_sent_at": steer_observation.as_ref().map(|observation| observation.sent_at),
@@ -2140,6 +2261,9 @@ async fn task_runtime_status(task_id: &str, tail: usize) -> Result<Value> {
         "runtime_state": runtime_state,
         "session_id": session.session_id,
         "runner_mode": session.runner_mode.as_str(),
+        "trace_id": session.trace_id,
+        "span_id": session.span_id,
+        "parent_span_id": session.parent_span_id,
         "assigned_worker": latest.assigned_worker,
         "retry_count": latest.retry_count,
         "retry_budget": latest.retry_budget,
@@ -2469,6 +2593,11 @@ fn runtime_report(args: &Value) -> Result<Value> {
     let tasks = filtered
         .iter()
         .map(|task| {
+            let latest_trace = runtime
+                .store
+                .latest_trace_context_for_task(&task.id)
+                .ok()
+                .flatten();
             json!({
                 "task_id": task.id,
                 "scope_id": task.scope_id,
@@ -2476,7 +2605,10 @@ fn runtime_report(args: &Value) -> Result<Value> {
                 "updated_epoch_ms": task.updated_epoch_ms,
                 "assigned_worker": task.assigned_worker,
                 "retry_count": task.retry_count,
-                "retry_budget": task.retry_budget
+                "retry_budget": task.retry_budget,
+                "trace_id": latest_trace.as_ref().map(|attempt| attempt.trace_id.clone()),
+                "span_id": latest_trace.as_ref().map(|attempt| attempt.span_id.clone()),
+                "parent_span_id": latest_trace.and_then(|attempt| attempt.parent_span_id)
             })
         })
         .collect::<Vec<_>>();
@@ -2887,6 +3019,9 @@ fn collect_startup_recovery_candidates() -> Result<Vec<StartupRecoveryCandidate>
                         session_id: session.session_id,
                         runner_mode,
                         attempt_number: session.attempt_number,
+                        trace_id: session.trace_id,
+                        span_id: session.span_id,
+                        parent_span_id: session.parent_span_id,
                     })
             });
 
@@ -3692,7 +3827,9 @@ fn mcp_tools_descriptor() -> Value {
                     },
                     "workdir": {"type":"string"},
                     "retry_budget": {"type":"integer"},
-                    "idempotency_key": {"type":"string"}
+                    "idempotency_key": {"type":"string"},
+                    "trace_id": {"type":"string"},
+                    "parent_span_id": {"type":"string"}
                 },
                 "required": ["task_id"]
             }
@@ -3740,7 +3877,9 @@ fn mcp_tools_descriptor() -> Value {
                     },
                     "workdir": {"type":"string"},
                     "retry_budget": {"type":"integer"},
-                    "idempotency_key": {"type":"string"}
+                    "idempotency_key": {"type":"string"},
+                    "trace_id": {"type":"string"},
+                    "parent_span_id": {"type":"string"}
                 },
                 "required": ["task_id"]
             }
@@ -4429,6 +4568,9 @@ mod tests {
                     session_id: "tmux-session-1".to_string(),
                     runner_mode: RuntimeRunnerMode::Tmux,
                     attempt_number: 3,
+                    trace_id: "trace:steer-observation".to_string(),
+                    span_id: "span:steer-observation:3".to_string(),
+                    parent_span_id: Some("span:steer-observation:2".to_string()),
                 },
             );
         }
@@ -4550,6 +4692,9 @@ mod tests {
                     session_id: "attempt-session-1".to_string(),
                     runner_mode: RuntimeRunnerMode::Process,
                     attempt_number: 3,
+                    trace_id: "trace:attempt-precedence".to_string(),
+                    span_id: "span:attempt-precedence:3".to_string(),
+                    parent_span_id: Some("span:attempt-precedence:2".to_string()),
                 },
             );
             emit_delivery_event(
@@ -4591,6 +4736,9 @@ mod tests {
                     session_id: "process-missing-session".to_string(),
                     runner_mode: RuntimeRunnerMode::Process,
                     attempt_number: 0,
+                    trace_id: "trace:poll-missing".to_string(),
+                    span_id: "span:poll-missing:0".to_string(),
+                    parent_span_id: None,
                 },
             );
         }

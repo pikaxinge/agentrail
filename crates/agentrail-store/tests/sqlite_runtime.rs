@@ -148,6 +148,9 @@ fn sqlite_store_persists_attempts_and_sessions_across_reconnect() {
         .expect("attempt query should succeed");
     assert_eq!(attempts.len(), 1);
     assert_eq!(attempts[0].session_id, "session-1");
+    assert_eq!(attempts[0].trace_id, "trace:task-with-attempts");
+    assert_eq!(attempts[0].span_id, "span:task-with-attempts:1");
+    assert!(attempts[0].parent_span_id.is_none());
     assert_eq!(attempts[0].terminal_state.as_deref(), Some("completed"));
     assert!(attempts[0].ended_epoch_ms.is_some());
 
@@ -156,8 +159,74 @@ fn sqlite_store_persists_attempts_and_sessions_across_reconnect() {
         .expect("session query should succeed");
     assert_eq!(sessions.len(), 1);
     assert_eq!(sessions[0].session_id, "session-1");
+    assert_eq!(sessions[0].trace_id, "trace:task-with-attempts");
+    assert_eq!(sessions[0].span_id, "span:task-with-attempts:1");
+    assert!(sessions[0].parent_span_id.is_none());
     assert_eq!(sessions[0].terminal_state.as_deref(), Some("completed"));
     assert!(sessions[0].ended_epoch_ms.is_some());
+}
+
+#[test]
+fn sqlite_store_attempt_trace_lineage_supports_inheritance_and_overrides() {
+    let store = TaskStore::connect("memory://trace-lineage");
+
+    let first = store
+        .register_task_attempt("task-trace-lineage", "session-1", "process")
+        .expect("register first attempt");
+    assert_eq!(first.trace_id, "trace:task-trace-lineage");
+    assert_eq!(first.span_id, "span:task-trace-lineage:1");
+    assert_eq!(first.parent_span_id, None);
+
+    let second = store
+        .register_task_attempt("task-trace-lineage", "session-2", "process")
+        .expect("register second attempt");
+    assert_eq!(second.trace_id, first.trace_id);
+    assert_eq!(second.span_id, "span:task-trace-lineage:2");
+    assert_eq!(
+        second.parent_span_id.as_deref(),
+        Some(first.span_id.as_str())
+    );
+
+    let third = store
+        .register_task_attempt_with_trace(
+            "task-trace-lineage",
+            "session-3",
+            "process",
+            Some("trace:external"),
+            Some("span:external-parent"),
+        )
+        .expect("register third attempt with explicit trace context");
+    assert_eq!(third.trace_id, "trace:external");
+    assert_eq!(third.span_id, "span:task-trace-lineage:3");
+    assert_eq!(
+        third.parent_span_id.as_deref(),
+        Some("span:external-parent")
+    );
+
+    let fourth = store
+        .register_task_attempt_with_trace(
+            "task-trace-lineage",
+            "session-4",
+            "process",
+            Some("trace:new-root"),
+            None,
+        )
+        .expect("register fourth attempt with new trace root");
+    assert_eq!(fourth.trace_id, "trace:new-root");
+    assert_eq!(fourth.span_id, "span:task-trace-lineage:4");
+    assert!(
+        fourth.parent_span_id.is_none(),
+        "new trace without explicit parent must not inherit prior span"
+    );
+
+    let latest = store
+        .latest_trace_context_for_task("task-trace-lineage")
+        .expect("latest trace context should load")
+        .expect("latest trace context should exist");
+    assert_eq!(latest.attempt_number, 4);
+    assert_eq!(latest.trace_id, fourth.trace_id);
+    assert_eq!(latest.span_id, fourth.span_id);
+    assert_eq!(latest.parent_span_id, fourth.parent_span_id);
 }
 
 #[test]
