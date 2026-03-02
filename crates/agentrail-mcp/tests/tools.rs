@@ -1350,6 +1350,81 @@ fn delivery_submit_rejects_steer_required_with_process_runner() {
 }
 
 #[test]
+fn delivery_submit_warns_when_interactive_command_is_provided() {
+    let tmp = tempdir().expect("tempdir");
+    let task_id = unique_task_id("task-delivery-interactive-command-deprecated");
+
+    let submit = handle_tool_call(
+        "delivery_submit",
+        json!({
+            "task_id": task_id,
+            "worker_id": "worker-a",
+            "runner_mode": "process",
+            "interactive_command": true,
+            "command": "bash",
+            "args": ["-lc", "sleep 5"],
+            "workdir": tmp.path().display().to_string()
+        }),
+    )
+    .expect("delivery_submit should succeed with legacy interactive_command");
+
+    let warnings = submit["warnings"]
+        .as_array()
+        .expect("warnings should be emitted when interactive_command is provided");
+    assert!(
+        warnings
+            .iter()
+            .any(|warning| warning
+                == "interactive_command is deprecated and ignored; use runner_mode=app_server + steer_required for steerable sessions"),
+        "expected deterministic deprecation warning, got: {warnings:?}"
+    );
+
+    let _ = handle_tool_call(
+        "delivery_stop",
+        json!({
+            "task_id": task_id,
+            "reason": "cleanup"
+        }),
+    )
+    .expect("delivery_stop cleanup should succeed");
+    let _ = wait_for_runtime_state(&task_id, "failed_retryable");
+}
+
+#[test]
+fn delivery_submit_does_not_warn_when_interactive_command_is_absent() {
+    let tmp = tempdir().expect("tempdir");
+    let task_id = unique_task_id("task-delivery-interactive-command-absent");
+
+    let submit = handle_tool_call(
+        "delivery_submit",
+        json!({
+            "task_id": task_id,
+            "worker_id": "worker-a",
+            "runner_mode": "process",
+            "command": "bash",
+            "args": ["-lc", "sleep 5"],
+            "workdir": tmp.path().display().to_string()
+        }),
+    )
+    .expect("delivery_submit should succeed when interactive_command is absent");
+
+    assert!(
+        submit.get("warnings").is_none(),
+        "warnings should be omitted when interactive_command is not provided: {submit:?}"
+    );
+
+    let _ = handle_tool_call(
+        "delivery_stop",
+        json!({
+            "task_id": task_id,
+            "reason": "cleanup"
+        }),
+    )
+    .expect("delivery_stop cleanup should succeed");
+    let _ = wait_for_runtime_state(&task_id, "failed_retryable");
+}
+
+#[test]
 fn delivery_submit_rejects_tmux_runner_mode_after_removal() {
     let tmp = tempdir().expect("tempdir");
     let task_id = unique_task_id("task-delivery-runner-mode-tmux-unsupported");
