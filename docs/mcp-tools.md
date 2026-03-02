@@ -103,19 +103,28 @@ phases:
 - Starts a tracked delivery task.
 - Required input: `task_id`.
 - Important options:
-  - `runner_mode`: `process` or `tmux`.
+  - `runner_mode`: `process`, `tmux`, or `app_server`.
   - `steer_required`: when `true`, submission must satisfy steer preflight rules.
   - `interactive_command`: when `true`, indicates session is steerable.
   - `idempotency_key`: dedupe repeated submit intents.
 
 Preflight behavior:
 - `steer_required=true` rejects non-steerable command shapes.
-- Use `runner_mode=tmux` and interactive command shape for steer-required rounds.
+- Use `runner_mode=tmux` or `runner_mode=app_server` for steer-required rounds.
 
 ### `delivery_status`
 - Returns current runtime state with normalized machine-first envelope.
 - Required input: `task_id`.
 - Optional: `tail` for log tail length.
+- Structured stall diagnostics fields are always present (nullable when not applicable):
+  - `last_output_at`
+  - `stall_duration_ms`
+  - `stall_reason`
+- `stall_reason` enum values:
+  - `no_output_freshness`
+  - `session_or_pane_missing`
+  - `runner_state_stale_or_inconsistent`
+  - `unknown`
 
 ### `delivery_steer`
 - Sends corrective instruction to a running task.
@@ -144,6 +153,10 @@ Preflight behavior:
 ### `delivery_report`
 - Returns aggregated runtime summary and task rows.
 - Supports filters: `scope_id`, `states`, `updated_since_epoch_ms`, pagination with `limit` and `cursor`.
+- Each task row includes diagnostics summary fields:
+  - `last_output_at`
+  - `stall_duration_ms`
+  - `stall_reason`
 
 ## Typical MCP Flows
 

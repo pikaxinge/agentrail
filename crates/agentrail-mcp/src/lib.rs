@@ -7,9 +7,10 @@ use axum::{
     routing::{get, post},
 };
 use serde_json::{Value, json};
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque, hash_map::DefaultHasher};
 use std::fs;
 use std::future::Future;
+use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{
@@ -183,6 +184,7 @@ struct RuntimeState {
     last_event_signature_by_task: HashMap<String, DeliveryEventSignature>,
     last_status_observation_by_task: HashMap<String, DeliveryStatusObservation>,
     last_steer_observation_by_task: HashMap<String, DeliverySteerObservation>,
+    output_freshness_by_task: HashMap<String, OutputFreshnessObservation>,
     retry_idempotency_replays: HashMap<String, Value>,
 }
 
@@ -247,6 +249,40 @@ const APP_SERVER_MAX_LOG_LINES: usize = 2_000;
 const APP_SERVER_MAX_TERMINAL_SESSIONS: usize = 256;
 const APP_SERVER_RPC_TIMEOUT_MS: u64 = 5_000;
 const APP_SERVER_TURN_RPC_TIMEOUT_MS: u64 = 30_000;
+const STALL_NO_OUTPUT_POLL_THRESHOLD: u32 = 3;
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct OutputFreshnessObservation {
+    last_output_at: Option<u64>,
+    last_log_fingerprint: Option<u64>,
+    stagnant_polls: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StallReason {
+    NoOutputFreshness,
+    SessionMissing,
+    RunnerStateStale,
+    Unknown,
+}
+
+impl StallReason {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::NoOutputFreshness => "no_output_freshness",
+            Self::SessionMissing => "session_or_pane_missing",
+            Self::RunnerStateStale => "runner_state_stale_or_inconsistent",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct StallDiagnostics {
+    last_output_at: Option<u64>,
+    stall_duration_ms: Option<u64>,
+    stall_reason: Option<StallReason>,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RuntimeStoreSource {
@@ -363,6 +399,7 @@ fn runtime_state() -> &'static Mutex<RuntimeState> {
             last_event_signature_by_task: HashMap::new(),
             last_status_observation_by_task: HashMap::new(),
             last_steer_observation_by_task: HashMap::new(),
+            output_freshness_by_task: HashMap::new(),
             retry_idempotency_replays: HashMap::new(),
         })
     })
@@ -425,6 +462,7 @@ fn reset_delivery_tracking(runtime: &mut RuntimeState, task_id: &str) {
     runtime.last_event_signature_by_task.remove(task_id);
     runtime.last_status_observation_by_task.remove(task_id);
     runtime.last_steer_observation_by_task.remove(task_id);
+    runtime.output_freshness_by_task.remove(task_id);
 }
 
 fn retry_idempotency_cache_key(task_id: &str, idempotency_key: &str) -> String {
@@ -902,6 +940,115 @@ fn delivery_logs_truncated(orchestration: &Value, tail: u32) -> bool {
     line_count >= tail as usize
 }
 
+fn non_negative_epoch_ms(raw: i64) -> Option<u64> {
+    u64::try_from(raw).ok()
+}
+
+fn log_fingerprint(logs: &str) -> Option<u64> {
+    if logs.is_empty() {
+        return None;
+    }
+    let mut hasher = DefaultHasher::new();
+    logs.hash(&mut hasher);
+    Some(hasher.finish())
+}
+
+fn observe_output_freshness(
+    runtime: &mut RuntimeState,
+    task_id: &str,
+    logs: &str,
+    now_ms: u64,
+) -> OutputFreshnessObservation {
+    let next_fingerprint = log_fingerprint(logs);
+    let observation = runtime
+        .output_freshness_by_task
+        .entry(task_id.to_string())
+        .or_default();
+
+    match (observation.last_log_fingerprint, next_fingerprint) {
+        (_, None) => {
+            observation.stagnant_polls = observation.stagnant_polls.saturating_add(1);
+        }
+        (None, Some(next)) => {
+            observation.last_log_fingerprint = Some(next);
+            observation.last_output_at = Some(now_ms);
+            observation.stagnant_polls = 0;
+        }
+        (Some(previous), Some(next)) if previous != next => {
+            observation.last_log_fingerprint = Some(next);
+            observation.last_output_at = Some(now_ms);
+            observation.stagnant_polls = 0;
+        }
+        (Some(_), Some(next)) => {
+            observation.last_log_fingerprint = Some(next);
+            observation.stagnant_polls = observation.stagnant_polls.saturating_add(1);
+        }
+    }
+
+    observation.clone()
+}
+
+fn derive_stall_diagnostics(
+    runtime_state: TaskRuntimeState,
+    session_present: bool,
+    runner_state: Option<&str>,
+    output: Option<&OutputFreshnessObservation>,
+    updated_epoch_ms: i64,
+    now_ms: u64,
+) -> StallDiagnostics {
+    let mut diagnostics = StallDiagnostics {
+        last_output_at: output.and_then(|entry| entry.last_output_at),
+        stall_duration_ms: None,
+        stall_reason: None,
+    };
+    let updated_at = non_negative_epoch_ms(updated_epoch_ms).unwrap_or(now_ms);
+
+    let active = matches!(
+        runtime_state,
+        TaskRuntimeState::Preparing | TaskRuntimeState::Running
+    );
+    let recently_failed = matches!(
+        runtime_state,
+        TaskRuntimeState::FailedRetryable | TaskRuntimeState::NeedsAttention
+    );
+    if !active && !recently_failed {
+        return diagnostics;
+    }
+
+    if active && !session_present {
+        diagnostics.stall_reason = Some(StallReason::SessionMissing);
+        diagnostics.stall_duration_ms = Some(now_ms.saturating_sub(updated_at));
+        return diagnostics;
+    }
+
+    if active && runner_state.is_none() {
+        diagnostics.stall_reason = Some(StallReason::Unknown);
+        diagnostics.stall_duration_ms = Some(now_ms.saturating_sub(updated_at));
+        return diagnostics;
+    }
+
+    if active && runner_state != Some("running") {
+        diagnostics.stall_reason = Some(StallReason::RunnerStateStale);
+        diagnostics.stall_duration_ms = Some(now_ms.saturating_sub(updated_at));
+        return diagnostics;
+    }
+
+    if active && output.is_some_and(|entry| entry.stagnant_polls >= STALL_NO_OUTPUT_POLL_THRESHOLD)
+    {
+        let reference = diagnostics.last_output_at.unwrap_or(updated_at);
+        diagnostics.stall_reason = Some(StallReason::NoOutputFreshness);
+        diagnostics.stall_duration_ms = Some(now_ms.saturating_sub(reference));
+        return diagnostics;
+    }
+
+    if recently_failed {
+        diagnostics.stall_reason = Some(StallReason::Unknown);
+        diagnostics.stall_duration_ms = Some(now_ms.saturating_sub(updated_at));
+    }
+
+    diagnostics
+}
+
 fn delivery_status_normalized_v1(orchestration: &Value, tail: u32) -> Value {
     let field = |name: &str| orchestration.get(name).cloned().unwrap_or(Value::Null);
 
@@ -921,6 +1068,9 @@ fn delivery_status_normalized_v1(orchestration: &Value, tail: u32) -> Value {
         "last_steer_sent_at": field("last_steer_sent_at"),
         "last_steer_observed_at": field("last_steer_observed_at"),
         "last_steer_apply_hint": field("last_steer_apply_hint"),
+        "last_output_at": field("last_output_at"),
+        "stall_duration_ms": field("stall_duration_ms"),
+        "stall_reason": field("stall_reason"),
         "timestamps": {
             "updated_at": now_unix_timestamp_ms()
         },
@@ -2106,13 +2256,15 @@ async fn orchestrate_start_runtime(args: Value) -> Result<Value> {
 }
 
 async fn task_runtime_status(task_id: &str, tail: usize) -> Result<Value> {
-    let (session, record, steer_observation, persisted_trace) = {
+    let now_ms = delivery_timestamp_ms();
+    let (session, record, steer_observation, persisted_trace, output_observation) = {
         let runtime = runtime_state_mutex()?;
         (
             runtime.sessions.get(task_id).cloned(),
             runtime.store.get_task(task_id)?,
             runtime.last_steer_observation_by_task.get(task_id).cloned(),
             runtime.store.latest_trace_context_for_task(task_id)?,
+            runtime.output_freshness_by_task.get(task_id).cloned(),
         )
     };
     let fallback_trace_id = persisted_trace
@@ -2139,6 +2291,13 @@ async fn task_runtime_status(task_id: &str, tail: usize) -> Result<Value> {
             .as_ref()
             .and_then(|active| active.parent_span_id.clone())
             .or(fallback_parent_span_id.clone());
+        let diagnostics = StallDiagnostics {
+            last_output_at: output_observation
+                .as_ref()
+                .and_then(|entry| entry.last_output_at),
+            stall_duration_ms: None,
+            stall_reason: None,
+        };
         return Ok(json!({
             "tool": "orchestrate_status",
             "task_id": task_id,
@@ -2147,6 +2306,9 @@ async fn task_runtime_status(task_id: &str, tail: usize) -> Result<Value> {
             "trace_id": trace_id,
             "span_id": span_id,
             "parent_span_id": parent_span_id,
+            "last_output_at": diagnostics.last_output_at,
+            "stall_duration_ms": diagnostics.stall_duration_ms,
+            "stall_reason": diagnostics.stall_reason.map(StallReason::as_str),
             "last_steer_sent_at": steer_observation.as_ref().map(|observation| observation.sent_at),
             "last_steer_observed_at": steer_observation.as_ref().and_then(|observation| observation.observed_at),
             "last_steer_apply_hint": steer_observation.as_ref().map(|observation| observation.apply_hint.clone())
@@ -2154,6 +2316,14 @@ async fn task_runtime_status(task_id: &str, tail: usize) -> Result<Value> {
     };
 
     if runtime_state_is_terminal(record.state) {
+        let diagnostics = derive_stall_diagnostics(
+            record.state,
+            session.is_some(),
+            None,
+            output_observation.as_ref(),
+            record.updated_epoch_ms,
+            now_ms,
+        );
         if session.is_some() {
             if let Some(active) = session.as_ref() {
                 let _ =
@@ -2169,6 +2339,9 @@ async fn task_runtime_status(task_id: &str, tail: usize) -> Result<Value> {
             "trace_id": fallback_trace_id.clone(),
             "span_id": fallback_span_id.clone(),
             "parent_span_id": fallback_parent_span_id.clone(),
+            "last_output_at": diagnostics.last_output_at,
+            "stall_duration_ms": diagnostics.stall_duration_ms,
+            "stall_reason": diagnostics.stall_reason.map(StallReason::as_str),
             "assigned_worker": record.assigned_worker,
             "retry_count": record.retry_count,
             "retry_budget": record.retry_budget,
@@ -2179,6 +2352,14 @@ async fn task_runtime_status(task_id: &str, tail: usize) -> Result<Value> {
     }
 
     let Some(session) = session else {
+        let diagnostics = derive_stall_diagnostics(
+            record.state,
+            false,
+            None,
+            output_observation.as_ref(),
+            record.updated_epoch_ms,
+            now_ms,
+        );
         return Ok(json!({
             "tool": "orchestrate_status",
             "task_id": task_id,
@@ -2187,6 +2368,9 @@ async fn task_runtime_status(task_id: &str, tail: usize) -> Result<Value> {
             "trace_id": fallback_trace_id.clone(),
             "span_id": fallback_span_id.clone(),
             "parent_span_id": fallback_parent_span_id.clone(),
+            "last_output_at": diagnostics.last_output_at,
+            "stall_duration_ms": diagnostics.stall_duration_ms,
+            "stall_reason": diagnostics.stall_reason.map(StallReason::as_str),
             "retry_count": record.retry_count,
             "retry_budget": record.retry_budget,
             "last_steer_sent_at": steer_observation.as_ref().map(|observation| observation.sent_at),
@@ -2198,6 +2382,44 @@ async fn task_runtime_status(task_id: &str, tail: usize) -> Result<Value> {
     let status = match runner_status(session.runner_mode, &session.session_id).await {
         Ok(status) => status,
         Err(error) => {
+            if is_session_not_found_error(&error) {
+                let _ = clear_runtime_session(task_id);
+                let diagnostics = derive_stall_diagnostics(
+                    record.state,
+                    false,
+                    None,
+                    output_observation.as_ref(),
+                    record.updated_epoch_ms,
+                    now_ms,
+                );
+                emit_delivery_status_events(
+                    task_id,
+                    "unknown",
+                    runtime_state_label(record.state),
+                    None,
+                    Some(session.attempt_number),
+                    None,
+                )?;
+                return Ok(json!({
+                    "tool": "orchestrate_status",
+                    "task_id": task_id,
+                    "state": "unknown",
+                    "runtime_state": runtime_state_label(record.state),
+                    "trace_id": session.trace_id,
+                    "span_id": session.span_id,
+                    "parent_span_id": session.parent_span_id,
+                    "runner_mode": session.runner_mode.as_str(),
+                    "last_output_at": diagnostics.last_output_at,
+                    "stall_duration_ms": diagnostics.stall_duration_ms,
+                    "stall_reason": diagnostics.stall_reason.map(StallReason::as_str),
+                    "assigned_worker": record.assigned_worker,
+                    "retry_count": record.retry_count,
+                    "retry_budget": record.retry_budget,
+                    "last_steer_sent_at": steer_observation.as_ref().map(|observation| observation.sent_at),
+                    "last_steer_observed_at": steer_observation.as_ref().and_then(|observation| observation.observed_at),
+                    "last_steer_apply_hint": steer_observation.as_ref().map(|observation| observation.apply_hint.clone())
+                }));
+            }
             let _ = clear_runtime_session(task_id);
             return Err(error);
         }
@@ -2224,11 +2446,61 @@ async fn task_runtime_status(task_id: &str, tail: usize) -> Result<Value> {
     let logs = match runner_logs(session.runner_mode, &session.session_id, tail).await {
         Ok(logs) => logs,
         Err(error) => {
+            if is_session_not_found_error(&error) {
+                let _ = clear_runtime_session(task_id);
+                let diagnostics = derive_stall_diagnostics(
+                    latest.state,
+                    false,
+                    None,
+                    output_observation.as_ref(),
+                    latest.updated_epoch_ms,
+                    now_ms,
+                );
+                emit_delivery_status_events(
+                    task_id,
+                    "unknown",
+                    runtime_state_label(latest.state),
+                    None,
+                    Some(session.attempt_number),
+                    None,
+                )?;
+                return Ok(json!({
+                    "tool": "orchestrate_status",
+                    "task_id": task_id,
+                    "state": "unknown",
+                    "runtime_state": runtime_state_label(latest.state),
+                    "trace_id": session.trace_id,
+                    "span_id": session.span_id,
+                    "parent_span_id": session.parent_span_id,
+                    "runner_mode": session.runner_mode.as_str(),
+                    "last_output_at": diagnostics.last_output_at,
+                    "stall_duration_ms": diagnostics.stall_duration_ms,
+                    "stall_reason": diagnostics.stall_reason.map(StallReason::as_str),
+                    "assigned_worker": latest.assigned_worker,
+                    "retry_count": latest.retry_count,
+                    "retry_budget": latest.retry_budget,
+                    "last_steer_sent_at": steer_observation.as_ref().map(|observation| observation.sent_at),
+                    "last_steer_observed_at": steer_observation.as_ref().and_then(|observation| observation.observed_at),
+                    "last_steer_apply_hint": steer_observation.as_ref().map(|observation| observation.apply_hint.clone())
+                }));
+            }
             let _ = clear_runtime_session(task_id);
             return Err(error);
         }
     };
+    let output_observation = {
+        let mut runtime = runtime_state_mutex()?;
+        observe_output_freshness(&mut runtime, task_id, &logs, now_ms)
+    };
     let runtime_state = runtime_state_label(latest.state).to_string();
+    let diagnostics = derive_stall_diagnostics(
+        latest.state,
+        true,
+        Some(status.state.as_str()),
+        Some(&output_observation),
+        latest.updated_epoch_ms,
+        now_ms,
+    );
     maybe_record_delivery_steer_observed(
         task_id,
         &session.session_id,
@@ -2264,6 +2536,9 @@ async fn task_runtime_status(task_id: &str, tail: usize) -> Result<Value> {
         "trace_id": session.trace_id,
         "span_id": session.span_id,
         "parent_span_id": session.parent_span_id,
+        "last_output_at": diagnostics.last_output_at,
+        "stall_duration_ms": diagnostics.stall_duration_ms,
+        "stall_reason": diagnostics.stall_reason.map(StallReason::as_str),
         "assigned_worker": latest.assigned_worker,
         "retry_count": latest.retry_count,
         "retry_budget": latest.retry_budget,
@@ -2534,6 +2809,7 @@ fn runtime_report(args: &Value) -> Result<Value> {
         .transpose()?;
 
     let runtime = runtime_state_mutex()?;
+    let now_ms = delivery_timestamp_ms();
     let snapshot = runtime.store.export_snapshot()?;
 
     let uses_report_query = scope_id.is_some()
@@ -2598,6 +2874,25 @@ fn runtime_report(args: &Value) -> Result<Value> {
                 .latest_trace_context_for_task(&task.id)
                 .ok()
                 .flatten();
+            let output_observation = runtime.output_freshness_by_task.get(&task.id);
+            let session_present = runtime.sessions.contains_key(&task.id);
+            let inferred_runner_state = if session_present
+                && matches!(
+                    task.state,
+                    TaskRuntimeState::Preparing | TaskRuntimeState::Running
+                ) {
+                Some("running")
+            } else {
+                None
+            };
+            let diagnostics = derive_stall_diagnostics(
+                task.state,
+                session_present,
+                inferred_runner_state,
+                output_observation,
+                task.updated_epoch_ms,
+                now_ms,
+            );
             json!({
                 "task_id": task.id,
                 "scope_id": task.scope_id,
@@ -2608,7 +2903,10 @@ fn runtime_report(args: &Value) -> Result<Value> {
                 "retry_budget": task.retry_budget,
                 "trace_id": latest_trace.as_ref().map(|attempt| attempt.trace_id.clone()),
                 "span_id": latest_trace.as_ref().map(|attempt| attempt.span_id.clone()),
-                "parent_span_id": latest_trace.and_then(|attempt| attempt.parent_span_id)
+                "parent_span_id": latest_trace.and_then(|attempt| attempt.parent_span_id),
+                "last_output_at": diagnostics.last_output_at,
+                "stall_duration_ms": diagnostics.stall_duration_ms,
+                "stall_reason": diagnostics.stall_reason.map(StallReason::as_str)
             })
         })
         .collect::<Vec<_>>();
@@ -4422,7 +4720,10 @@ mod tests {
                 "retry_budget": 3,
                 "last_steer_sent_at": 111_u64,
                 "last_steer_observed_at": Value::Null,
-                "last_steer_apply_hint": "transport_sent"
+                "last_steer_apply_hint": "transport_sent",
+                "last_output_at": 222_u64,
+                "stall_duration_ms": 333_u64,
+                "stall_reason": "no_output_freshness"
             }),
             12,
         );
@@ -4430,6 +4731,9 @@ mod tests {
         assert_eq!(normalized["last_steer_sent_at"], 111_u64);
         assert!(normalized["last_steer_observed_at"].is_null());
         assert_eq!(normalized["last_steer_apply_hint"], "transport_sent");
+        assert_eq!(normalized["last_output_at"], 222_u64);
+        assert_eq!(normalized["stall_duration_ms"], 333_u64);
+        assert_eq!(normalized["stall_reason"], "no_output_freshness");
     }
 
     #[test]
@@ -4756,6 +5060,33 @@ mod tests {
             !runtime.sessions.contains_key(&task_id),
             "stale missing session should be removed after poll failure"
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn task_runtime_status_reports_session_missing_stall_diagnostics() {
+        let task_id = unique_test_task_id("status-session-missing");
+        {
+            let runtime = runtime_state().lock().expect("runtime lock");
+            runtime
+                .store
+                .upsert_task(&TaskRecord::new(task_id.clone(), "worker-a", 1))
+                .expect("seed task");
+            runtime
+                .store
+                .transition(&task_id, TaskRuntimeState::Preparing)
+                .expect("queued -> preparing");
+            runtime
+                .store
+                .transition(&task_id, TaskRuntimeState::Running)
+                .expect("preparing -> running");
+        }
+
+        let status = task_runtime_status(&task_id, 20)
+            .await
+            .expect("status should return diagnostics for missing session");
+        assert_eq!(status["runtime_state"], "running");
+        assert_eq!(status["stall_reason"], "session_or_pane_missing");
+        assert!(status["stall_duration_ms"].is_number());
     }
 
     fn tmux_available() -> bool {
