@@ -104,6 +104,7 @@ phases:
 - Required input: `task_id`.
 - Important options:
   - `runner_mode`: `process`, `tmux`, or `app_server`.
+  - `app_server_request_policy` (app_server only): `deny_all` (default), `allow_safe_subset`, `delegate_fail_open` (disabled by default).
   - `steer_required`: when `true`, submission must satisfy steer preflight rules.
   - `interactive_command`: when `true`, indicates session is steerable.
   - `idempotency_key`: dedupe repeated submit intents.
@@ -111,7 +112,16 @@ phases:
 Preflight behavior:
 - `steer_required=true` rejects non-steerable command shapes.
 - `runner_mode=process` rejects `codex exec` and `codex-guarded-exec` command shapes (to avoid nondeterministic skill-intake loops).
+- `app_server_request_policy` is valid only with `runner_mode=app_server`.
 - Use `runner_mode=tmux` or `runner_mode=app_server` for steer-required rounds.
+
+App Server server-request handling:
+- approval-style server requests return deterministic decision values:
+  - `deny_all` -> `decline`
+  - `allow_safe_subset` -> `accept` only for read-only command subset, otherwise `decline`
+- `allow_safe_subset` currently allows: `pwd`, `ls`, `cat`, `echo`, `rg`, `find`, `git status`, `git diff`, `git show`; any command containing shell control/metacharacter tokens (for example `&&`, `||`, `;`, `|`, `&`, redirection, command substitution, newlines) is denied.
+- unsupported server request methods return deterministic JSON-RPC error `code=-32601`.
+- `delegate_fail_open` returns deterministic disabled-policy error `code=-32050`.
 
 ### `delivery_status`
 - Returns current runtime state with normalized machine-first envelope.
