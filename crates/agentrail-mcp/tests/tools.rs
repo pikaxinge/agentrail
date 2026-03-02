@@ -858,9 +858,11 @@ fn delivery_submit_status_and_report_are_available() {
         vec![
             "assigned_worker",
             "last_output_at",
+            "last_steer_applied_at",
             "last_steer_apply_hint",
             "last_steer_observed_at",
             "last_steer_sent_at",
+            "last_steer_stalled_at",
             "logs",
             "parent_span_id",
             "retry_budget",
@@ -919,6 +921,8 @@ fn delivery_submit_status_and_report_are_available() {
     );
     assert!(status["normalized"]["last_steer_sent_at"].is_null());
     assert!(status["normalized"]["last_steer_observed_at"].is_null());
+    assert!(status["normalized"]["last_steer_applied_at"].is_null());
+    assert!(status["normalized"]["last_steer_stalled_at"].is_null());
     assert!(status["normalized"]["last_steer_apply_hint"].is_null());
     assert_eq!(
         status["normalized"]["last_output_at"],
