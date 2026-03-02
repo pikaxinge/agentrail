@@ -90,6 +90,21 @@ Step 2: final agent self-review (before round close)
   - what issue(s) were opened
   - why this improves next-round smoothness
 
+## Stall detection & observability (required)
+- For tmux-backed coding rounds, prioritize stall judgment from background logs + tmux pane state before declaring a task stuck.
+- Required checks:
+  - tmux target exists (session/window/pane reachable)
+  - pane liveness (`pane_dead`)
+  - current command (`pane_current_command`)
+  - output freshness (pane output changes over time)
+  - tmux runner log artifacts (for example `.agentrail-tmux-logs` when configured)
+  - latest `delivery_status` snapshot (state/tail reconciliation)
+- Stuck decision should be based on combined evidence from tmux + runner logs + `delivery_status`, not a single signal.
+- If stall is confirmed:
+  - `delivery_stop`
+  - re-submit with narrowed instruction
+  - record stall evidence in retro and open friction issue when systemic.
+
 ## Plan & issue generation
 - Use the `plan` skill for plan decomposition and issue generation when creating new workstreams.
 - Every issue plan must include:
