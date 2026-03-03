@@ -270,6 +270,57 @@ done
     (script_path, log_path)
 }
 
+fn write_fake_app_server_steer_requires_turn_start_script(
+    root: &Path,
+    script_name: &str,
+) -> (PathBuf, PathBuf) {
+    let script_path = root.join(script_name);
+    let log_path = root.join(format!("{script_name}.requests.log"));
+    let escaped_log_path = log_path.display().to_string().replace('\'', "'\"'\"'");
+    let script = format!(
+        r#"#!/usr/bin/env bash
+set -euo pipefail
+
+LOG_PATH='{escaped_log_path}'
+turn_start_count=0
+
+while IFS= read -r line; do
+  printf '%s\n' "$line" >> "$LOG_PATH"
+  id="$(printf '%s\n' "$line" | sed -n 's/.*"id":[[:space:]]*\([0-9][0-9]*\).*/\1/p' | head -n 1)"
+
+  if [[ "$line" == *'"method":"initialize"'* ]]; then
+    printf '{{"id":%s,"result":{{"userAgent":"fake-app-server/1.0"}}}}\n' "$id"
+  elif [[ "$line" == *'"method":"initialized"'* ]]; then
+    :
+  elif [[ "$line" == *'"method":"thread/start"'* ]]; then
+    printf '{{"id":%s,"result":{{"thread":{{"id":"thread-test"}}}}}}\n' "$id"
+  elif [[ "$line" == *'"method":"turn/start"'* ]]; then
+    turn_start_count=$((turn_start_count + 1))
+    printf '{{"id":%s,"result":{{"turn":{{"id":"turn-%s"}}}}}}\n' "$id" "$turn_start_count"
+  elif [[ "$line" == *'"method":"turn/steer"'* ]]; then
+    printf '{{"id":%s,"error":{{"code":-32600,"message":"no active turn to steer"}}}}\n' "$id"
+  elif [[ "$line" == *'"method":"turn/interrupt"'* ]]; then
+    printf '{{"id":%s,"result":{{"accepted":true}}}}\n' "$id"
+  elif [[ -n "$id" ]]; then
+    printf '{{"id":%s,"result":{{}}}}\n' "$id"
+  fi
+done
+"#
+    );
+    fs::write(&script_path, script)
+        .expect("write fake app server script requiring turn/start steer fallback");
+    #[cfg(unix)]
+    {
+        let mut permissions = fs::metadata(&script_path)
+            .expect("metadata for fake app server script")
+            .permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&script_path, permissions)
+            .expect("set executable bit for fake app server script");
+    }
+    (script_path, log_path)
+}
+
 #[derive(Debug)]
 struct RealCliE2eConfig {
     command: String,
@@ -1910,6 +1961,73 @@ fn delivery_submit_app_server_runner_maps_submit_steer_stop_over_stdio_jsonrpc()
         .expect("request log should include turn/interrupt");
     assert_eq!(turn_interrupt["params"]["threadId"], "thread-test");
     assert!(turn_interrupt["params"]["turnId"].is_string());
+}
+
+#[test]
+fn delivery_steer_app_server_falls_back_to_turn_start_when_no_active_turn_error_is_returned() {
+    let tmp = tempdir().expect("tempdir");
+    let (script_path, request_log_path) = write_fake_app_server_steer_requires_turn_start_script(
+        tmp.path(),
+        "fake-app-server-steer-fallback.sh",
+    );
+    let task_id = unique_task_id("task-delivery-app-server-steer-fallback");
+
+    let submit = handle_tool_call(
+        "delivery_submit",
+        json!({
+            "task_id": task_id,
+            "worker_id": "worker-a",
+            "runner_mode": "app_server",
+            "command": script_path.display().to_string(),
+            "args": [],
+            "workdir": tmp.path().display().to_string()
+        }),
+    )
+    .expect("delivery_submit should succeed for app_server runner");
+    assert_eq!(submit["orchestration"]["status"], "accepted");
+
+    let steer = handle_tool_call(
+        "delivery_steer",
+        json!({
+            "task_id": task_id,
+            "instruction": "fallback-turn-start-instruction"
+        }),
+    )
+    .expect("delivery_steer should succeed via turn/start fallback");
+    assert_eq!(steer["status"], "sent");
+
+    let request_log =
+        fs::read_to_string(&request_log_path).expect("fake app server request log should exist");
+    let requests = request_log
+        .lines()
+        .map(|line| {
+            serde_json::from_str::<serde_json::Value>(line).expect("line should be valid json")
+        })
+        .collect::<Vec<_>>();
+    let turn_start_calls = requests
+        .iter()
+        .filter(|request| request["method"] == "turn/start")
+        .collect::<Vec<_>>();
+    assert!(
+        turn_start_calls.len() >= 2,
+        "expected startup turn/start and fallback turn/start calls: {request_log}"
+    );
+    let fallback_turn_start = turn_start_calls
+        .last()
+        .expect("fallback turn/start request should exist");
+    assert_eq!(
+        fallback_turn_start["params"]["input"][0]["text"],
+        "fallback-turn-start-instruction"
+    );
+
+    let _stop = handle_tool_call(
+        "delivery_stop",
+        json!({
+            "task_id": task_id,
+            "reason": "cleanup"
+        }),
+    )
+    .expect("delivery_stop should succeed");
 }
 
 #[test]
