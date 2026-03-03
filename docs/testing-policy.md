@@ -96,6 +96,32 @@ For MCP-driven rounds, keep verification aligned with close-gate expectations:
 - Cleanup via `delivery_cleanup`.
 - Ensure docs and issue artifacts for any friction encountered.
 
+### Opt-in Real CLI E2E Harness (AR-109)
+`agentrail-mcp` includes ignored-by-default E2E tests that validate real local App Server
+control flow (`delivery_submit -> delivery_status -> delivery_steer -> delivery_stop/retry`)
+against a local CLI binary.
+
+Enable explicitly when you have a local CLI binary available:
+
+```bash
+AGENTRAIL_E2E_REAL_CLI=1 \
+AGENTRAIL_E2E_APP_SERVER_COMMAND=codex \
+AGENTRAIL_E2E_APP_SERVER_ARGS_JSON='["app-server"]' \
+CARGO_TARGET_DIR=/tmp/agentrail-target \
+cargo test -p agentrail-mcp --test tools -- --ignored delivery_submit_app_server_real_cli_e2e
+```
+
+Optional environment variables:
+- `AGENTRAIL_E2E_ARTIFACT_DIR`: output directory for captured artifacts.
+- `AGENTRAIL_E2E_STATUS_TAIL`: `delivery_status` log tail size (default `200`).
+- `AGENTRAIL_E2E_STEER_INSTRUCTION`: steering probe text used in happy-path test.
+
+Artifacts are written as JSON files per task and phase:
+- `*-status.json`
+- `*-timeline.json`
+- `*-explain-failure.json`
+- `*-summary.json`
+
 ## Policy Changes
 Any update to this policy must be done with:
 - Clear rationale.
