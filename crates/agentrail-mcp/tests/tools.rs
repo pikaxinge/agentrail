@@ -270,6 +270,154 @@ done
     (script_path, log_path)
 }
 
+#[derive(Debug)]
+struct RealCliE2eConfig {
+    command: String,
+    args: Vec<String>,
+    artifact_dir: PathBuf,
+    tail: u32,
+    steer_instruction: String,
+}
+
+fn parse_string_array_env(var_name: &str, default: &[&str]) -> Vec<String> {
+    match std::env::var(var_name) {
+        Ok(raw) if !raw.trim().is_empty() => serde_json::from_str::<Vec<String>>(&raw)
+            .unwrap_or_else(|error| panic!("{var_name} must be a JSON string array: {error}")),
+        _ => default.iter().map(|value| (*value).to_string()).collect(),
+    }
+}
+
+fn load_real_cli_e2e_config() -> RealCliE2eConfig {
+    let enabled = std::env::var("AGENTRAIL_E2E_REAL_CLI")
+        .ok()
+        .unwrap_or_default();
+    assert_eq!(
+        enabled, "1",
+        "set AGENTRAIL_E2E_REAL_CLI=1 to acknowledge running real local CLI E2E tests"
+    );
+
+    let command = std::env::var("AGENTRAIL_E2E_APP_SERVER_COMMAND")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| "codex".to_string());
+    let args = parse_string_array_env("AGENTRAIL_E2E_APP_SERVER_ARGS_JSON", &["app-server"]);
+
+    let artifact_dir = std::env::var("AGENTRAIL_E2E_ARTIFACT_DIR")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            std::env::temp_dir().join(format!("agentrail-e2e-real-cli-{}", unique_task_id("run")))
+        });
+    fs::create_dir_all(&artifact_dir).expect("create AGENTRAIL_E2E_ARTIFACT_DIR");
+
+    let tail = std::env::var("AGENTRAIL_E2E_STATUS_TAIL")
+        .ok()
+        .and_then(|raw| raw.parse::<u32>().ok())
+        .unwrap_or(200);
+    let steer_instruction = std::env::var("AGENTRAIL_E2E_STEER_INSTRUCTION")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| "real-cli-e2e-steer-probe".to_string());
+
+    RealCliE2eConfig {
+        command,
+        args,
+        artifact_dir,
+        tail,
+        steer_instruction,
+    }
+}
+
+fn write_json_artifact(dir: &Path, file_name: &str, value: &Value) {
+    let path = dir.join(file_name);
+    let payload = serde_json::to_string_pretty(value).expect("serialize artifact JSON");
+    fs::write(&path, format!("{payload}\n")).unwrap_or_else(|error| {
+        panic!("write artifact {} failed: {error}", path.display());
+    });
+}
+
+fn wait_for_runtime_state_any(task_id: &str, wanted: &[&str]) -> serde_json::Value {
+    let mut last = None;
+    for _ in 0..80 {
+        let status = handle_tool_call(
+            "delivery_status",
+            json!({
+                "task_id": task_id,
+                "tail": 200
+            }),
+        )
+        .expect("delivery_status should succeed while waiting for runtime state");
+        let runtime_state = status["runtime_state"].as_str().unwrap_or("unknown");
+        if wanted.contains(&runtime_state) {
+            return status;
+        }
+        last = Some(status);
+        thread::sleep(Duration::from_millis(75));
+    }
+
+    panic!(
+        "timed out waiting for runtime_state in {:?}, last_status={}",
+        wanted,
+        last.unwrap_or_else(|| json!({"status":"none"}))
+    );
+}
+
+fn capture_task_artifacts(task_id: &str, config: &RealCliE2eConfig, label: &str) {
+    let status = handle_tool_call(
+        "delivery_status",
+        json!({
+            "task_id": task_id,
+            "tail": config.tail
+        }),
+    )
+    .expect("delivery_status should succeed for artifact capture");
+    let timeline = handle_tool_call(
+        "delivery_timeline",
+        json!({
+            "task_id": task_id,
+            "limit": 500
+        }),
+    )
+    .expect("delivery_timeline should succeed for artifact capture");
+    let explain = handle_tool_call(
+        "delivery_explain_failure",
+        json!({
+            "task_id": task_id
+        }),
+    )
+    .expect("delivery_explain_failure should succeed for artifact capture");
+    let summary = json!({
+        "task_id": task_id,
+        "label": label,
+        "runtime_state": status["runtime_state"],
+        "state": status["state"],
+        "timeline_cursor": timeline["next_cursor"],
+        "failed": explain["failed"],
+    });
+
+    write_json_artifact(
+        &config.artifact_dir,
+        &format!("{label}-{task_id}-status.json"),
+        &status,
+    );
+    write_json_artifact(
+        &config.artifact_dir,
+        &format!("{label}-{task_id}-timeline.json"),
+        &timeline,
+    );
+    write_json_artifact(
+        &config.artifact_dir,
+        &format!("{label}-{task_id}-explain-failure.json"),
+        &explain,
+    );
+    write_json_artifact(
+        &config.artifact_dir,
+        &format!("{label}-{task_id}-summary.json"),
+        &summary,
+    );
+}
+
 #[test]
 fn orchestrate_start_starts_real_process_and_exposes_session() {
     let tmp = tempdir().expect("tempdir");
@@ -3107,6 +3255,137 @@ fn delivery_cleanup_retention_prune_mode_rejects_active_tasks() {
     let remaining = report_task_ids(&scoped_report);
     assert!(remaining.contains(&ready_task));
     assert!(remaining.contains(&running_task));
+}
+
+#[test]
+#[ignore = "opt-in local real CLI E2E harness; set AGENTRAIL_E2E_REAL_CLI=1"]
+fn delivery_submit_app_server_real_cli_e2e_happy_path_with_artifacts() {
+    let config = load_real_cli_e2e_config();
+    let tmp = tempdir().expect("tempdir");
+    let task_id = unique_task_id("task-e2e-real-cli-happy");
+
+    let submit = handle_tool_call(
+        "delivery_submit",
+        json!({
+            "task_id": task_id,
+            "worker_id": "worker-a",
+            "runner_mode": "app_server",
+            "steer_required": true,
+            "command": config.command,
+            "args": config.args,
+            "workdir": tmp.path().display().to_string()
+        }),
+    )
+    .expect("delivery_submit should succeed with real local app_server command");
+    assert_eq!(submit["tool"], "delivery_submit");
+    assert_eq!(submit["orchestration"]["status"], "accepted");
+
+    let running_status = wait_for_runtime_state_any(&task_id, &["running"]);
+    assert_eq!(running_status["runtime_state"], "running");
+
+    let steer = handle_tool_call(
+        "delivery_steer",
+        json!({
+            "task_id": task_id,
+            "instruction": config.steer_instruction
+        }),
+    )
+    .expect("delivery_steer should succeed for active real CLI session");
+    assert_eq!(steer["tool"], "delivery_steer");
+    assert_eq!(steer["status"], "sent");
+
+    capture_task_artifacts(&task_id, &config, "happy");
+
+    let stop = handle_tool_call(
+        "delivery_stop",
+        json!({
+            "task_id": task_id,
+            "reason": "e2e-happy-cleanup"
+        }),
+    )
+    .expect("delivery_stop should succeed for happy-path cleanup");
+    assert!(
+        stop["status"] == "stopped" || stop["status"] == "already_stopped",
+        "unexpected stop status: {stop}"
+    );
+}
+
+#[test]
+#[ignore = "opt-in local real CLI E2E harness; set AGENTRAIL_E2E_REAL_CLI=1"]
+fn delivery_submit_app_server_real_cli_e2e_failure_retry_with_artifacts() {
+    let config = load_real_cli_e2e_config();
+    let tmp = tempdir().expect("tempdir");
+    let task_id = unique_task_id("task-e2e-real-cli-failure");
+
+    let first_submit = handle_tool_call(
+        "delivery_submit",
+        json!({
+            "task_id": task_id,
+            "worker_id": "worker-a",
+            "runner_mode": "app_server",
+            "command": config.command,
+            "args": config.args,
+            "workdir": tmp.path().display().to_string()
+        }),
+    )
+    .expect("initial delivery_submit should succeed for failure/retry path");
+    assert_eq!(first_submit["orchestration"]["status"], "accepted");
+
+    let stop = handle_tool_call(
+        "delivery_stop",
+        json!({
+            "task_id": task_id,
+            "reason": "e2e-controlled-failure"
+        }),
+    )
+    .expect("delivery_stop should succeed to induce controlled failure");
+    assert!(
+        stop["status"] == "stopped" || stop["status"] == "already_stopped",
+        "unexpected controlled-failure stop status: {stop}"
+    );
+    assert_eq!(stop["runtime_state"], "failed_retryable");
+
+    let failed_status = wait_for_runtime_state_any(&task_id, &["failed_retryable"]);
+    assert_eq!(failed_status["runtime_state"], "failed_retryable");
+    capture_task_artifacts(&task_id, &config, "failure-before-retry");
+
+    let retry_submit = handle_tool_call(
+        "delivery_submit",
+        json!({
+            "task_id": task_id,
+            "worker_id": "worker-a",
+            "runner_mode": "app_server",
+            "command": config.command,
+            "args": config.args,
+            "workdir": tmp.path().display().to_string()
+        }),
+    )
+    .expect("retry delivery_submit should succeed from failed_retryable");
+    assert_eq!(retry_submit["orchestration"]["status"], "accepted");
+    assert!(
+        retry_submit["orchestration"]["attempt_number"]
+            .as_u64()
+            .expect("attempt_number should be u64")
+            >= 2,
+        "retry attempt should increment attempt_number: {retry_submit}"
+    );
+
+    let _ =
+        wait_for_runtime_state_any(&task_id, &["running", "ready_to_merge", "failed_retryable"]);
+    capture_task_artifacts(&task_id, &config, "failure-after-retry");
+
+    let cleanup_stop = handle_tool_call(
+        "delivery_stop",
+        json!({
+            "task_id": task_id,
+            "reason": "e2e-retry-cleanup"
+        }),
+    )
+    .expect("cleanup delivery_stop should succeed after retry");
+    assert!(
+        cleanup_stop["status"] == "stopped" || cleanup_stop["status"] == "already_stopped",
+        "unexpected cleanup stop status: {cleanup_stop}"
+    );
 }
 
 #[test]
