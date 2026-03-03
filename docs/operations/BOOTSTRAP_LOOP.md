@@ -83,6 +83,16 @@ For PR merge in multi-worktree sessions, use `scripts/gh-pr-merge-safe.sh` inste
 `gh pr merge --delete-branch`. It retries without `--delete-branch` only when local branch
 cleanup fails because `main` is checked out in another worktree.
 
+When MCP worker binary path drifts from your latest build artifact, hot-reload the supervisor
+with an explicit worker command override:
+
+```json
+{"jsonrpc":"2.0","id":"reload-1","method":"agentrail/reload","params":{"worker_cmd":"/tmp/agentrail-target/debug/agentrail-mcp --transport stdio"}}
+```
+
+Use this when `delivery_submit` unexpectedly reports unsupported runner modes on a commit that
+already contains the required support.
+
 Behavior of `codex-guarded-exec.sh`:
 - If the worker fails to mutate the workspace before timeout, the guard exits with code `124`.
 - This creates a deterministic failure signal so orchestrator can stop/retry instead of waiting indefinitely.

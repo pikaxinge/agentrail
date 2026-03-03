@@ -4361,6 +4361,12 @@ struct SupervisedWorker {
     stdout_rx: mpsc::UnboundedReceiver<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SupervisorReloadRequest {
+    id: Option<Value>,
+    worker_cmd: Option<String>,
+}
+
 async fn spawn_supervised_worker(worker_cmd: Option<&str>) -> Result<SupervisedWorker> {
     let mut command = if let Some(raw) = worker_cmd {
         let mut cmd = Command::new("bash");
@@ -4434,7 +4440,7 @@ async fn restart_supervised_worker(
     Ok(())
 }
 
-fn extract_reload_request_id(raw_line: &str, reload_method: &str) -> Option<Option<Value>> {
+fn parse_reload_request(raw_line: &str, reload_method: &str) -> Option<SupervisorReloadRequest> {
     let parsed: Value = serde_json::from_str(raw_line).ok()?;
     let method = parsed.get("method")?.as_str()?;
     if method != reload_method {
@@ -4442,14 +4448,24 @@ fn extract_reload_request_id(raw_line: &str, reload_method: &str) -> Option<Opti
     }
 
     let id = parsed.get("id").filter(|value| !value.is_null()).cloned();
-    Some(id)
+    let worker_cmd = parsed
+        .get("params")
+        .and_then(|params| params.get("worker_cmd"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string);
+
+    Some(SupervisorReloadRequest { id, worker_cmd })
 }
 
 pub async fn run_supervisor_stdio(worker_cmd: Option<&str>, reload_method: &str) -> Result<()> {
+    let mut worker_cmd = worker_cmd.map(ToString::to_string);
     info!(
         operation = "mcp_server_bootstrap",
         transport = "supervisor-stdio",
         reload_method = reload_method,
+        worker_cmd = worker_cmd.as_deref().unwrap_or("<self>"),
         outcome = "ok",
         "agentrail MCP stdio supervisor bootstrap"
     );
@@ -4458,7 +4474,7 @@ pub async fn run_supervisor_stdio(worker_cmd: Option<&str>, reload_method: &str)
     let stdout = tokio::io::stdout();
     let mut client_reader = BufReader::new(stdin).lines();
     let mut client_writer = BufWriter::new(stdout);
-    let mut worker = spawn_supervised_worker(worker_cmd).await?;
+    let mut worker = spawn_supervised_worker(worker_cmd.as_deref()).await?;
 
     loop {
         loop {
@@ -4475,7 +4491,7 @@ pub async fn run_supervisor_stdio(worker_cmd: Option<&str>, reload_method: &str)
                         outcome = "disconnected",
                         "worker stdout channel disconnected; restarting worker"
                     );
-                    restart_supervised_worker(&mut worker, worker_cmd).await?;
+                    restart_supervised_worker(&mut worker, worker_cmd.as_deref()).await?;
                     break;
                 }
             }
@@ -4498,20 +4514,25 @@ pub async fn run_supervisor_stdio(worker_cmd: Option<&str>, reload_method: &str)
             continue;
         }
 
-        if let Some(response_id) = extract_reload_request_id(&line, reload_method) {
+        if let Some(request) = parse_reload_request(&line, reload_method) {
+            if let Some(next_worker_cmd) = request.worker_cmd {
+                worker_cmd = Some(next_worker_cmd);
+            }
             info!(
                 operation = "mcp_supervisor_reload",
+                worker_cmd = worker_cmd.as_deref().unwrap_or("<self>"),
                 outcome = "requested",
                 "supervisor received reload request"
             );
-            restart_supervised_worker(&mut worker, worker_cmd).await?;
-            if let Some(id) = response_id {
+            restart_supervised_worker(&mut worker, worker_cmd.as_deref()).await?;
+            if let Some(id) = request.id {
                 let response = json!({
                     "jsonrpc": "2.0",
                     "id": id,
                     "result": {
                         "ok": true,
-                        "reloaded": true
+                        "reloaded": true,
+                        "worker_cmd": worker_cmd
                     }
                 });
                 client_writer
@@ -4530,7 +4551,7 @@ pub async fn run_supervisor_stdio(worker_cmd: Option<&str>, reload_method: &str)
                 error = %error,
                 "worker stdin write failed; restarting worker and retrying"
             );
-            restart_supervised_worker(&mut worker, worker_cmd).await?;
+            restart_supervised_worker(&mut worker, worker_cmd.as_deref()).await?;
             worker.stdin.write_all(line.as_bytes()).await?;
         }
         worker.stdin.write_all(b"\n").await?;
@@ -5428,22 +5449,37 @@ mod tests {
     }
 
     #[test]
-    fn extract_reload_request_id_returns_id_for_matching_method() {
-        let id = extract_reload_request_id(
+    fn parse_reload_request_returns_id_for_matching_method() {
+        let request = parse_reload_request(
             r#"{"jsonrpc":"2.0","id":"abc","method":"agentrail/reload","params":{}}"#,
             "agentrail/reload",
         )
         .expect("reload request should match");
-        assert_eq!(id, Some(json!("abc")));
+        assert_eq!(request.id, Some(json!("abc")));
+        assert!(request.worker_cmd.is_none());
     }
 
     #[test]
-    fn extract_reload_request_id_ignores_other_methods() {
-        let id = extract_reload_request_id(
+    fn parse_reload_request_extracts_worker_cmd_from_params() {
+        let request = parse_reload_request(
+            r#"{"jsonrpc":"2.0","id":1,"method":"agentrail/reload","params":{"worker_cmd":" /tmp/agentrail-target/debug/agentrail-mcp --transport stdio "}}"#,
+            "agentrail/reload",
+        )
+        .expect("reload request should parse worker_cmd");
+        assert_eq!(request.id, Some(json!(1)));
+        assert_eq!(
+            request.worker_cmd.as_deref(),
+            Some("/tmp/agentrail-target/debug/agentrail-mcp --transport stdio")
+        );
+    }
+
+    #[test]
+    fn parse_reload_request_ignores_other_methods() {
+        let request = parse_reload_request(
             r#"{"jsonrpc":"2.0","id":"abc","method":"tools/list","params":{}}"#,
             "agentrail/reload",
         );
-        assert!(id.is_none());
+        assert!(request.is_none());
     }
 
     #[test]
