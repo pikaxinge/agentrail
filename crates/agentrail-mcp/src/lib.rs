@@ -2209,21 +2209,43 @@ async fn app_server_steer(session_id: &str, instruction: &str) -> Result<()> {
         let thread_id = inner.thread_id.clone().ok_or_else(|| {
             anyhow::anyhow!("app_server thread id missing for session {session_id}")
         })?;
-        let turn_id = inner.active_turn_id.clone().ok_or_else(|| {
-            anyhow::anyhow!("app_server active turn id missing for session {session_id}")
-        })?;
-        (thread_id, turn_id)
+        (thread_id, inner.active_turn_id.clone())
     };
+
+    if let Some(turn_id) = turn_id {
+        match app_server_rpc_request(
+            &session,
+            "turn/steer",
+            app_server_turn_steer_params(&thread_id, &turn_id, instruction),
+        )
+        .await
+        {
+            Ok(turn) => {
+                if let Some(next_turn_id) = extract_turn_id(&turn) {
+                    let mut inner = session.inner.lock().await;
+                    inner.active_turn_id = Some(next_turn_id);
+                }
+                return Ok(());
+            }
+            Err(error)
+                if error
+                    .to_string()
+                    .to_ascii_lowercase()
+                    .contains("no active turn to steer") => {}
+            Err(error) => return Err(error),
+        }
+    }
+
     let turn = app_server_rpc_request(
         &session,
-        "turn/steer",
-        app_server_turn_steer_params(&thread_id, &turn_id, instruction),
+        "turn/start",
+        app_server_turn_start_params(&thread_id, instruction),
     )
     .await?;
-    if let Some(next_turn_id) = extract_turn_id(&turn) {
-        let mut inner = session.inner.lock().await;
-        inner.active_turn_id = Some(next_turn_id);
-    }
+    let next_turn_id = extract_turn_id(&turn)
+        .ok_or_else(|| anyhow::anyhow!("app_server turn/start response missing turn id"))?;
+    let mut inner = session.inner.lock().await;
+    inner.active_turn_id = Some(next_turn_id);
     Ok(())
 }
 
